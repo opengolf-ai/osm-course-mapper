@@ -1,5 +1,3 @@
-import { ell, rr } from './geometry';
-
 /**
  * Where one hole stands.
  *
@@ -16,38 +14,6 @@ export const STATUS_META: Record<HoleStatus, { label: string; tone: string }> = 
   complete: { label: 'On the map', tone: 'success' },
   unmapped: { label: 'Nothing yet', tone: 'neutral' },
   unknown: { label: 'Unknown', tone: 'info' },
-};
-
-/** Three fairway silhouettes, cycled across the board tiles. */
-export const MINIS = [
-  'M8 78 C 30 60 50 48 72 34 C 88 24 100 18 116 12 L 120 26 C 104 32 92 38 78 46 C 58 58 38 70 18 88 Z',
-  'M4 20 C 30 26 54 40 76 56 C 92 68 104 76 118 82 L 114 92 C 98 86 84 78 68 66 C 46 50 24 36 0 30 Z',
-  'M14 84 C 24 58 40 40 62 26 C 80 14 98 10 118 8 L 120 22 C 102 24 86 28 70 38 C 50 50 36 64 28 88 Z',
-];
-
-export interface Shape {
-  d: string;
-  label: string;
-  lx: number;
-  ly: number;
-}
-
-/** Proposed features for the hole under review, in the review map's 1000x680 viewBox. */
-export const SHAPES: Record<string, Shape> = {
-  green: { d: ell(838, 150, 66, 50), label: 'green', lx: 758, ly: 206 },
-  greenAlt: { d: ell(524, 330, 30, 20), label: 'green?', lx: 486, ly: 356 },
-  bunkerA: { d: ell(744, 214, 34, 20), label: 'bunker', lx: 628, ly: 244 },
-  bunkerB: { d: ell(906, 208, 27, 17), label: 'bunker', lx: 830, ly: 250 },
-  fairway: {
-    d: 'M180 590 C 268 512 348 458 436 390 C 528 318 648 246 776 200 L 818 272 C 696 316 578 384 494 448 C 410 512 336 566 250 636 Z',
-    label: 'fairway',
-    lx: 366,
-    ly: 486,
-  },
-  tee1: { d: rr(118, 602, 76, 36, 6), label: 'back tee', lx: 208, ly: 618 },
-  tee2: { d: rr(158, 568, 68, 32, 6), label: '', lx: 0, ly: 0 },
-  tee3: { d: rr(196, 538, 64, 30, 6), label: '', lx: 0, ly: 0 },
-  tee4: { d: rr(234, 510, 60, 28, 6), label: 'forward tee', lx: 306, ly: 486 },
 };
 
 export const TEE_IDS = ['tee1', 'tee2', 'tee3', 'tee4'] as const;
@@ -68,7 +34,13 @@ export interface Step {
   done: string;
 }
 
-/** The review sequence. Each step asks a golf question, never a geometry question. */
+/**
+ * The review sequence. Each step asks a golf question, never a geometry question.
+ *
+ * Nothing proposes features yet — detection is deferred, and inventing shapes to
+ * review over a real course is exactly what KTD13 forbids. The sequence stays
+ * built, and the playing-line flow is the path that produces geometry today.
+ */
 export const STEPS: Step[] = [
   {
     id: 'green',
@@ -127,12 +99,3 @@ export const STEPS: Step[] = [
     done: 'Hole checked.',
   },
 ];
-
-/** Review map viewBox, shared by the imagery and the overlay so clicks land in the same space. */
-export const REVIEW_VIEWBOX = { w: 1000, h: 680 };
-
-/** Diagonal of the review viewBox, used to convert click distance into yards. */
-export const REVIEW_DIAGONAL = 833;
-
-/** How far the measured playing line may drift from the card before it reads as a mismatch. */
-export const YARDAGE_TOLERANCE = 25;

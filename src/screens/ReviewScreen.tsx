@@ -1,18 +1,48 @@
-import { REVIEW_VIEWBOX, SHAPES, STEPS, TEE_IDS, TEE_POSITIONS } from '../data/course';
-import { ell } from '../data/geometry';
+/**
+ * One hole, on real aerial imagery.
+ *
+ * The screen opens in the playing-line flow, because that is the only path that
+ * produces real geometry today: detection is deferred, and inventing proposals
+ * over a real course is what KTD13 rules out. The contributor clicks the tee,
+ * any points where the hole bends, then the green; the line is measured along
+ * its path and checked against the tee set they started from.
+ *
+ * Everything drawn is WGS84 GeoJSON on one MapLibre source. Pending, active and
+ * confirmed styling comes from each feature's own `status` property through a
+ * `match` expression, rather than from three parallel arrays of path strings.
+ */
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { Map as MapLibreMap } from 'maplibre-gl';
+import { STEPS, TEE_IDS, TEE_POSITIONS } from '../data/course';
+import type { LngLat } from '../geo/coords';
 import { Button, Icon } from '../ds';
-import { HoleImagery } from '../components/HoleImagery';
 import { HoverButton } from '../components/HoverButton';
-import type { Mapper } from '../state/useMapper';
+import { BaseMap, type ImageryStatus } from '../map/BaseMap';
+import { LOCATE_CLOSE_ENOUGH, type MapBounds, type Mapper } from '../state/useMapper';
 
-interface ShapeLabel {
-  key: string;
-  left: number;
-  top: number;
-  text: string;
-  bg: string;
-  fg: string;
-}
+const FEATURE_SOURCE = 'review-features';
+const FILL_LAYER = 'review-features-fill';
+const LINE_LAYER = 'review-features-line';
+const POINT_LAYER = 'review-features-point';
+
+/**
+ * One expression, read by every layer: the feature says what it is and the paint
+ * follows. `pending` has nothing to draw until detection lands, and is declared
+ * here so the vocabulary stays whole.
+ */
+const STATUS_COLOR = [
+  'match',
+  ['get', 'status'],
+  'confirmed',
+  '#a3dcc7',
+  'active',
+  '#3ecfb4',
+  'pending',
+  'rgba(255,255,255,.42)',
+  '#a3dcc7',
+];
+
+const STATUS_WIDTH = ['match', ['get', 'status'], 'active', 4, 2.5];
 
 const RAIL_CARD = {
   background: 'var(--green-800)',
@@ -29,6 +59,36 @@ const EYEBROW = {
   textTransform: 'uppercase',
 } as const;
 
+const STEP_ROW = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 11,
+  background: 'var(--green-900)',
+  border: '1px solid rgba(255,255,255,.12)',
+  borderRadius: 'var(--radius-md)',
+  padding: '11px 13px',
+} as const;
+
+const GHOST_BUTTON = {
+  height: 38,
+  background: 'var(--green-900)',
+  border: '1px solid rgba(255,255,255,.2)',
+  borderRadius: 'var(--radius-md)',
+  color: '#fff',
+  fontSize: 13,
+  fontWeight: 600,
+  cursor: 'pointer',
+  padding: '0 12px',
+} as const;
+
+/** Where a caption sits on screen once its coordinate has been projected. */
+interface PlacedLabel {
+  key: string;
+  text: string;
+  x: number;
+  y: number;
+}
+
 export function ReviewScreen({ mapper }: { mapper: Mapper }) {
   const { state, derived, actions } = mapper;
   const {
@@ -39,320 +99,312 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
     q,
     allDone,
     isLocate,
-    blocked,
+    locatePoints,
     locateDone,
+    canFinish,
     locateYds,
-    locateWithinTolerance,
-    corridor,
-    activeIds,
-    confirmedIds,
-    pendingIds,
-    measured,
+    locateVerdict,
+    features,
+    labels,
+    mapBounds,
     scorecard,
     summary,
   } = derived;
 
-  const { tee, green } = state.locate;
-  const holeNum = state.course?.holes[hi]?.number ?? hi + 1;
+  const [map, setMap] = useState<MapLibreMap | null>(null);
+  const [imagery, setImagery] = useState<ImageryStatus>('loading');
+  const [placed, setPlaced] = useState<PlacedLabel[]>([]);
+
+  const course = state.course;
+  const holeNum = course?.holes[hi]?.number ?? hi + 1;
   /* The card is a real record now, so every number on it can be absent. */
   const cardText = cardYds ?? '—';
+  const imageryFailed = imagery === 'error';
+  const placing = (state.addMode !== null || (isLocate && !locateDone)) && !imageryFailed;
 
-  const labelFor = (id: string, active: boolean): ShapeLabel | null => {
-    const sh = SHAPES[id];
-    if (!sh || !sh.label) return null;
-    const isTee = id.startsWith('tee');
-    const text = isTee
-      ? (state.teeAssign[id as (typeof TEE_IDS)[number]] ?? 'tee') + ' tee'
-      : sh.label;
-    return {
-      key: id,
-      left: (sh.lx / REVIEW_VIEWBOX.w) * 100,
-      top: (sh.ly / REVIEW_VIEWBOX.h) * 100,
-      text,
-      bg: active ? 'var(--mint-400)' : 'rgba(6,43,38,.86)',
-      fg: active ? '#062b26' : '#d3efe4',
-    };
-  };
+  const teeSetName =
+    course?.tees.find((tee) => tee.color === state.teeSet)?.name ?? course?.tees[0]?.name ?? 'the card';
 
-  const candidateLabel = (id: string, key: string): ShapeLabel => {
-    const sh = SHAPES[id];
-    return {
-      key: id,
-      left: (sh.lx / REVIEW_VIEWBOX.w) * 100,
-      top: (sh.ly / REVIEW_VIEWBOX.h) * 100,
-      text: key,
-      bg: 'var(--mint-400)',
-      fg: '#062b26',
-    };
-  };
+  /*
+   * The caption reports a measurement or says there is not one — it never echoes
+   * the card back as though the line had been drawn. The attention branch keeps
+   * its own two numbers, which are copy in that panel, not a measurement.
+   */
+  const measurement =
+    state.mode === 'attention'
+      ? `${state.attentionResolved ? 374 : 250} yd tee to green`
+      : locatePoints.length >= 2
+        ? `${locateYds} yd along your line`
+        : 'no line drawn yet';
 
-  const shapeLabels: ShapeLabel[] = isLocate
-    ? ([
-        tee && {
-          key: 'locate-tee',
-          left: Math.min(Math.max((tee.x / REVIEW_VIEWBOX.w) * 100, 2), 76),
-          top: Math.max(((tee.y - 48) / REVIEW_VIEWBOX.h) * 100, 2),
-          text: 'your tee',
-          bg: 'rgba(6,43,38,.86)',
-          fg: '#d3efe4',
+  /*
+   * The camera is set once per hole: to the hole when it already has geometry,
+   * to the course when it does not. Re-fitting as the contributor draws would
+   * move the imagery out from under the point they were about to click.
+   */
+  const frame = useRef<{ hole: number; bounds: MapBounds | undefined } | null>(null);
+  if (!frame.current || frame.current.hole !== hi) {
+    frame.current = { hole: hi, bounds: mapBounds ?? undefined };
+  }
+
+  /* One source and three layers, added once the style exists. */
+  const handleMapReady = useCallback((instance: MapLibreMap) => {
+    const draw = () => {
+      if (instance.getSource(FEATURE_SOURCE)) return;
+      instance.addSource(FEATURE_SOURCE, {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] },
+      });
+      instance.addLayer({
+        id: FILL_LAYER,
+        type: 'fill',
+        source: FEATURE_SOURCE,
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        paint: { 'fill-color': STATUS_COLOR, 'fill-opacity': 0.16 },
+      } as never);
+      instance.addLayer({
+        id: LINE_LAYER,
+        type: 'line',
+        source: FEATURE_SOURCE,
+        filter: ['!=', ['geometry-type'], 'Point'],
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: { 'line-color': STATUS_COLOR, 'line-width': STATUS_WIDTH },
+      } as never);
+      instance.addLayer({
+        id: POINT_LAYER,
+        type: 'circle',
+        source: FEATURE_SOURCE,
+        filter: ['==', ['geometry-type'], 'Point'],
+        paint: {
+          'circle-radius': 5,
+          'circle-color': STATUS_COLOR,
+          'circle-stroke-width': 2,
+          'circle-stroke-color': 'rgba(6,43,38,.8)',
         },
-        green && {
-          key: 'locate-green',
-          left: Math.min(Math.max((green.x / REVIEW_VIEWBOX.w) * 100, 2), 76),
-          top: Math.max(((green.y - 56) / REVIEW_VIEWBOX.h) * 100, 2),
-          text: 'your green',
-          bg: 'rgba(6,43,38,.86)',
-          fg: '#d3efe4',
-        },
-      ].filter(Boolean) as ShapeLabel[])
-    : (blocked
-        ? [candidateLabel('greenAlt', 'A'), candidateLabel('green', 'B')]
-        : (activeIds.map((id) => labelFor(id, true)).filter(Boolean) as ShapeLabel[])
-      ).concat(confirmedIds.map((id) => labelFor(id, false)).filter(Boolean) as ShapeLabel[]);
+      } as never);
+    };
+    if (instance.isStyleLoaded()) draw();
+    else instance.once('load', draw);
+    setMap(instance);
+  }, []);
 
-  const confirmedShapes = isLocate
-    ? [tee && { d: ell(tee.x, tee.y, 34, 22) }, green && { d: ell(green.x, green.y, 40, 30) }].filter(
-        Boolean,
-      )
-    : confirmedIds.map((id) => ({ d: SHAPES[id].d })).concat(state.extra.map((e) => ({ d: e.d })));
+  /* Whatever the contributor has drawn, pushed to the map as it changes. */
+  const featuresKey = JSON.stringify(features);
+  useEffect(() => {
+    if (!map) return;
+    const source = map.getSource(FEATURE_SOURCE) as
+      | { setData?: (data: unknown) => void }
+      | undefined;
+    source?.setData?.({ type: 'FeatureCollection', features });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- featuresKey stands in for features
+  }, [map, featuresKey]);
 
-  const activeShapes = isLocate
-    ? corridor
-      ? [{ d: corridor }]
-      : []
-    : activeIds.map((id) => ({ d: SHAPES[id].d }));
+  /*
+   * Captions are anchored to coordinates, not to the container, so they are
+   * projected here and re-projected whenever the camera moves.
+   */
+  const labelsKey = JSON.stringify(labels);
+  useEffect(() => {
+    if (!map) return;
+    const project = () => {
+      setPlaced(
+        labels.map((label) => {
+          const point = map.project(label.position as [number, number]);
+          return { key: label.key, text: label.text, x: point.x, y: point.y };
+        }),
+      );
+    };
+    project();
+    map.on('move', project);
+    map.on('zoom', project);
+    return () => {
+      map.off('move', project);
+      map.off('zoom', project);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- labelsKey stands in for labels
+  }, [map, labelsKey]);
 
-  const mapCursor = state.addMode || (isLocate && !locateDone) ? 'crosshair' : 'default';
+  /* R19: with no imagery under the cursor there is nothing to place a point on. */
+  const handleMapClick = useCallback(
+    (position: LngLat) => {
+      if (imageryFailed) return;
+      actions.onMapClick(position);
+    },
+    [imageryFailed, actions],
+  );
+
   const stepCounter = isLocate
-    ? 'first, the outline of the hole'
+    ? locateDone
+      ? 'the line you drew'
+      : 'draw the line the hole plays'
     : allDone
       ? 'all checks done'
       : `check ${state.step + 1} of ${STEPS.length}`;
 
+  const turnPoints = Math.max(locatePoints.length - 2, 0);
+
   return (
     <section style={{ display: 'grid', gridTemplateColumns: '1fr 428px', height: 'calc(100vh - 56px)' }}>
       {/* ---------- Map pane ---------- */}
-      <div style={{ position: 'relative', overflow: 'hidden', background: '#24391f' }}>
-        <HoleImagery />
-
-        <svg
-          viewBox="0 0 1000 680"
-          preserveAspectRatio="none"
-          onClick={actions.onMapClick}
-          style={{
-            position: 'absolute',
-            inset: 0,
-            width: '100%',
-            height: '100%',
-            display: 'block',
-            cursor: mapCursor,
-          }}
+      <div style={{ position: 'relative', overflow: 'hidden', background: '#22321f' }}>
+        <BaseMap
+          bounds={frame.current.bounds}
+          center={course ? [course.longitude, course.latitude] : undefined}
+          label={`Hole ${holeNum}`}
+          note={`${measurement} · ${teeSetName} says ${cardText}`}
+          onMapReady={handleMapReady}
+          onMapClick={handleMapClick}
+          onImageryStatusChange={setImagery}
         >
-          {!isLocate &&
-            pendingIds.map((id) => (
-              <path
-                key={id}
-                d={SHAPES[id].d}
-                fill="rgba(255,255,255,.05)"
-                stroke="rgba(255,255,255,.42)"
-                strokeWidth={2}
-                strokeDasharray="7 6"
-              />
-            ))}
-          {confirmedShapes.map((c, i) => (
-            <path
-              key={i}
-              d={(c as { d: string }).d}
-              fill="rgba(163,220,199,.16)"
-              stroke="#a3dcc7"
-              strokeWidth={2.5}
+          {/* The click target sits above the canvas only to carry the cursor. */}
+          {placing && (
+            <div
+              style={{ position: 'absolute', inset: 0, cursor: 'crosshair', pointerEvents: 'none' }}
+              aria-hidden="true"
             />
-          ))}
-          {activeShapes.map((a, i) => (
-            <g key={i}>
-              <path d={a.d} fill="none" stroke="rgba(62,207,180,.35)" strokeWidth={14} />
-              <path
-                d={a.d}
-                fill="rgba(62,207,180,.14)"
-                stroke="var(--mint-400)"
-                strokeWidth={3.5}
-                strokeDasharray="10 8"
-                style={{ animation: 'ogDash 1.4s linear infinite' }}
-              />
-            </g>
-          ))}
-        </svg>
+          )}
 
-        <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
-          {shapeLabels.map((l) => (
-            <span
-              key={l.key}
+          <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden' }}>
+            {placed.map((label) => (
+              <span
+                key={label.key}
+                style={{
+                  position: 'absolute',
+                  left: label.x,
+                  top: label.y,
+                  transform: 'translate(-50%, calc(-100% - 12px))',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  height: 24,
+                  padding: '0 9px',
+                  borderRadius: 6,
+                  background: 'rgba(6,43,38,.86)',
+                  color: '#d3efe4',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 12,
+                  letterSpacing: '.02em',
+                  whiteSpace: 'nowrap',
+                  boxShadow: '0 1px 6px rgba(6,43,38,.4)',
+                }}
+              >
+                {label.text}
+              </span>
+            ))}
+          </div>
+
+          {state.addMode && !imageryFailed && (
+            <div
               style={{
                 position: 'absolute',
-                left: `${l.left}%`,
-                top: `${l.top}%`,
-                display: 'inline-flex',
-                alignItems: 'center',
-                height: 26,
-                padding: '0 10px',
-                borderRadius: 6,
-                background: l.bg,
-                color: l.fg,
-                fontFamily: 'var(--font-mono)',
-                fontSize: 13,
-                letterSpacing: '.02em',
-                whiteSpace: 'nowrap',
-                boxShadow: '0 1px 6px rgba(6,43,38,.4)',
-              }}
-            >
-              {l.text}
-            </span>
-          ))}
-        </div>
-
-        <div
-          style={{
-            position: 'absolute',
-            top: 20,
-            left: 20,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 14,
-            background: 'rgba(6,43,38,.82)',
-            backdropFilter: 'var(--blur-panel)',
-            border: '1px solid rgba(255,255,255,.14)',
-            borderRadius: 'var(--radius-md)',
-            padding: '11px 16px',
-          }}
-        >
-          <span
-            style={{
-              fontFamily: 'var(--font-display)',
-              fontSize: 20,
-              fontWeight: 800,
-              color: '#fff',
-              letterSpacing: '-.02em',
-            }}
-          >
-            Hole {holeNum}
-          </span>
-          <span style={{ width: 1, height: 18, background: 'rgba(255,255,255,.2)', display: 'block' }} />
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green-200)' }}>
-            tee to green {isLocate ? (locateDone ? locateYds : '—') : (measured ?? '—')} yd · card
-            says {cardText}
-          </span>
-        </div>
-
-        {state.addMode && (
-          <div
-            style={{
-              position: 'absolute',
-              top: 20,
-              left: '50%',
-              transform: 'translateX(-50%)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 14,
-              background: 'var(--mint-400)',
-              color: 'var(--green-950)',
-              borderRadius: 'var(--radius-md)',
-              padding: '12px 16px',
-              fontSize: 14,
-              fontWeight: 600,
-              boxShadow: 'var(--shadow-lg)',
-              animation: 'ogRise 190ms var(--ease-out)',
-            }}
-          >
-            Click the map where the {state.addMode} is.
-            <button
-              onClick={actions.cancelAdd}
-              style={{
-                background: 'rgba(6,43,38,.14)',
-                border: 'none',
-                borderRadius: 'var(--radius-sm)',
-                height: 26,
-                padding: '0 10px',
-                color: 'var(--green-950)',
-                fontFamily: 'var(--font-mono)',
-                fontSize: 11,
-                cursor: 'pointer',
-              }}
-            >
-              cancel
-            </button>
-          </div>
-        )}
-
-        {isLocate && !locateDone && (
-          <div
-            style={{
-              position: 'absolute',
-              top: 20,
-              left: '50%',
-              transform: 'translateX(-50%)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: 12,
-              background: 'var(--mint-400)',
-              color: 'var(--green-950)',
-              borderRadius: 'var(--radius-md)',
-              padding: '12px 16px',
-              fontSize: 14,
-              fontWeight: 600,
-              boxShadow: 'var(--shadow-lg)',
-              animation: 'ogRise 190ms var(--ease-out)',
-            }}
-          >
-            <span
-              style={{
-                width: 22,
-                height: 22,
-                borderRadius: 999,
-                background: 'rgba(6,43,38,.16)',
+                top: 20,
+                left: '50%',
+                transform: 'translateX(-50%)',
                 display: 'flex',
                 alignItems: 'center',
-                justifyContent: 'center',
-                fontFamily: 'var(--font-mono)',
-                fontSize: 12,
+                gap: 14,
+                background: 'var(--mint-400)',
+                color: 'var(--green-950)',
+                borderRadius: 'var(--radius-md)',
+                padding: '12px 16px',
+                fontSize: 14,
+                fontWeight: 600,
+                boxShadow: 'var(--shadow-lg)',
+                animation: 'ogRise 190ms var(--ease-out)',
               }}
             >
-              {tee ? '2' : '1'}
-            </span>
-            {tee ? 'Now click the green you putt on.' : 'Click where you tee off.'}
-          </div>
-        )}
+              Click the map where the {state.addMode} is.
+              <button
+                onClick={actions.cancelAdd}
+                style={{
+                  background: 'rgba(6,43,38,.14)',
+                  border: 'none',
+                  borderRadius: 'var(--radius-sm)',
+                  height: 26,
+                  padding: '0 10px',
+                  color: 'var(--green-950)',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 11,
+                  cursor: 'pointer',
+                }}
+              >
+                cancel
+              </button>
+            </div>
+          )}
 
-        <div
-          style={{
-            position: 'absolute',
-            bottom: 20,
-            right: 20,
-            display: 'flex',
-            gap: 18,
-            background: 'rgba(6,43,38,.78)',
-            border: '1px solid rgba(255,255,255,.12)',
-            borderRadius: 'var(--radius-md)',
-            padding: '9px 14px',
-            fontFamily: 'var(--font-mono)',
-            fontSize: 11,
-            color: 'var(--green-200)',
-          }}
-        >
-          <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <span style={{ width: 18, height: 0, borderTop: '2px dashed var(--mint-400)', display: 'block' }} />
-            asking you now
-          </span>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <span style={{ width: 18, height: 0, borderTop: '2px solid #a3dcc7', display: 'block' }} />
-            you confirmed
-          </span>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <span
-              style={{ width: 18, height: 0, borderTop: '2px dashed rgba(255,255,255,.42)', display: 'block' }}
-            />
-            not asked yet
-          </span>
-        </div>
+          {isLocate && !locateDone && !imageryFailed && (
+            <div
+              style={{
+                position: 'absolute',
+                top: 20,
+                left: '50%',
+                transform: 'translateX(-50%)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                background: 'var(--mint-400)',
+                color: 'var(--green-950)',
+                borderRadius: 'var(--radius-md)',
+                padding: '12px 16px',
+                fontSize: 14,
+                fontWeight: 600,
+                boxShadow: 'var(--shadow-lg)',
+                animation: 'ogRise 190ms var(--ease-out)',
+              }}
+            >
+              <span
+                style={{
+                  width: 22,
+                  height: 22,
+                  borderRadius: 999,
+                  background: 'rgba(6,43,38,.16)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 12,
+                }}
+              >
+                {locatePoints.length + 1}
+              </span>
+              {locatePoints.length === 0
+                ? 'Click where you tee off.'
+                : 'Click where the hole bends, then the green you putt on.'}
+            </div>
+          )}
+
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 20,
+              left: 20,
+              display: 'flex',
+              gap: 18,
+              background: 'rgba(6,43,38,.78)',
+              border: '1px solid rgba(255,255,255,.12)',
+              borderRadius: 'var(--radius-md)',
+              padding: '9px 14px',
+              fontFamily: 'var(--font-mono)',
+              fontSize: 11,
+              color: 'var(--green-200)',
+            }}
+          >
+            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span style={{ width: 18, height: 0, borderTop: '2px solid var(--mint-400)', display: 'block' }} />
+              asking you now
+            </span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span style={{ width: 18, height: 0, borderTop: '2px solid #a3dcc7', display: 'block' }} />
+              you confirmed
+            </span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span
+                style={{ width: 18, height: 0, borderTop: '2px dashed rgba(255,255,255,.42)', display: 'block' }}
+              />
+              not asked yet
+            </span>
+          </div>
+        </BaseMap>
       </div>
 
       {/* ---------- Review rail ---------- */}
@@ -387,7 +439,7 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
             <p style={{ margin: '0 0 12px', fontSize: 14, color: '#f2e0c4', textWrap: 'pretty' }}>
               {state.attentionResolved
                 ? 'We swapped in the green further up the hole. Everything below is back to a normal check.'
-                : `Tee to green measures 250 yards. Your card says hole ${holeNum} plays ${cardText} from the back tee. Usually that means we grabbed the wrong green — pick the one you putt on.`}
+                : `Tee to green measures 250 yards. Your card says hole ${holeNum} plays ${cardText} from the ${teeSetName.toLowerCase()} tee. Usually that means we grabbed the wrong green — pick the one you putt on.`}
             </p>
 
             {!state.attentionResolved && (
@@ -575,34 +627,68 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
               Show us where this hole plays.
             </h3>
             <p style={{ margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' }}>
-              Two clicks on the imagery: where you tee off, then the green you putt on. We draw
-              everything inside that line and you check it.
+              Click the tee, then a point wherever the hole bends, then the green you putt on. We
+              measure along the line you drew — the same way your card counts a dogleg.
             </p>
+
+            {/* R15: the card the line is checked against is the set you played. */}
+            <div style={{ ...STEP_ROW, marginBottom: 10 }}>
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)', width: 74 }}>
+                measuring
+              </span>
+              <select
+                value={state.teeSet ?? ''}
+                onChange={(e) => actions.setTeeSet(e.target.value)}
+                aria-label="Tee set to measure against"
+                style={{
+                  flex: 1,
+                  height: 32,
+                  background: 'var(--green-800)',
+                  color: '#fff',
+                  border: '1px solid rgba(255,255,255,.18)',
+                  borderRadius: 'var(--radius-sm)',
+                  padding: '0 8px',
+                  fontSize: 13,
+                  cursor: 'pointer',
+                }}
+              >
+                {(course?.tees ?? []).map((tee) => (
+                  <option key={tee.color} value={tee.color}>
+                    from the {tee.name} tees
+                  </option>
+                ))}
+              </select>
+            </div>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 16 }}>
               {[
-                { num: '1', label: 'Where you tee off', done: !!tee, state: tee ? 'marked' : 'click the map' },
+                {
+                  num: '1',
+                  label: 'Where you tee off',
+                  done: locatePoints.length >= 1,
+                  state: locatePoints.length >= 1 ? 'marked' : 'click the map',
+                },
                 {
                   num: '2',
+                  label: 'Where the hole bends',
+                  done: turnPoints > 0,
+                  state:
+                    turnPoints > 0
+                      ? `${turnPoints} point${turnPoints === 1 ? '' : 's'}`
+                      : locatePoints.length >= 1
+                        ? 'optional'
+                        : 'next',
+                },
+                {
+                  num: '3',
                   label: 'The green you putt on',
-                  done: !!green,
-                  state: green ? 'marked' : tee ? 'click the map' : 'next',
+                  done: locateDone,
+                  state: locateDone ? 'marked' : locatePoints.length >= 1 ? 'click, then finish' : 'next',
                 },
               ].map((p) => {
-                const ring = p.done ? 'var(--mint-400)' : p.num === '1' || tee ? '#fff' : 'var(--green-200)';
+                const ring = p.done ? 'var(--mint-400)' : locatePoints.length >= 1 ? '#fff' : 'var(--green-200)';
                 return (
-                  <div
-                    key={p.num}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 11,
-                      background: 'var(--green-900)',
-                      border: '1px solid rgba(255,255,255,.12)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: '11px 13px',
-                    }}
-                  >
+                  <div key={p.num} style={STEP_ROW}>
                     <span
                       style={{
                         width: 24,
@@ -626,6 +712,31 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
               })}
             </div>
 
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9, marginBottom: 14 }}>
+              <HoverButton
+                onClick={actions.undoLastPoint}
+                disabled={locatePoints.length === 0}
+                style={{ ...GHOST_BUTTON, opacity: locatePoints.length === 0 ? 0.45 : 1 }}
+                hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
+              >
+                Undo last point
+              </HoverButton>
+              <HoverButton
+                onClick={actions.finishLine}
+                disabled={!canFinish}
+                style={{
+                  ...GHOST_BUTTON,
+                  background: canFinish ? 'var(--mint-400)' : 'var(--green-900)',
+                  color: canFinish ? 'var(--green-950)' : '#fff',
+                  borderColor: canFinish ? 'var(--mint-400)' : 'rgba(255,255,255,.2)',
+                  opacity: canFinish ? 1 : 0.45,
+                }}
+                hoverStyle={canFinish ? {} : { background: 'var(--green-900)' }}
+              >
+                Finish the line
+              </HoverButton>
+            </div>
+
             {locateDone && (
               <div style={{ animation: 'ogRise 190ms var(--ease-out)' }}>
                 <div
@@ -645,26 +756,26 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
                   }}
                 >
                   <span style={{ color: '#fff', fontSize: 20 }}>{locateYds}</span>
-                  <span>yd tee to green</span>
+                  <span>yd along your line</span>
                   <span
                     style={{
                       marginLeft: 'auto',
-                      color: locateWithinTolerance ? 'var(--mint-400)' : 'var(--amber-500)',
+                      color:
+                        locateVerdict === LOCATE_CLOSE_ENOUGH ? 'var(--mint-400)' : 'var(--amber-500)',
                     }}
                   >
-                    the card says {cardText} —{' '}
-                    {locateWithinTolerance ? 'close enough' : 'check your two clicks'}
+                    the {teeSetName} tees say {cardText} — {locateVerdict ?? 'no card to check'}
                   </span>
                 </div>
                 <Button size="lg" variant="accent" fullWidth onClick={actions.confirmLocate}>
-                  Find the rest of the hole
+                  Save this line and carry on
                 </Button>
               </div>
             )}
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 14 }}>
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
-                nothing is drawn until you click
+                {locatePoints.length} point{locatePoints.length === 1 ? '' : 's'} marked
               </span>
               <button
                 onClick={actions.resetLocate}
@@ -708,18 +819,7 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
             {q.isTees && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 16 }}>
                 {TEE_IDS.map((id, i) => (
-                  <div
-                    key={id}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 10,
-                      background: 'var(--green-900)',
-                      border: '1px solid rgba(255,255,255,.12)',
-                      borderRadius: 'var(--radius-md)',
-                      padding: '9px 12px',
-                    }}
-                  >
+                  <div key={id} style={{ ...STEP_ROW, gap: 10, padding: '9px 12px' }}>
                     <span
                       style={{
                         fontFamily: 'var(--font-mono)',
@@ -763,34 +863,14 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
                 <HoverButton
                   onClick={actions.reject}
-                  style={{
-                    height: 44,
-                    background: 'var(--green-900)',
-                    border: '1px solid rgba(255,255,255,.2)',
-                    borderRadius: 'var(--radius-md)',
-                    color: '#fff',
-                    fontSize: 14,
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                    padding: '0 10px',
-                  }}
+                  style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
                   hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
                 >
                   {q.reject}
                 </HoverButton>
                 <HoverButton
                   onClick={actions.missing}
-                  style={{
-                    height: 44,
-                    background: 'var(--green-900)',
-                    border: '1px solid rgba(255,255,255,.2)',
-                    borderRadius: 'var(--radius-md)',
-                    color: '#fff',
-                    fontSize: 14,
-                    fontWeight: 600,
-                    cursor: 'pointer',
-                    padding: '0 10px',
-                  }}
+                  style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
                   hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
                 >
                   {q.miss}

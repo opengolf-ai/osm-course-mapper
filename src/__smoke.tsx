@@ -8,6 +8,7 @@ import { INITIAL, computeDerived, type MapperState, type Mapper } from './state/
 import { buildCourseSession, defaultTeeAssign, holeStatusesFrom } from './state/courseSession';
 import type { CourseDetail } from './api/types';
 import type { OsmCourse, OsmLookup } from './api/overpass';
+import type { LngLat } from './geo/coords';
 import { STEPS } from './data/course';
 
 const noop = () => {};
@@ -109,12 +110,24 @@ const FOUND: OsmLookup = { status: 'found', course: OSM_COURSE };
 const ABSENT: OsmLookup = { status: 'absent' };
 const UNKNOWN: OsmLookup = { status: 'unknown', message: 'it did not answer within 8s' };
 
+/*
+ * A real playing line: OpenStreetMap way 671717506, Pebble Beach hole 1, tee,
+ * corner and green. Not invented geometry — a copy of what OSM already holds, so
+ * the server render has a line to measure.
+ */
+const PEBBLE_HOLE_ONE: LngLat[] = [
+  [-121.9495343, 36.5693904],
+  [-121.9477382, 36.5705598],
+  [-121.9461359, 36.5706059],
+];
+
 function mapperFor(overrides: Partial<MapperState>): Mapper {
   const state: MapperState = {
     ...INITIAL,
     screen: 'review',
     course: COURSE,
     teeAssign: defaultTeeAssign(COURSE),
+    teeSet: COURSE.tees[0]?.color ?? null,
     osm: FOUND,
     holeStatus: holeStatusesFrom(COURSE, FOUND),
     ...overrides,
@@ -185,7 +198,7 @@ export function renderAll(): Record<string, string> {
         mapper={mapperFor({
           mode: 'ready',
           step: STEPS.length,
-          confirmed: ['green', 'bunkerA', 'bunkerB', 'tee1', 'tee2', 'tee3', 'tee4', 'fairway'],
+          locate: { points: PEBBLE_HOLE_ONE, finished: true },
         })}
       />,
     ),
@@ -195,12 +208,21 @@ export function renderAll(): Record<string, string> {
     reviewLocateEmpty: renderToString(
       <ReviewScreen mapper={mapperFor({ mode: 'locate', holeIndex: 9 })} />,
     ),
+    reviewLocateDrawing: renderToString(
+      <ReviewScreen
+        mapper={mapperFor({
+          mode: 'locate',
+          holeIndex: 0,
+          locate: { points: PEBBLE_HOLE_ONE.slice(0, 2), finished: false },
+        })}
+      />,
+    ),
     reviewLocateDone: renderToString(
       <ReviewScreen
         mapper={mapperFor({
           mode: 'locate',
-          holeIndex: 9,
-          locate: { tee: { x: 150, y: 620 }, green: { x: 838, y: 150 } },
+          holeIndex: 0,
+          locate: { points: PEBBLE_HOLE_ONE, finished: true },
         })}
       />,
     ),

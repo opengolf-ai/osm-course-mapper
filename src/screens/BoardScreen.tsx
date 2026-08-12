@@ -1,5 +1,5 @@
 import type { OsmLookup } from '../api/overpass';
-import { MINIS, STATUS_META, type HoleStatus } from '../data/course';
+import { STATUS_META, type HoleStatus } from '../data/course';
 import { holeYardage, type CourseSession } from '../state/courseSession';
 import { Badge } from '../ds';
 import { HoverButton } from '../components/HoverButton';
@@ -24,12 +24,16 @@ const PROGRESS_FILL: Record<HoleStatus, string> = {
     'repeating-linear-gradient(45deg, rgba(188,217,232,.34) 0 3px, rgba(255,255,255,.06) 3px 6px)',
 };
 
-const STROKE: Record<HoleStatus, string> = {
-  complete: '#a3dcc7',
-  attention: '#eec98a',
-  ready: '#3ecfb4',
-  unmapped: '#3ecfb4',
-  unknown: '#bcd9e8',
+/** The tile's image slot until real per-hole imagery lands: flat, and plainly empty. */
+const TILE_PLACEHOLDER: React.CSSProperties = {
+  position: 'relative',
+  height: 88,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background:
+    'repeating-linear-gradient(135deg, rgba(255,255,255,.035) 0 6px, rgba(255,255,255,0) 6px 12px), var(--green-950)',
+  borderBottom: '1px solid rgba(255,255,255,.08)',
 };
 
 /** The one banner the board carries, stating what the OpenStreetMap lookup found. */
@@ -196,42 +200,23 @@ export function BoardScreen({
                 borderColor: 'rgba(255,255,255,.22)',
               }}
             >
-              <div style={{ position: 'relative', height: 88, background: '#2a3f24' }}>
-                <svg
-                  viewBox="0 0 120 88"
-                  preserveAspectRatio="none"
-                  style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
+              {/*
+               * A neutral placeholder, not a drawing of a hole. Per-hole thumbnails
+               * off real imagery are deferred, and a generated silhouette here would
+               * be a shape claiming to be this hole when it is not.
+               */}
+              <div style={TILE_PLACEHOLDER}>
+                <span
+                  style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 10,
+                    letterSpacing: '.12em',
+                    textTransform: 'uppercase',
+                    color: 'rgba(211,239,228,.42)',
+                  }}
                 >
-                  <rect width="120" height="88" fill="#2c4126" />
-                  <ellipse cx="20" cy="18" rx="26" ry="20" fill="#1d2f16" />
-                  <ellipse cx="104" cy="74" rx="24" ry="18" fill="#1d2f16" />
-                  <path d={MINIS[i % 3]} fill="#527d3b" />
-                  {/* Nothing is drawn for a hole we hold nothing about, or know nothing about. */}
-                  {st !== 'unmapped' && st !== 'unknown' && (
-                    <g>
-                      <ellipse
-                        cx={92}
-                        cy={20}
-                        rx={9}
-                        ry={7}
-                        fill="#8bb256"
-                        stroke={STROKE[st]}
-                        strokeWidth={1.6}
-                        strokeDasharray={st === 'complete' ? undefined : '3 3'}
-                      />
-                      <ellipse
-                        cx={74}
-                        cy={34}
-                        rx={5}
-                        ry={3.4}
-                        fill="#ded1a8"
-                        stroke={STROKE[st]}
-                        strokeWidth={1.2}
-                        strokeDasharray={st === 'complete' ? undefined : '3 3'}
-                      />
-                    </g>
-                  )}
-                </svg>
+                  no thumbnail yet
+                </span>
               </div>
               <div style={{ padding: '12px 14px 14px' }}>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 9 }}>
