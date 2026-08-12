@@ -1,0 +1,16 @@
+@import url("./tokens/fonts.css");
+@import url("./tokens/colors.css");
+@import url("./tokens/typography.css");
+@import url("./tokens/spacing.css");
+@import url("./tokens/elevation.css");
+@import url("./tokens/motion.css");
+@import url("./tokens/base.css");
+
+html,body{margin:0;padding:0;background:var(--green-950)}
+*{box-sizing:border-box}
+a{color:var(--mint-400);text-decoration:none}
+a:hover{color:var(--mint-300)}
+@keyframes ogPulse{0%{opacity:.35}50%{opacity:1}100%{opacity:.35}}
+@keyframes ogRise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes ogDash{to{stroke-dashoffset:-28}}
+input,select{font-family:var(--font-sans)}

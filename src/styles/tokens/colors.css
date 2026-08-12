@@ -1,0 +1,58 @@
+:root{
+/* --- Brand base: sampled directly from the opengolf.ai logo --- */
+--green-950:#062b26;--green-900:#0b3d36;--green-800:#0d4a42;--green-700:#12564a;
+--green-600:#186048;--green-500:#237a5c;--green-400:#3d9a76;--green-300:#6cbfa1;
+--green-200:#a3dcc7;--green-100:#d3efe4;--green-50:#ecf7f2;
+--mint-600:#1fa892;--mint-500:#2bc0a6;--mint-400:#3ecfb4;--mint-300:#80d0c8;--mint-200:#b3e5df;--mint-100:#dcf3f0;
+/* --- Paper / neutrals: warm, faintly green-shifted (the logo plate) --- */
+--paper:#f9faf4;--paper-2:#f2f4ea;--paper-3:#e8ebdf;
+--ink-900:#0e1f1b;--ink-800:#1c2f2a;--ink-700:#33443e;--ink-600:#4d5f58;
+--ink-500:#6b7c74;--ink-400:#8d9c94;--ink-300:#b3c0b8;--ink-200:#d3dbd3;--ink-100:#e7ece5;
+--white:#ffffff;
+/* --- Status --- */
+--amber-500:#c98a15;--amber-100:#f8ecd2;
+--clay-500:#b4462f;--clay-100:#f7dfd9;
+--sky-500:#2b7fa8;--sky-100:#dcecf4;
+
+/* --- Semantic aliases: use these in components --- */
+--brand-primary:var(--green-800);
+--brand-primary-hover:var(--green-900);
+--brand-primary-active:var(--green-950);
+--brand-accent:var(--mint-400);
+--brand-accent-soft:var(--mint-300);
+--brand-flag:var(--green-600);
+
+--surface-page:var(--paper);
+--surface-card:var(--white);
+--surface-sunken:var(--paper-2);
+--surface-inset:var(--paper-3);
+--surface-inverse:var(--green-900);
+--surface-accent-soft:var(--green-50);
+
+--text-body:var(--ink-800);
+--text-heading:var(--green-900);
+--text-muted:var(--ink-500);
+--text-faint:var(--ink-400);
+--text-inverse:var(--paper);
+--text-accent:var(--green-700);
+--text-link:var(--green-700);
+--text-link-hover:var(--green-950);
+
+--border-subtle:var(--ink-100);
+--border-default:var(--ink-200);
+--border-strong:var(--ink-300);
+--border-accent:var(--green-300);
+--border-focus:var(--mint-500);
+
+--status-success-fg:var(--green-500);--status-success-bg:var(--green-50);
+--status-warning-fg:var(--amber-500);--status-warning-bg:var(--amber-100);
+--status-danger-fg:var(--clay-500);--status-danger-bg:var(--clay-100);
+--status-info-fg:var(--sky-500);--status-info-bg:var(--sky-100);
+}
+/* Inverted sections (footers, dark hero bands, terminal panels) */
+.og-inverse{
+--surface-card:var(--green-800);--surface-page:var(--green-900);--surface-sunken:var(--green-950);
+--text-body:var(--green-100);--text-heading:var(--white);--text-muted:var(--green-200);
+--border-subtle:rgba(255,255,255,.10);--border-default:rgba(255,255,255,.16);--border-strong:rgba(255,255,255,.28);
+--text-link:var(--mint-400);--text-link-hover:var(--mint-300);
+}
