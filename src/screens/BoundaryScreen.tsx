@@ -1,16 +1,23 @@
-import { COURSE_NAME, LANDMARKS } from '../data/course';
+import { LANDMARKS } from '../data/course';
 import { Button, Icon } from '../ds';
 import { CourseImagery } from '../components/CourseImagery';
 import { HoverButton } from '../components/HoverButton';
 
 interface BoundaryScreenProps {
+  courseName: string;
   flagged: boolean;
   onFlag: () => void;
   onConfirm: () => void;
   onBack: () => void;
 }
 
-export function BoundaryScreen({ flagged, onFlag, onConfirm, onBack }: BoundaryScreenProps) {
+export function BoundaryScreen({
+  courseName,
+  flagged,
+  onFlag,
+  onConfirm,
+  onBack,
+}: BoundaryScreenProps) {
   return (
     <section style={{ display: 'grid', gridTemplateColumns: '1fr 420px', height: 'calc(100vh - 56px)' }}>
       <div style={{ position: 'relative', overflow: 'hidden', background: '#22321f' }}>
@@ -40,7 +47,7 @@ export function BoundaryScreen({ flagged, onFlag, onConfirm, onBack }: BoundaryS
               animation: 'ogPulse 2.4s var(--ease-out) infinite',
             }}
           />
-          <span style={{ fontSize: 14, fontWeight: 600, color: '#fff' }}>{COURSE_NAME}</span>
+          <span style={{ fontSize: 14, fontWeight: 600, color: '#fff' }}>{courseName}</span>
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green-200)' }}>
             outline we traced
           </span>

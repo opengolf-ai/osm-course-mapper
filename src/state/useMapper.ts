@@ -5,15 +5,20 @@ import {
   REVIEW_VIEWBOX,
   SHAPES,
   STEPS,
-  TEES,
   TEE_IDS,
   YARDAGE_TOLERANCE,
-  YDS,
   type HoleStatus,
   type Step,
   type TeeId,
 } from '../data/course';
 import { corridorPath, distance, ell, rr, type Point } from '../data/geometry';
+import {
+  defaultTeeAssign,
+  holeYardage,
+  scorecardFor,
+  statusesFor,
+  type CourseSession,
+} from './courseSession';
 
 export type Screen = 'search' | 'boundary' | 'board' | 'review' | 'complete';
 export type ReviewMode = 'ready' | 'locate' | 'attention';
@@ -26,6 +31,8 @@ export interface ExtraShape {
 
 export interface MapperState {
   screen: Screen;
+  /** The course the contributor opened. Null until a detail record loads. */
+  course: CourseSession | null;
   query: string;
   mode: ReviewMode;
   holeIndex: number;
@@ -44,6 +51,7 @@ export interface MapperState {
 
 export const INITIAL: MapperState = {
   screen: 'search',
+  course: null,
   query: '',
   mode: 'ready',
   holeIndex: 0,
@@ -56,7 +64,8 @@ export const INITIAL: MapperState = {
   lastAction: '',
   attentionResolved: false,
   flagged: false,
-  teeAssign: { tee1: 'Blue', tee2: 'Gold', tee3: 'White', tee4: 'Red' },
+  /* Named for real when a course loads — `defaultTeeAssign` reads the course's own sets. */
+  teeAssign: { tee1: '', tee2: '', tee3: '', tee4: '' },
   holeStatus: INITIAL_STATUS.slice(),
 };
 
@@ -78,7 +87,10 @@ const isBlocked = (s: MapperState) => s.mode === 'attention' && !s.attentionReso
  */
 export function computeDerived(s: MapperState) {
   const hi = s.holeIndex;
-  const cardYds = YDS[hi];
+  const course = s.course;
+  const hole = course?.holes[hi] ?? null;
+  /* Null, never 0, when the record carries no yardage: the screens say "—" for it. */
+  const cardYds = course ? holeYardage(course, hi) : null;
   const q = currentStep(s);
   const allDone = s.step >= STEPS.length;
   const isLocate = s.mode === 'locate';
@@ -86,8 +98,11 @@ export function computeDerived(s: MapperState) {
 
   const { tee, green } = s.locate;
   const locateDone = !!(tee && green);
-  const locateYds = locateDone ? Math.round(distance(tee!, green!) * (cardYds / REVIEW_DIAGONAL)) : 0;
-  const locateOff = Math.abs(locateYds - cardYds);
+  const locateYds =
+    locateDone && cardYds !== null
+      ? Math.round(distance(tee!, green!) * (cardYds / REVIEW_DIAGONAL))
+      : 0;
+  const locateOff = cardYds === null ? Infinity : Math.abs(locateYds - cardYds);
   const corridor = locateDone ? corridorPath(tee!, green!) : null;
 
   const activeIds = s.addMode
@@ -112,6 +127,8 @@ export function computeDerived(s: MapperState) {
   return {
     hi,
     cardYds,
+    holePar: hole?.par ?? null,
+    holeHandicapIndex: hole?.handicapIndex ?? null,
     q,
     allDone,
     isLocate,
@@ -126,11 +143,8 @@ export function computeDerived(s: MapperState) {
     pendingIds,
     measured,
     doneCount: s.holeStatus.filter((x) => x === 'complete').length,
-    scorecard: TEES.map((t) => ({
-      name: t.name,
-      yd: Math.round(cardYds * (t.yd / 378)),
-      swatch: t.swatch,
-    })),
+    /* Straight off this hole's own `yardages` map — no ratio, no hole-1 baseline. */
+    scorecard: course ? scorecardFor(course, hi) : [],
     summary: [
       '1 green',
       `${2 - bunkersRemoved + s.extra.length} bunkers`,
@@ -163,6 +177,34 @@ export function useMapper() {
         attentionResolved:
           screen === 'review' && mode === 'attention' ? false : s.attentionResolved,
       }));
+    },
+    [patch],
+  );
+
+  /**
+   * Adopt a loaded course. Everything sized to the previous course — the hole
+   * statuses, the hole index, the tee names — is rebuilt here, so opening a
+   * nine-hole course after an eighteen never leaves nine stale tiles behind.
+   */
+  const openCourse = useCallback(
+    (session: CourseSession) => {
+      patch({
+        course: session,
+        screen: 'board',
+        mode: 'ready',
+        holeIndex: 0,
+        holeStatus: statusesFor(session, INITIAL_STATUS),
+        teeAssign: defaultTeeAssign(session),
+        step: 0,
+        confirmed: [],
+        removed: [],
+        extra: [],
+        addMode: null,
+        locate: { tee: null, green: null },
+        lastAction: '',
+        attentionResolved: false,
+        flagged: false,
+      });
     },
     [patch],
   );
@@ -333,6 +375,7 @@ export function useMapper() {
     actions: {
       patch,
       go,
+      openCourse,
       accept,
       reject,
       missing,

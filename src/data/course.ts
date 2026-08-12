@@ -1,24 +1,5 @@
 import { ell, rr } from './geometry';
 
-export interface Tee {
-  name: string;
-  yd: number;
-  swatch: string;
-}
-
-/** Pebble Beach hole 1 tee set. Yardages for other holes are scaled from these. */
-export const TEES: Tee[] = [
-  { name: 'Blue', yd: 378, swatch: '#2b7fa8' },
-  { name: 'Gold', yd: 349, swatch: '#c98a15' },
-  { name: 'White', yd: 337, swatch: '#e8ebdf' },
-  { name: 'Green', yd: 328, swatch: '#237a5c' },
-  { name: 'Red', yd: 310, swatch: '#b4462f' },
-];
-
-export const PARS = [4, 5, 4, 4, 3, 5, 3, 4, 4, 4, 4, 3, 4, 5, 4, 4, 3, 5];
-export const YDS = [378, 502, 390, 331, 192, 506, 106, 427, 481, 495, 390, 202, 445, 580, 397, 403, 178, 543];
-export const INDEX = [6, 10, 2, 16, 8, 12, 18, 4, 14, 5, 9, 17, 3, 7, 11, 1, 15, 13];
-
 export type HoleStatus = 'ready' | 'attention' | 'complete' | 'unmapped';
 
 export const INITIAL_STATUS: HoleStatus[] = [
@@ -159,9 +140,6 @@ export const LANDMARKS: Landmark[] = [
   { name: '17-Mile Drive', icon: 'x', verdict: 'outside', color: 'var(--green-200)', action: 'should be in' },
   { name: 'Carmel Bay shoreline', icon: 'x', verdict: 'outside', color: 'var(--green-200)', action: 'should be in' },
 ];
-
-export const COURSE_NAME = 'Pebble Beach Golf Links';
-export const COURSE_META = 'par 72 · 6,802 yd · 18 holes · Jack Neville & Douglas Grant, 1919';
 
 /** Review map viewBox, shared by the imagery and the overlay so clicks land in the same space. */
 export const REVIEW_VIEWBOX = { w: 1000, h: 680 };

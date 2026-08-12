@@ -1,16 +1,10 @@
-import {
-  COURSE_META,
-  COURSE_NAME,
-  MINIS,
-  PARS,
-  STATUS_META,
-  YDS,
-  type HoleStatus,
-} from '../data/course';
+import { MINIS, STATUS_META, type HoleStatus } from '../data/course';
+import { holeYardage, type CourseSession } from '../state/courseSession';
 import { Badge } from '../ds';
 import { HoverButton } from '../components/HoverButton';
 
 interface BoardScreenProps {
+  course: CourseSession;
   holeStatus: HoleStatus[];
   doneCount: number;
   onOpenHole: (index: number) => void;
@@ -31,7 +25,16 @@ const STROKE: Record<HoleStatus, string> = {
   unmapped: '#3ecfb4',
 };
 
-export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: BoardScreenProps) {
+export function BoardScreen({
+  course,
+  holeStatus,
+  doneCount,
+  onOpenHole,
+  onBack,
+}: BoardScreenProps) {
+  /* The course decides how many tiles there are; the status list only colors them. */
+  const statusAt = (i: number): HoleStatus => holeStatus[i] ?? 'unmapped';
+
   return (
     <section>
       <div
@@ -54,7 +57,7 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
               margin: '0 0 6px',
             }}
           >
-            {COURSE_NAME}
+            {course.name}
           </h1>
           <div
             style={{
@@ -64,8 +67,14 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
               fontVariantNumeric: 'tabular-nums',
             }}
           >
-            {COURSE_META}
+            {course.meta}
           </div>
+          {/* Said out loud rather than shown as blank tiles, per R5. */}
+          {!course.cardAvailable && (
+            <div style={{ fontSize: 13, color: 'var(--amber-500)', marginTop: 6 }}>
+              A scorecard is not in this course’s record — pars and yardages are unknown.
+            </div>
+          )}
         </div>
         <div style={{ width: 360 }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
@@ -79,13 +88,15 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
             >
               {doneCount}
             </span>
-            <span style={{ fontSize: 14, color: 'var(--green-200)' }}>of 18 holes on the map</span>
+            <span style={{ fontSize: 14, color: 'var(--green-200)' }}>
+              of {course.holes.length} holes on the map
+            </span>
           </div>
           <div style={{ display: 'flex', gap: 3 }}>
-            {holeStatus.map((st, i) => (
+            {course.holes.map((hole, i) => (
               <span
-                key={i}
-                style={{ flex: 1, height: 8, borderRadius: 2, background: PROGRESS_FILL[st] }}
+                key={hole.number}
+                style={{ flex: 1, height: 8, borderRadius: 2, background: PROGRESS_FILL[statusAt(i)] }}
               />
             ))}
           </div>
@@ -100,11 +111,13 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
           padding: '22px 32px 8px',
         }}
       >
-        {holeStatus.map((st, i) => {
+        {course.holes.map((hole, i) => {
+          const st = statusAt(i);
           const meta = STATUS_META[st];
+          const yd = holeYardage(course, i);
           return (
             <HoverButton
-              key={i}
+              key={hole.number}
               onClick={() => onOpenHole(i)}
               style={{
                 display: 'block',
@@ -170,7 +183,7 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
                       letterSpacing: '-.02em',
                     }}
                   >
-                    {i + 1}
+                    {hole.number}
                   </span>
                   <span
                     style={{
@@ -181,7 +194,7 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
                       whiteSpace: 'nowrap',
                     }}
                   >
-                    par {PARS[i]} · {YDS[i]} yd
+                    par {hole.par ?? '—'} · {yd ?? '—'} yd
                   </span>
                 </div>
                 <Badge tone={meta.tone} dot>

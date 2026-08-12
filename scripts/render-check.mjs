@@ -12,7 +12,11 @@ const CHECKS = [
   ['boundary',          '176 '],
   ['boundary',          'Carmel Bay shoreline'],
   ['boundaryFlagged',   'You flagged something.'],
-  ['board',             'Jack Neville'],
+  // The board's name and card line come from the loaded course record, not a constant.
+  ['board',             'Pebble Beach Golf Links'],
+  ['board',             'par 72 · 6,802 yd · 18 holes'],
+  ['board',             'of 18 holes on the map'],
+  ['board',             'par 4 · 378 yd'],
   ['board',             'Ready to review'],
   ['board',             'Needs attention'],
   ['board',             'On the map'],
@@ -40,7 +44,9 @@ const CHECKS = [
   ['reviewLocateDone',  'yd tee to green'],
   ['reviewAddMode',     'Click the map where the bunker is.'],
   ['complete',          'Hole 1 is on the map.'],
+  ['complete',          'Anyone pulling Pebble Beach Golf Links'],
   ['complete',          'signed as your OpenStreetMap account'],
+  ['complete',          '3 of 18 holes done'],
 ];
 
 let bad = 0;

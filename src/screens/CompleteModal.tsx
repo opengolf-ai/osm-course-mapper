@@ -1,16 +1,22 @@
-import { COURSE_NAME } from '../data/course';
 import { Button, Icon } from '../ds';
 
 interface CompleteModalProps {
+  courseName: string;
   holeNum: number;
   doneCount: number;
+  holeCount: number;
   onNextHole: () => void;
   onBack: () => void;
 }
 
-export function CompleteModal({ holeNum, doneCount, onNextHole, onBack }: CompleteModalProps) {
-  const courseShortName = COURSE_NAME.replace(' Golf Links', '');
-
+export function CompleteModal({
+  courseName,
+  holeNum,
+  doneCount,
+  holeCount,
+  onNextHole,
+  onBack,
+}: CompleteModalProps) {
   return (
     <div
       style={{
@@ -66,7 +72,7 @@ export function CompleteModal({ holeNum, doneCount, onNextHole, onBack }: Comple
           Hole {holeNum} is on the map.
         </h2>
         <p style={{ margin: '0 0 18px', color: 'var(--ink-600)', fontSize: 14, textWrap: 'pretty' }}>
-          Anyone pulling {courseShortName} now gets your green, your bunkers and your tees.
+          Anyone pulling {courseName} now gets your green, your bunkers and your tees.
         </p>
 
         <div
@@ -92,7 +98,7 @@ export function CompleteModal({ holeNum, doneCount, onNextHole, onBack }: Comple
             marginBottom: 22,
           }}
         >
-          signed as your OpenStreetMap account · {doneCount} of 18 holes done
+          signed as your OpenStreetMap account · {doneCount} of {holeCount} holes done
         </div>
 
         <div style={{ display: 'flex', gap: 10 }}>

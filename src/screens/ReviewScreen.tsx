@@ -1,13 +1,4 @@
-import {
-  INDEX,
-  PARS,
-  REVIEW_VIEWBOX,
-  SHAPES,
-  STEPS,
-  TEES,
-  TEE_IDS,
-  TEE_POSITIONS,
-} from '../data/course';
+import { REVIEW_VIEWBOX, SHAPES, STEPS, TEE_IDS, TEE_POSITIONS } from '../data/course';
 import { ell } from '../data/geometry';
 import { Button, Icon } from '../ds';
 import { HoleImagery } from '../components/HoleImagery';
@@ -43,6 +34,8 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
   const {
     hi,
     cardYds,
+    holePar,
+    holeHandicapIndex,
     q,
     allDone,
     isLocate,
@@ -60,7 +53,9 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
   } = derived;
 
   const { tee, green } = state.locate;
-  const holeNum = hi + 1;
+  const holeNum = state.course?.holes[hi]?.number ?? hi + 1;
+  /* The card is a real record now, so every number on it can be absent. */
+  const cardText = cardYds ?? '—';
 
   const labelFor = (id: string, active: boolean): ShapeLabel | null => {
     const sh = SHAPES[id];
@@ -243,7 +238,8 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
           </span>
           <span style={{ width: 1, height: 18, background: 'rgba(255,255,255,.2)', display: 'block' }} />
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green-200)' }}>
-            tee to green {isLocate ? (locateDone ? locateYds : '—') : measured} yd · card says {cardYds}
+            tee to green {isLocate ? (locateDone ? locateYds : '—') : (measured ?? '—')} yd · card
+            says {cardText}
           </span>
         </div>
 
@@ -391,7 +387,7 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
             <p style={{ margin: '0 0 12px', fontSize: 14, color: '#f2e0c4', textWrap: 'pretty' }}>
               {state.attentionResolved
                 ? 'We swapped in the green further up the hole. Everything below is back to a normal check.'
-                : 'Tee to green measures 250 yards. Your card says the 1st plays 378 from the back tee. Usually that means we grabbed the wrong green — pick the one you putt on.'}
+                : `Tee to green measures 250 yards. Your card says hole ${holeNum} plays ${cardText} from the back tee. Usually that means we grabbed the wrong green — pick the one you putt on.`}
             </p>
 
             {!state.attentionResolved && (
@@ -507,9 +503,14 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
                 marginLeft: 'auto',
               }}
             >
-              par {PARS[hi]} · index {INDEX[hi]}
+              par {holePar ?? '—'} · index {holeHandicapIndex ?? '—'}
             </span>
           </div>
+          {scorecard.length === 0 && (
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green-200)' }}>
+              No yardages for this hole in the course record.
+            </div>
+          )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
             {scorecard.map((t) => (
               <div
@@ -651,7 +652,7 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
                       color: locateWithinTolerance ? 'var(--mint-400)' : 'var(--amber-500)',
                     }}
                   >
-                    the card says {cardYds} —{' '}
+                    the card says {cardText} —{' '}
                     {locateWithinTolerance ? 'close enough' : 'check your two clicks'}
                   </span>
                 </div>
@@ -744,7 +745,7 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
                         cursor: 'pointer',
                       }}
                     >
-                      {TEES.map((t) => (
+                      {scorecard.map((t) => (
                         <option key={t.name} value={t.name}>
                           {t.name} · {t.yd} yd
                         </option>
