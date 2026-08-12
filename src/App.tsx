@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCourse } from './api/opengolf';
+import { lookupOsmCourse } from './api/overpass';
 import { TopNav, type NavItem } from './components/TopNav';
 import { BoardScreen } from './screens/BoardScreen';
 import { BoundaryScreen } from './screens/BoundaryScreen';
@@ -10,11 +11,18 @@ import { buildCourseSession } from './state/courseSession';
 import { useMapper } from './state/useMapper';
 
 /**
- * What opening a course is doing right now. Loading and failed are surfaces of
- * their own per R5 — a detail fetch that fails leaves the contributor on search
- * with the cause stated, never on an empty board.
+ * What opening a course is doing right now. Loading, checking, and failed are
+ * surfaces of their own per R5 — a detail fetch that fails leaves the contributor
+ * on search with the cause stated, never on an empty board.
+ *
+ * `checking` is the OpenStreetMap stage. It can only fail into `unknown`, never
+ * into a stop: a course whose OSM lookup dies still opens (R12).
  */
-type CourseLoad = { kind: 'idle' } | { kind: 'loading' } | { kind: 'failed'; message: string };
+type CourseLoad =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'checking' }
+  | { kind: 'failed'; message: string };
 
 export default function App() {
   const mapper = useMapper();
@@ -32,19 +40,41 @@ export default function App() {
       inFlight.current = controller;
       setLoad({ kind: 'loading' });
 
-      void getCourse(courseId, controller.signal).then((result) => {
+      void (async () => {
+        const result = await getCourse(courseId, controller.signal);
         if (controller.signal.aborted || result.status === 'aborted') return;
-        if (result.status === 'ok') {
-          setLoad({ kind: 'idle' });
-          actions.openCourse(buildCourseSession(result.data));
+        if (result.status !== 'ok') {
+          setLoad({
+            kind: 'failed',
+            message: result.status === 'failed' ? result.message : 'the record held no course data',
+          });
           return;
         }
-        setLoad({
-          kind: 'failed',
-          message:
-            result.status === 'failed' ? result.message : 'the record held no course data',
-        });
-      });
+
+        const session = buildCourseSession(result.data);
+
+        /*
+         * The course opens on what OpenStreetMap already holds, so the answer is
+         * waited for rather than applied later — being moved off the board onto
+         * a boundary screen mid-read would be worse than the wait. The lookup
+         * carries its own timeout and single retry, and every failure resolves
+         * to `unknown`, so this can stall but never hang.
+         */
+        setLoad({ kind: 'checking' });
+        const osm = await lookupOsmCourse(
+          {
+            id: session.id,
+            name: session.name,
+            latitude: session.latitude,
+            longitude: session.longitude,
+          },
+          controller.signal,
+        );
+        if (controller.signal.aborted) return;
+
+        setLoad({ kind: 'idle' });
+        actions.openCourse(session, osm);
+      })();
     },
     [actions],
   );
@@ -56,11 +86,21 @@ export default function App() {
    * stranded — but only once a course is loaded, since every one of them reads it.
    */
   const lastHole = course ? course.holes.length - 1 : 0;
+  /* Only a course OSM actually holds a line for has a boundary screen to reach. */
+  const adopted = state.osm.status === 'found' ? state.osm.course : null;
   const navItems: NavItem[] = [
     { label: 'find', active: state.screen === 'search', go: () => actions.go('search') },
     ...(course
       ? [
-          { label: 'boundary', active: state.screen === 'boundary', go: () => actions.go('boundary') },
+          ...(adopted
+            ? [
+                {
+                  label: 'boundary',
+                  active: state.screen === 'boundary',
+                  go: () => actions.go('boundary'),
+                },
+              ]
+            : []),
           { label: 'holes', active: state.screen === 'board', go: () => actions.go('board') },
           {
             label: 'review',
@@ -113,20 +153,14 @@ export default function App() {
       <TopNav items={navItems} />
 
       {showSearch && (
-        <SearchScreen
-          query={state.query}
-          onQuery={actions.setQuery}
-          /* Every course opens the board today; U7 routes on whether OSM holds a boundary for this id. */
-          onOpen={openCourse}
-        />
+        <SearchScreen query={state.query} onQuery={actions.setQuery} onOpen={openCourse} />
       )}
 
-      {course && state.screen === 'boundary' && (
+      {course && adopted && state.screen === 'boundary' && (
         <BoundaryScreen
+          course={adopted}
           courseName={course.name}
-          flagged={state.flagged}
-          onFlag={actions.flagBoundary}
-          onConfirm={() => actions.go('board')}
+          onContinue={() => actions.go('board')}
           onBack={() => actions.go('search')}
         />
       )}
@@ -136,6 +170,7 @@ export default function App() {
           course={course}
           holeStatus={state.holeStatus}
           doneCount={derived.doneCount}
+          osm={state.osm}
           onOpenHole={actions.openHole}
           onBack={() => actions.go('search')}
         />
@@ -186,7 +221,9 @@ function CourseLoadNotice({ load }: { load: Exclude<CourseLoad, { kind: 'idle' }
     >
       {failed
         ? `Could not open that course — ${load.message}. Pick a course to try again.`
-        : 'Opening that course — loading its scorecard …'}
+        : load.kind === 'checking'
+          ? 'Checking what OpenStreetMap already holds for this course …'
+          : 'Opening that course — loading its scorecard …'}
     </div>
   );
 }

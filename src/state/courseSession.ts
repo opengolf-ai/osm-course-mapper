@@ -1,3 +1,4 @@
+import type { OsmLookup } from '../api/overpass';
 import type { CourseDetail } from '../api/types';
 import { TEE_IDS, type HoleStatus, type TeeId } from '../data/course';
 
@@ -253,10 +254,19 @@ export function defaultTeeAssign(session: CourseSession): Record<TeeId, string> 
 }
 
 /**
- * Hole statuses sized to the loaded course. A nine-hole course gets nine, and a
- * course longer than the seed gets `unmapped` past its end. U7 replaces the seed
- * with what OpenStreetMap already holds.
+ * Hole statuses sized to the loaded course and driven by what OpenStreetMap
+ * already holds (R10).
+ *
+ * The three outcomes stay three different answers. A found boundary marks the
+ * refs Overpass returned as complete and the rest as `unmapped`; an absent course
+ * is `unmapped` throughout; a failed or still-running lookup is `unknown`
+ * throughout, which is not the same claim as zero (R16).
  */
-export function statusesFor(session: CourseSession, seed: readonly HoleStatus[]): HoleStatus[] {
-  return session.holes.map((_, i) => seed[i] ?? 'unmapped');
+export function holeStatusesFrom(session: CourseSession, lookup: OsmLookup): HoleStatus[] {
+  if (lookup.status === 'found') {
+    const mapped = new Set(lookup.course.mappedHoleRefs);
+    return session.holes.map((hole) => (mapped.has(hole.number) ? 'complete' : 'unmapped'));
+  }
+  const status: HoleStatus = lookup.status === 'absent' ? 'unmapped' : 'unknown';
+  return session.holes.map(() => status);
 }

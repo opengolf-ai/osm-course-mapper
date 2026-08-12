@@ -5,9 +5,10 @@ import { BoundaryScreen } from './screens/BoundaryScreen';
 import { CompleteModal } from './screens/CompleteModal';
 import { ReviewScreen } from './screens/ReviewScreen';
 import { INITIAL, computeDerived, type MapperState, type Mapper } from './state/useMapper';
-import { buildCourseSession, defaultTeeAssign, statusesFor } from './state/courseSession';
+import { buildCourseSession, defaultTeeAssign, holeStatusesFrom } from './state/courseSession';
 import type { CourseDetail } from './api/types';
-import { INITIAL_STATUS, STEPS } from './data/course';
+import type { OsmCourse, OsmLookup } from './api/overpass';
+import { STEPS } from './data/course';
 
 const noop = () => {};
 
@@ -70,13 +71,52 @@ const FIXTURE: CourseDetail = {
 
 const COURSE = buildCourseSession(FIXTURE);
 
+/*
+ * One adopted OpenStreetMap course, in the shape `lookupOsmCourse` returns. This
+ * is not demo geometry for a screen to draw over imagery — it is the harness
+ * standing in for a network answer so the server render has something to render.
+ */
+const OSM_COURSE: OsmCourse = {
+  osmId: 'relation/3741806',
+  name: 'Pebble Beach Golf Course',
+  boundary: {
+    type: 'Polygon',
+    coordinates: [
+      [
+        [-121.955, 36.563],
+        [-121.943, 36.563],
+        [-121.943, 36.574],
+        [-121.955, 36.574],
+        [-121.955, 36.563],
+      ],
+    ],
+  },
+  acres: 176,
+  bbox: [-121.955, 36.563, -121.943, 36.574],
+  mappedHoleRefs: [1, 2, 3],
+  landmarks: [
+    {
+      id: 'way/700001',
+      name: 'Pebble Beach Clubhouse',
+      kind: 'Clubhouse',
+      position: [-121.9494, 36.5688],
+    },
+  ],
+  matchedBy: 'name',
+};
+
+const FOUND: OsmLookup = { status: 'found', course: OSM_COURSE };
+const ABSENT: OsmLookup = { status: 'absent' };
+const UNKNOWN: OsmLookup = { status: 'unknown', message: 'it did not answer within 8s' };
+
 function mapperFor(overrides: Partial<MapperState>): Mapper {
   const state: MapperState = {
     ...INITIAL,
     screen: 'review',
     course: COURSE,
     teeAssign: defaultTeeAssign(COURSE),
-    holeStatus: statusesFor(COURSE, INITIAL_STATUS),
+    osm: FOUND,
+    holeStatus: holeStatusesFrom(COURSE, FOUND),
     ...overrides,
   };
   return {
@@ -92,22 +132,47 @@ export function renderAll(): Record<string, string> {
 
     boundary: renderToString(
       <BoundaryScreen
+        course={OSM_COURSE}
         courseName={COURSE.name}
-        flagged={false}
-        onFlag={noop}
-        onConfirm={noop}
+        onContinue={noop}
         onBack={noop}
       />,
     ),
-    boundaryFlagged: renderToString(
-      <BoundaryScreen courseName={COURSE.name} flagged onFlag={noop} onConfirm={noop} onBack={noop} />,
+    boundaryBare: renderToString(
+      <BoundaryScreen
+        course={{ ...OSM_COURSE, landmarks: [], mappedHoleRefs: [] }}
+        courseName={COURSE.name}
+        onContinue={noop}
+        onBack={noop}
+      />,
     ),
 
     board: renderToString(
       <BoardScreen
         course={COURSE}
-        holeStatus={statusesFor(COURSE, INITIAL_STATUS)}
-        doneCount={2}
+        holeStatus={holeStatusesFrom(COURSE, FOUND)}
+        doneCount={OSM_COURSE.mappedHoleRefs.length}
+        osm={FOUND}
+        onOpenHole={noop}
+        onBack={noop}
+      />,
+    ),
+    boardAbsent: renderToString(
+      <BoardScreen
+        course={COURSE}
+        holeStatus={holeStatusesFrom(COURSE, ABSENT)}
+        doneCount={0}
+        osm={ABSENT}
+        onOpenHole={noop}
+        onBack={noop}
+      />,
+    ),
+    boardUnknown: renderToString(
+      <BoardScreen
+        course={COURSE}
+        holeStatus={holeStatusesFrom(COURSE, UNKNOWN)}
+        doneCount={0}
+        osm={UNKNOWN}
         onOpenHole={noop}
         onBack={noop}
       />,

@@ -8,9 +8,11 @@ import type { CourseDetail } from '../api/types';
 import {
   buildCourseSession,
   defaultTeeAssign,
+  holeStatusesFrom,
   holeYardage,
   scorecardFor,
 } from './courseSession';
+import { clearOsmCache } from '../api/overpass';
 import { INITIAL, computeDerived } from './useMapper';
 
 /**
@@ -194,6 +196,44 @@ describe('defaultTeeAssign', () => {
   });
 });
 
+describe('holeStatusesFrom', () => {
+  it('marks exactly the hole refs Overpass returned as complete', () => {
+    const session = buildCourseSession(detailFixture());
+
+    const statuses = holeStatusesFrom(session, {
+      status: 'found',
+      course: {
+        osmId: 'relation/3741806',
+        name: 'Pebble Beach Golf Course',
+        boundary: { type: 'Polygon', coordinates: [] },
+        acres: 176,
+        bbox: [-121.955, 36.563, -121.943, 36.574],
+        mappedHoleRefs: [1, 3],
+        landmarks: [],
+        matchedBy: 'name',
+      },
+    });
+
+    expect(statuses).toEqual(['complete', 'unmapped', 'complete']);
+  });
+
+  it('reads an absent course as unmapped and a failed lookup as unknown', () => {
+    const session = buildCourseSession(detailFixture());
+
+    expect(holeStatusesFrom(session, { status: 'absent' })).toEqual([
+      'unmapped',
+      'unmapped',
+      'unmapped',
+    ]);
+    /* R16: never zeros. A failed lookup says so on every tile. */
+    expect(holeStatusesFrom(session, { status: 'unknown', message: 'it timed out' })).toEqual([
+      'unknown',
+      'unknown',
+      'unknown',
+    ]);
+  });
+});
+
 describe('computeDerived with a loaded course', () => {
   it('reads the card from the session rather than a fixture constant', () => {
     const session = buildCourseSession(detailFixture());
@@ -232,6 +272,7 @@ describe('BoardScreen with a loaded course', () => {
         course: session,
         holeStatus: session.holes.map(() => 'unmapped' as const),
         doneCount: 0,
+        osm: { status: 'absent' as const },
         onOpenHole: () => {},
         onBack: () => {},
       }),
@@ -250,6 +291,7 @@ describe('BoardScreen with a loaded course', () => {
         course: session,
         holeStatus: session.holes.map(() => 'unmapped' as const),
         doneCount: 0,
+        osm: { status: 'absent' as const },
         onOpenHole: () => {},
         onBack: () => {},
       }),
@@ -272,18 +314,19 @@ function jsonResponse(body: unknown, status = 200) {
 async function settle(ms = SEARCH_DEBOUNCE_MS + 20) {
   await act(async () => {
     vi.advanceTimersByTime(ms);
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    /* Search, detail, and the OpenStreetMap lookup each chain several awaits. */
+    for (let tick = 0; tick < 16; tick += 1) await Promise.resolve();
   });
 }
 
 let fetchMock: ReturnType<typeof vi.fn>;
 
-/** Search resolves; whether detail resolves is what each test varies. */
+/** Search and Overpass resolve; whether detail resolves is what each test varies. */
 function routeFetch(detail: () => Promise<Response>) {
   return vi.fn(async (input: unknown) => {
     const url = String(input);
+    /* This course is not in OpenStreetMap, which is the plain case here. */
+    if (url.includes('overpass')) return jsonResponse({ elements: [] });
     if (url.includes('/courses/search')) {
       return jsonResponse({
         courses: [
@@ -301,6 +344,7 @@ function routeFetch(detail: () => Promise<Response>) {
 }
 
 beforeEach(() => {
+  clearOsmCache();
   vi.useFakeTimers();
 });
 

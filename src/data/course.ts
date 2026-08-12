@@ -1,18 +1,21 @@
 import { ell, rr } from './geometry';
 
-export type HoleStatus = 'ready' | 'attention' | 'complete' | 'unmapped';
-
-export const INITIAL_STATUS: HoleStatus[] = [
-  'ready', 'complete', 'complete', 'attention', 'ready', 'ready',
-  'ready', 'ready', 'ready', 'unmapped', 'unmapped', 'unmapped',
-  'unmapped', 'unmapped', 'unmapped', 'unmapped', 'unmapped', 'unmapped',
-];
+/**
+ * Where one hole stands.
+ *
+ * `unmapped` and `unknown` are different answers and must stay that way (R16):
+ * `unmapped` is "OpenStreetMap holds nothing for this hole", `unknown` is "the
+ * OpenStreetMap lookup failed, so we cannot say". Collapsing the second into the
+ * first would tell a contributor that a fully-mapped course is empty.
+ */
+export type HoleStatus = 'ready' | 'attention' | 'complete' | 'unmapped' | 'unknown';
 
 export const STATUS_META: Record<HoleStatus, { label: string; tone: string }> = {
   ready: { label: 'Ready to review', tone: 'accent' },
   attention: { label: 'Needs attention', tone: 'warning' },
   complete: { label: 'On the map', tone: 'success' },
   unmapped: { label: 'Nothing yet', tone: 'neutral' },
+  unknown: { label: 'Unknown', tone: 'info' },
 };
 
 /** Three fairway silhouettes, cycled across the board tiles. */
@@ -123,22 +126,6 @@ export const STEPS: Step[] = [
     miss: 'Yes, add water',
     done: 'Hole checked.',
   },
-];
-
-export interface Landmark {
-  name: string;
-  icon: string;
-  verdict: string;
-  color: string;
-  action: string;
-}
-
-export const LANDMARKS: Landmark[] = [
-  { name: 'Clubhouse and pro shop', icon: 'circle-check', verdict: 'inside', color: 'var(--mint-400)', action: 'not inside' },
-  { name: 'Practice range and putting green', icon: 'circle-check', verdict: 'inside', color: 'var(--mint-400)', action: 'not inside' },
-  { name: 'The Lodge at Pebble Beach', icon: 'circle-check', verdict: 'inside', color: 'var(--mint-400)', action: 'not inside' },
-  { name: '17-Mile Drive', icon: 'x', verdict: 'outside', color: 'var(--green-200)', action: 'should be in' },
-  { name: 'Carmel Bay shoreline', icon: 'x', verdict: 'outside', color: 'var(--green-200)', action: 'should be in' },
 ];
 
 /** Review map viewBox, shared by the imagery and the overlay so clicks land in the same space. */

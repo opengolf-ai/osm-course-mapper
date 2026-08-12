@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { OsmLookup } from '../api/overpass';
 import {
-  INITIAL_STATUS,
   REVIEW_DIAGONAL,
   REVIEW_VIEWBOX,
   SHAPES,
@@ -14,9 +14,9 @@ import {
 import { corridorPath, distance, ell, rr, type Point } from '../data/geometry';
 import {
   defaultTeeAssign,
+  holeStatusesFrom,
   holeYardage,
   scorecardFor,
-  statusesFor,
   type CourseSession,
 } from './courseSession';
 
@@ -44,7 +44,8 @@ export interface MapperState {
   addMode: string | null;
   lastAction: string;
   attentionResolved: boolean;
-  flagged: boolean;
+  /** What OpenStreetMap answered for the open course. Drives routing and the board. */
+  osm: OsmLookup;
   teeAssign: Record<TeeId, string>;
   holeStatus: HoleStatus[];
 }
@@ -63,10 +64,11 @@ export const INITIAL: MapperState = {
   addMode: null,
   lastAction: '',
   attentionResolved: false,
-  flagged: false,
+  osm: { status: 'pending' },
   /* Named for real when a course loads — `defaultTeeAssign` reads the course's own sets. */
   teeAssign: { tee1: '', tee2: '', tee3: '', tee4: '' },
-  holeStatus: INITIAL_STATUS.slice(),
+  /* No course, no holes. Statuses arrive with the course, from OpenStreetMap. */
+  holeStatus: [],
 };
 
 /** The noun the "we missed one" branch is about, per review step. */
@@ -182,18 +184,24 @@ export function useMapper() {
   );
 
   /**
-   * Adopt a loaded course. Everything sized to the previous course — the hole
-   * statuses, the hole index, the tee names — is rebuilt here, so opening a
-   * nine-hole course after an eighteen never leaves nine stale tiles behind.
+   * Adopt a loaded course and whatever OpenStreetMap holds for it. Everything
+   * sized to the previous course — the hole statuses, the hole index, the tee
+   * names — is rebuilt here, so opening a nine-hole course after an eighteen
+   * never leaves nine stale tiles behind.
+   *
+   * An adopted boundary opens on the boundary screen for orientation (R11);
+   * anything else — absent, or a lookup that failed — opens straight on the
+   * board, which states what happened (R12).
    */
   const openCourse = useCallback(
-    (session: CourseSession) => {
+    (session: CourseSession, osm: OsmLookup) => {
       patch({
         course: session,
-        screen: 'board',
+        screen: osm.status === 'found' ? 'boundary' : 'board',
         mode: 'ready',
         holeIndex: 0,
-        holeStatus: statusesFor(session, INITIAL_STATUS),
+        osm,
+        holeStatus: holeStatusesFrom(session, osm),
         teeAssign: defaultTeeAssign(session),
         step: 0,
         confirmed: [],
@@ -203,7 +211,6 @@ export function useMapper() {
         locate: { tee: null, green: null },
         lastAction: '',
         attentionResolved: false,
-        flagged: false,
       });
     },
     [patch],
@@ -328,7 +335,14 @@ export function useMapper() {
         ...s,
         holeIndex: i,
         screen: 'review',
-        mode: status === 'attention' ? 'attention' : status === 'unmapped' ? 'locate' : 'ready',
+        /* Nothing known about the hole — whether because OSM holds nothing or
+         * because it never answered — means starting from the playing line. */
+        mode:
+          status === 'attention'
+            ? 'attention'
+            : status === 'unmapped' || status === 'unknown'
+              ? 'locate'
+              : 'ready',
         step: 0,
         confirmed: [],
         removed: [],
@@ -399,7 +413,6 @@ export function useMapper() {
           lastAction:
             'Inside your line we found a green, 2 bunkers and the fairway. Check them below.',
         }),
-      flagBoundary: () => patch({ flagged: true }),
       resolveAttention: (lastAction: string) => patch({ attentionResolved: true, lastAction }),
       nudge: () =>
         patch({

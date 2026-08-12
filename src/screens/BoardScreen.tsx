@@ -1,3 +1,4 @@
+import type { OsmLookup } from '../api/overpass';
 import { MINIS, STATUS_META, type HoleStatus } from '../data/course';
 import { holeYardage, type CourseSession } from '../state/courseSession';
 import { Badge } from '../ds';
@@ -7,6 +8,8 @@ interface BoardScreenProps {
   course: CourseSession;
   holeStatus: HoleStatus[];
   doneCount: number;
+  /** What OpenStreetMap answered for this course. Decides the header and the banner. */
+  osm: OsmLookup;
   onOpenHole: (index: number) => void;
   onBack: () => void;
 }
@@ -16,6 +19,9 @@ const PROGRESS_FILL: Record<HoleStatus, string> = {
   ready: 'rgba(62,207,180,.28)',
   attention: 'var(--amber-500)',
   unmapped: 'rgba(255,255,255,.12)',
+  /* Hatched, so an unknown course does not read as an empty one at a glance. */
+  unknown:
+    'repeating-linear-gradient(45deg, rgba(188,217,232,.34) 0 3px, rgba(255,255,255,.06) 3px 6px)',
 };
 
 const STROKE: Record<HoleStatus, string> = {
@@ -23,17 +29,46 @@ const STROKE: Record<HoleStatus, string> = {
   attention: '#eec98a',
   ready: '#3ecfb4',
   unmapped: '#3ecfb4',
+  unknown: '#bcd9e8',
 };
+
+/** The one banner the board carries, stating what the OpenStreetMap lookup found. */
+function osmBanner(osm: OsmLookup, courseName: string): { tone: 'warning' | 'info'; text: string } | null {
+  if (osm.status === 'absent') {
+    return {
+      tone: 'info',
+      text:
+        `OpenStreetMap holds no boundary for ${courseName} yet, so there was nothing to show you ` +
+        'first. Every hole here starts from scratch.',
+    };
+  }
+  if (osm.status === 'unknown') {
+    return {
+      tone: 'warning',
+      text:
+        `We could not check OpenStreetMap — ${osm.message}. What is already mapped is unknown, ` +
+        'not empty, so nothing below is counted until it answers.',
+    };
+  }
+  if (osm.status === 'pending') {
+    return { tone: 'info', text: 'Still checking what OpenStreetMap already holds for this course.' };
+  }
+  return null;
+}
 
 export function BoardScreen({
   course,
   holeStatus,
   doneCount,
+  osm,
   onOpenHole,
   onBack,
 }: BoardScreenProps) {
   /* The course decides how many tiles there are; the status list only colors them. */
   const statusAt = (i: number): HoleStatus => holeStatus[i] ?? 'unmapped';
+  /* R16: with no answer from OpenStreetMap there is no number to print. */
+  const countKnown = osm.status === 'found' || osm.status === 'absent';
+  const banner = osmBanner(osm, course.name);
 
   return (
     <section>
@@ -78,19 +113,27 @@ export function BoardScreen({
         </div>
         <div style={{ width: 360 }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
-            <span
-              style={{
-                fontFamily: 'var(--font-mono)',
-                fontSize: 22,
-                color: '#fff',
-                fontVariantNumeric: 'tabular-nums',
-              }}
-            >
-              {doneCount}
-            </span>
-            <span style={{ fontSize: 14, color: 'var(--green-200)' }}>
-              of {course.holes.length} holes on the map
-            </span>
+            {countKnown ? (
+              <>
+                <span
+                  style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 22,
+                    color: '#fff',
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  {doneCount}
+                </span>
+                <span style={{ fontSize: 14, color: 'var(--green-200)' }}>
+                  of {course.holes.length} holes on the map
+                </span>
+              </>
+            ) : (
+              <span style={{ fontSize: 14, color: 'var(--green-200)' }}>
+                Mapped state unknown — OpenStreetMap has not answered
+              </span>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 3 }}>
             {course.holes.map((hole, i) => (
@@ -102,6 +145,23 @@ export function BoardScreen({
           </div>
         </div>
       </div>
+
+      {banner && (
+        <div
+          style={{
+            margin: '18px 32px 0',
+            background: banner.tone === 'warning' ? 'rgba(201,138,21,.14)' : 'rgba(43,127,168,.14)',
+            border: `1px solid ${banner.tone === 'warning' ? 'rgba(201,138,21,.5)' : 'rgba(43,127,168,.5)'}`,
+            borderRadius: 'var(--radius-lg)',
+            padding: '13px 16px',
+            fontSize: 14,
+            color: banner.tone === 'warning' ? '#f6e3bd' : '#cfe6f2',
+            textWrap: 'pretty',
+          }}
+        >
+          {banner.text}
+        </div>
+      )}
 
       <div
         style={{
@@ -146,7 +206,8 @@ export function BoardScreen({
                   <ellipse cx="20" cy="18" rx="26" ry="20" fill="#1d2f16" />
                   <ellipse cx="104" cy="74" rx="24" ry="18" fill="#1d2f16" />
                   <path d={MINIS[i % 3]} fill="#527d3b" />
-                  {st !== 'unmapped' && (
+                  {/* Nothing is drawn for a hole we hold nothing about, or know nothing about. */}
+                  {st !== 'unmapped' && st !== 'unknown' && (
                     <g>
                       <ellipse
                         cx={92}
