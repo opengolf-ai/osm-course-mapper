@@ -1,0 +1,31 @@
+{
+  "name": "osm-course-mapper",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "forwardPorts": [5173, 8000, 5432],
+  "portsAttributes": {
+    "5173": { "label": "Vite dev server" },
+    "8000": { "label": "Detection service" },
+    "5432": { "label": "Postgres" }
+  },
+  "postCreateCommand": "npm ci && python -m pip install -e './service[dev,segmentation]'",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "dbaeumer.vscode-eslint"
+      ],
+      "settings": {
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["service"]
+      }
+    }
+  },
+  "remoteUser": "vscode"
+}
