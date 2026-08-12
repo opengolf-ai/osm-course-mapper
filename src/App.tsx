@@ -61,7 +61,8 @@ export default function App() {
         <SearchScreen
           query={state.query}
           onQuery={actions.setQuery}
-          onOpen={(course) => actions.go(course.done === 0 ? 'boundary' : 'board')}
+          /* Every course opens the board today; U7 routes on whether OSM holds a boundary for this id. */
+          onOpen={(_courseId) => actions.go('board')}
         />
       )}
 

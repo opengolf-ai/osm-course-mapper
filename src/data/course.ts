@@ -144,20 +144,6 @@ export const STEPS: Step[] = [
   },
 ];
 
-export interface CourseSummary {
-  name: string;
-  place: string;
-  done: number;
-  state: string;
-}
-
-export const COURSES: CourseSummary[] = [
-  { name: 'Pebble Beach Golf Links', place: 'Pebble Beach · California', done: 0, state: 'outline only · 0 of 18 holes' },
-  { name: 'Spyglass Hill Golf Course', place: 'Pebble Beach · California', done: 4, state: '4 of 18 holes done' },
-  { name: 'The Links at Spanish Bay', place: 'Pebble Beach · California', done: 0, state: 'nothing mapped yet' },
-  { name: 'Poppy Hills Golf Course', place: 'Pebble Beach · California', done: 18, state: 'all 18 holes done' },
-];
-
 export interface Landmark {
   name: string;
   icon: string;

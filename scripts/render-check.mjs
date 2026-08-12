@@ -6,6 +6,8 @@ const out = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v.replace
 const CHECKS = [
   ['app',               'Map your home course.'],
   ['app',               'course mapper'],
+  // Search renders its idle state on the server: live results arrive from an effect, never from SSR.
+  ['app',               'Type a course name to search courses in the United States.'],
   ['boundary',          'Is this the whole course?'],
   ['boundary',          '176 '],
   ['boundary',          'Carmel Bay shoreline'],
