@@ -13,25 +13,38 @@ import type { DetectResult } from '../api/detect';
 
 const harness = vi.hoisted(() => {
   const listeners = new Map<string, Array<(event: unknown) => void>>();
-  const sources = new Map<string, { data: unknown }>();
+  const sources = new Map<string, { data: unknown; spec: Record<string, unknown> }>();
   const layers: Array<Record<string, unknown>> = [];
+  const layout = new Map<string, Record<string, unknown>>();
   return {
     listeners,
     sources,
     layers,
+    layout,
+    constructed: 0,
+    removed: 0,
     reset() {
       listeners.clear();
       sources.clear();
       layers.length = 0;
+      layout.clear();
+      this.constructed = 0;
+      this.removed = 0;
     },
     emit(type: string, event: unknown) {
       for (const handler of [...(listeners.get(type) ?? [])]) handler(event);
+    },
+    indexOf(id: string) {
+      return layers.findIndex((layer) => layer.id === id);
     },
   };
 });
 
 vi.mock('maplibre-gl', () => {
   class FakeMap {
+    constructor() {
+      harness.constructed += 1;
+    }
     on(type: string, handler: (event: unknown) => void) {
       harness.listeners.set(type, [...(harness.listeners.get(type) ?? []), handler]);
       return this;
@@ -43,23 +56,40 @@ vi.mock('maplibre-gl', () => {
     off() {
       return this;
     }
-    remove() {}
+    remove() {
+      harness.removed += 1;
+    }
     fitBounds() {}
     isStyleLoaded() {
       return true;
     }
     getSource(id: string) {
       const entry = harness.sources.get(id);
-      return entry && { setData: (data: unknown) => (entry.data = data) };
+      return entry && { setData: (data: unknown) => (entry.data = data), spec: entry.spec };
     }
     addSource(id: string, spec: { data?: unknown }) {
-      harness.sources.set(id, { data: spec.data });
+      harness.sources.set(id, { data: spec.data, spec: spec as Record<string, unknown> });
     }
-    addLayer(layer: Record<string, unknown>) {
-      harness.layers.push(layer);
+    /* Real `addLayer` inserts *before* `beforeId` — the fake splices, so
+     * "beneath the suggestion layer" is an assertion rather than a hope. */
+    addLayer(layer: Record<string, unknown>, beforeId?: string) {
+      const at = beforeId === undefined ? -1 : harness.indexOf(beforeId);
+      if (at >= 0) harness.layers.splice(at, 0, layer);
+      else harness.layers.push(layer);
+      harness.layout.set(layer.id as string, { ...(layer.layout as Record<string, unknown>) });
     }
-    getLayer() {
-      return undefined;
+    getLayer(id: string) {
+      return harness.layers.find((layer) => layer.id === id);
+    }
+    removeLayer(id: string) {
+      const at = harness.indexOf(id);
+      if (at >= 0) harness.layers.splice(at, 1);
+    }
+    removeSource(id: string) {
+      harness.sources.delete(id);
+    }
+    setLayoutProperty(id: string, key: string, value: unknown) {
+      harness.layout.set(id, { ...harness.layout.get(id), [key]: value });
     }
     touchZoomRotate = { disableRotation: () => {} };
     /* A thousandth of a degree per pixel, both ways, so the two are inverses. */
@@ -118,7 +148,7 @@ const DETAIL: CourseDetail = {
 const SESSION = buildCourseSession(DETAIL);
 
 /** The screen, opened on hole 1 of a course OpenStreetMap holds nothing for. */
-function Harness() {
+function Harness({ now }: { now?: Date }) {
   const mapper = useMapper();
   const opened = useRef(false);
 
@@ -135,12 +165,12 @@ function Harness() {
   }, [mapper.state.course, mapper.state.screen, mapper.actions]);
 
   if (!mapper.state.course) return null;
-  return <ReviewScreen mapper={mapper} />;
+  return <ReviewScreen mapper={mapper} now={now} />;
 }
 
 /** Renders and lets the lazy MapLibre import settle before returning. */
-async function mount() {
-  const result = render(<Harness />);
+async function mount(now?: Date) {
+  const result = render(<Harness now={now} />);
   for (let tick = 0; tick < 20 && harness.sources.size === 0; tick += 1) {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -541,5 +571,188 @@ describe('asking the detection service for proposals', () => {
     expect(screen.getByText(ASK)).toBeDefined();
     expect(screen.getByText(HAND_MAPPABLE)).toBeDefined();
     expect(screen.getByText('Stopped looking. The hole is yours to map by hand.')).toBeDefined();
+  });
+});
+
+/**
+ * R5 and R9: judging a proposal against what the model actually read.
+ *
+ * The contributor is told the model's confidence and the year of the frame it
+ * came out of before they answer, and can put that frame itself on screen. The
+ * overlay must be a layer on the live map — the imagery source is what the
+ * construction effect rebuilds on, so switching it would discard the review
+ * layers and, worse, show NAIP pixels that are not the ones inference read.
+ */
+describe('provenance and the imagery the model read', () => {
+  const BOUNDS: [number, number, number, number] = [-121.95, 36.566, -121.944, 36.572];
+
+  /** What the service returns today: a signed href to the whole COG item. */
+  const COG_IMAGERY = {
+    source: 'USDA NAIP via Microsoft Planetary Computer',
+    itemId: 'ca_m_3612_2023',
+    acquired: '2023-07-04',
+    gsdMeters: 0.6,
+    assetHref: 'https://naipeuwest.blob.core.windows.net/naip/m_3612_2023.tif?sig=abc',
+    boundsWgs84: BOUNDS,
+    crs: 'EPSG:26910',
+    width: 1024,
+    height: 1024,
+  };
+
+  /** The same corridor window as a picture a browser can decode. */
+  const RENDITION = {
+    ...COG_IMAGERY,
+    assetHref: 'https://example.invalid/corridor/m_3612_2023.png?sig=abc',
+  };
+
+  function proposal(overrides: Partial<Record<string, unknown>> = {}) {
+    return {
+      id: '77d2-0',
+      kind: 'green' as const,
+      geometry: {
+        type: 'Polygon' as const,
+        coordinates: [
+          [
+            [-121.9462, 36.5705],
+            [-121.946, 36.5705],
+            [-121.946, 36.5707],
+            [-121.9462, 36.5707],
+            [-121.9462, 36.5705],
+          ],
+        ],
+      },
+      confidence: 0.8,
+      areaSquareMeters: 640,
+      vertexCount: 5,
+      notes: [],
+      teeSet: null,
+      acquired: '2023-07-04',
+      gsdMeters: 0.6,
+      source: 'USDA NAIP via Microsoft Planetary Computer',
+      modelId: 'sam2',
+      itemId: 'ca_m_3612_2023',
+      ...overrides,
+    };
+  }
+
+  /** Draw, finish, ask, and land one proposal with the given corridor imagery. */
+  async function withProposals(
+    imagery: unknown,
+    options: { now?: Date; proposals?: unknown[] } = {},
+  ) {
+    detectMock.mockResolvedValue({
+      status: 'ok',
+      jobId: '77d2',
+      proposals: options.proposals ?? [proposal()],
+      imagery,
+      missingTeeSets: [],
+    } as unknown as DetectResult);
+    const view = await mount(options.now);
+    await clickAt(-121_949, 36_569);
+    await clickAt(-121_946, 36_570);
+    await press('Finish the line');
+    await press(ASK);
+    return view;
+  }
+
+  it("renders the proposal's confidence and the NAIP acquisition year in the rail", async () => {
+    await withProposals(COG_IMAGERY, { now: new Date('2024-01-01T00:00:00Z') });
+
+    expect(screen.getByText('Is that the green?')).toBeDefined();
+    /* Always there, not only when something is wrong: 2023 is inside the
+     * three-year window, so this render carries no warning at all. */
+    expect(screen.getByText('80%')).toBeDefined();
+    expect(screen.getByText('NAIP 2023')).toBeDefined();
+    expect(screen.queryByText(/more than 3 years old/)).toBeNull();
+  });
+
+  it('shows the corridor raster the service read, under the proposals, without rebuilding the map', async () => {
+    await withProposals(RENDITION, { now: new Date('2024-01-01T00:00:00Z') });
+
+    /* Added hidden — nobody asked for it yet. */
+    expect(harness.layout.get('detection-corridor')?.visibility).toBe('none');
+
+    await press('Show me the imagery you read');
+
+    const source = harness.sources.get('detection-corridor')?.spec;
+    expect(source?.type).toBe('image');
+    expect(source?.url).toBe(RENDITION.assetHref);
+    /* The window the service actually read, as MapLibre's four corners. */
+    expect(source?.coordinates).toEqual([
+      [-121.95, 36.572],
+      [-121.944, 36.572],
+      [-121.944, 36.566],
+      [-121.95, 36.566],
+    ]);
+
+    expect(harness.layout.get('detection-corridor')?.visibility).toBe('visible');
+    /* Beneath the suggestion fill, so the shape being judged stays on top. */
+    expect(harness.indexOf('detection-corridor')).toBeLessThan(harness.indexOf('review-features-fill'));
+
+    /* One map for the whole exchange: the overlay is a layer, not a source swap. */
+    expect(harness.constructed).toBe(1);
+    expect(harness.removed).toBe(0);
+    /* And the proposal on top of it is untouched by the toggle. */
+    expect(screen.getByText('Is that the green?')).toBeDefined();
+
+    /* The credit on the map names the same acquisition the rail states. */
+    expect(screen.getByText(/acquired 2023-07-04/)).toBeDefined();
+    expect(screen.getByText('NAIP 2023')).toBeDefined();
+
+    await press('Back to the display imagery');
+    expect(harness.layout.get('detection-corridor')?.visibility).toBe('none');
+  });
+
+  it('states the gap rather than offering a toggle when the frame is a GeoTIFF', async () => {
+    await withProposals(COG_IMAGERY, { now: new Date('2024-01-01T00:00:00Z') });
+
+    expect(screen.queryByText('Show me the imagery you read')).toBeNull();
+    expect(screen.getByText(/We cannot put that frame on screen yet/)).toBeDefined();
+    /* Nothing was drawn in its place — no overlay layer at all. */
+    expect(harness.indexOf('detection-corridor')).toBe(-1);
+  });
+
+  it('warns past three years and not at exactly three, showing the year either way', async () => {
+    /* Acquired 2023-07-04. Three years to the day is not "more than three". */
+    await withProposals(COG_IMAGERY, { now: new Date('2026-07-04T00:00:00Z') });
+    expect(screen.getByText('NAIP 2023')).toBeDefined();
+    expect(screen.queryByText(/more than 3 years old/)).toBeNull();
+  });
+
+  it('warns on a proposal read from imagery more than three years old', async () => {
+    await withProposals(COG_IMAGERY, { now: new Date('2026-07-05T00:00:00Z') });
+
+    expect(screen.getByText('NAIP 2023')).toBeDefined();
+    expect(screen.getByText(/This came out of 2023 imagery — more than 3 years old/)).toBeDefined();
+    expect(screen.getByText(/not in what the model saw/)).toBeDefined();
+  });
+
+  it('shows a newer proposal its year with no warning attached', async () => {
+    await withProposals(
+      { ...COG_IMAGERY, acquired: '2025-06-01' },
+      {
+        now: new Date('2026-07-05T00:00:00Z'),
+        proposals: [proposal({ acquired: '2025-06-01' })],
+      },
+    );
+
+    expect(screen.getByText('NAIP 2025')).toBeDefined();
+    expect(screen.queryByText(/more than 3 years old/)).toBeNull();
+  });
+
+  it('puts a confidence beside every proposal queued in the step, not just the active one', async () => {
+    await withProposals(COG_IMAGERY, {
+      now: new Date('2024-01-01T00:00:00Z'),
+      proposals: [
+        proposal({ id: 'b1', kind: 'bunker', confidence: 0.91 }),
+        proposal({ id: 'b2', kind: 'bunker', confidence: 0.42 }),
+      ],
+    });
+    await press('Nothing to confirm — carry on');
+
+    expect(screen.getByText('Bunker 1 of 2 — is that sand?')).toBeDefined();
+    expect(screen.getByText('bunker 1 — asking now')).toBeDefined();
+    expect(screen.getByText('bunker 2')).toBeDefined();
+    expect(screen.getByText('42%')).toBeDefined();
   });
 });

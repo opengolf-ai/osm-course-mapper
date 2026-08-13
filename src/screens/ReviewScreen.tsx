@@ -16,6 +16,12 @@
  * fill — and stays that way until the contributor has answered about that one
  * feature (R8, KTD8). The review sequence walks them one at a time; nothing here
  * can confirm a batch, and no answer is inferred from moving on.
+ *
+ * Every suggestion arrives with where it came from, and the rail says so before
+ * it is answered (R5, R9): the model's confidence, the year of the NAIP frame it
+ * was read out of, and — on demand — that frame itself, laid over the display
+ * basemap so the contributor judges the shape against the pixels the model read
+ * rather than against a different picture of the same place.
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Map as MapLibreMap } from 'maplibre-gl';
@@ -24,6 +30,8 @@ import type { LngLat } from '../geo/coords';
 import { Button, Icon } from '../ds';
 import { HoverButton } from '../components/HoverButton';
 import { BaseMap, type ImageryStatus } from '../map/BaseMap';
+import { corridorOverlay, type CorridorOverlay } from '../map/imagerySources';
+import type { DetectionImagery, Proposal } from '../api/detect';
 import { LOCATE_CLOSE_ENOUGH, type MapBounds, type Mapper } from '../state/useMapper';
 
 const FEATURE_SOURCE = 'review-features';
@@ -152,6 +160,224 @@ function RailNotice({ children, tone }: { children: ReactNode; tone?: 'danger' }
   );
 }
 
+/* --- How old the imagery is (R5) ------------------------------------------ */
+
+/**
+ * Past this, the imagery gets a warning rather than only a year.
+ *
+ * Three years, not "anything not from this season". Planetary Computer's NAIP
+ * holdings end at 2023 and NAIP flies each state on a two-to-three-year cadence,
+ * so a warning framed as an exception would fire on very nearly every proposal —
+ * and a warning that is always on is a warning nobody reads. Three years is the
+ * point past which a course could plausibly have rebuilt a green or added a
+ * bunker without the model having any way to know.
+ */
+export const IMAGERY_STALE_YEARS = 3;
+
+/** The age of one acquisition, in the terms the rail states it. */
+export interface ImageryAge {
+  /** The acquisition year, which is always shown. */
+  year: number;
+  /** Whole years elapsed, for the always-visible line. */
+  years: number;
+  /** More than `IMAGERY_STALE_YEARS` old, which is the only case that warns. */
+  stale: boolean;
+}
+
+/**
+ * How old a `YYYY-MM-DD` acquisition is, against a reference date.
+ *
+ * `now` is a parameter with a default rather than a `new Date()` inside the
+ * component, so the three-year boundary can be tested at exactly three years
+ * instead of only near it. Everything is compared in UTC: an acquisition date
+ * carries no timezone, and letting the local one shift it would move the
+ * boundary by a day depending on where the contributor is sitting.
+ *
+ * Staleness is a date comparison, not a rounded year count — exactly three years
+ * to the day is not "more than three years old", and one day more is.
+ */
+export function imageryAge(acquired: string | null | undefined, now: Date = new Date()): ImageryAge | null {
+  if (!acquired) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(acquired.trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+  const acquiredMs = Date.UTC(year, month - 1, day);
+  const nowYear = now.getUTCFullYear();
+  const todayMs = Date.UTC(nowYear, now.getUTCMonth(), now.getUTCDate());
+
+  /* Whole years: the difference in years, minus one if this year's anniversary
+   * has not come round yet. Never negative — imagery dated ahead of `now` is a
+   * service problem, not something to render as "-1 years old". */
+  let years = nowYear - year;
+  if (todayMs < Date.UTC(nowYear, month - 1, day)) years -= 1;
+  if (years < 0) years = 0;
+
+  return {
+    year,
+    years,
+    stale: acquiredMs < Date.UTC(nowYear - IMAGERY_STALE_YEARS, now.getUTCMonth(), now.getUTCDate()),
+  };
+}
+
+/** `0.83` as `83%`. Confidence is 0–1 on the wire and a percentage in the rail. */
+function percent(confidence: number): string {
+  return `${Math.round((Number.isFinite(confidence) ? confidence : 0) * 100)}%`;
+}
+
+/** "USDA NAIP via Microsoft Planetary Computer" is a credit line, not a label. */
+function shortSource(source: string | null): string {
+  if (!source) return 'imagery';
+  return /naip/i.test(source) ? 'NAIP' : source.split(/[—·|(]/, 1)[0].trim() || 'imagery';
+}
+
+const PROVENANCE_ROW = {
+  display: 'flex',
+  alignItems: 'baseline',
+  gap: 10,
+  fontFamily: 'var(--font-mono)',
+  fontSize: 12,
+  color: 'var(--green-100)',
+  fontVariantNumeric: 'tabular-nums',
+} as const;
+
+/**
+ * Where this suggestion came from, stated before it is answered (R5, R9).
+ *
+ * Confidence and the acquisition year are always here — not folded into a
+ * warning, not behind a disclosure. A contributor deciding whether to trust a
+ * traced bunker edge is entitled to know the model was 41% sure of it and read
+ * it off a frame flown in 2021, and both facts are as relevant when nothing is
+ * wrong as when something is.
+ */
+function ProvenancePanel({
+  proposal,
+  imagery,
+  corridor,
+  showing,
+  onToggle,
+  now,
+}: {
+  proposal: Proposal | null;
+  imagery: DetectionImagery | null;
+  corridor: CorridorOverlay | null;
+  showing: boolean;
+  onToggle: () => void;
+  now?: Date;
+}) {
+  /* The proposal is the authority — R5 puts the date on each one — and the
+   * corridor answer is the fallback for a step with nothing being asked about. */
+  const acquired = proposal?.acquired ?? imagery?.acquired ?? null;
+  const age = imageryAge(acquired, now);
+  const gsd = proposal?.gsdMeters ?? imagery?.gsdMeters ?? null;
+  const source = shortSource(proposal?.source ?? imagery?.source ?? null);
+  if (!proposal && !imagery) return null;
+
+  return (
+    <div
+      style={{
+        background: 'var(--green-900)',
+        border: '1px solid rgba(255,255,255,.12)',
+        borderRadius: 'var(--radius-md)',
+        padding: '11px 13px',
+        marginBottom: 14,
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 7,
+      }}
+    >
+      <div style={{ ...EYEBROW, color: 'var(--green-200)' }}>What the model read</div>
+
+      {proposal && (
+        <div style={PROVENANCE_ROW}>
+          <span style={{ color: 'var(--green-200)', width: 74 }}>confidence</span>
+          <span style={{ color: '#fff' }}>{percent(proposal.confidence)}</span>
+          <span
+            aria-hidden="true"
+            style={{
+              flex: 1,
+              height: 4,
+              borderRadius: 2,
+              background: 'rgba(255,255,255,.12)',
+              overflow: 'hidden',
+            }}
+          >
+            <span
+              style={{
+                display: 'block',
+                height: '100%',
+                width: percent(proposal.confidence),
+                background: PROPOSED_COLOR,
+              }}
+            />
+          </span>
+        </div>
+      )}
+
+      <div style={PROVENANCE_ROW}>
+        <span style={{ color: 'var(--green-200)', width: 74 }}>imagery</span>
+        <span style={{ color: '#fff' }}>
+          {source} {age ? age.year : 'date unknown'}
+        </span>
+        <span style={{ color: 'var(--green-200)' }}>
+          {age ? `${age.years} yr old` : 'no acquisition date'}
+          {gsd === null ? '' : ` · ${gsd} m/px`}
+        </span>
+      </div>
+
+      {/* R5: warn only past three years, so the warning still means something. */}
+      {age?.stale && (
+        <div
+          style={{
+            background: 'rgba(201,138,21,.14)',
+            border: '1px solid rgba(201,138,21,.55)',
+            borderRadius: 'var(--radius-sm)',
+            padding: '9px 11px',
+            fontFamily: 'var(--font-mono)',
+            fontSize: 12,
+            lineHeight: 1.6,
+            color: '#f2e0c4',
+            textWrap: 'pretty',
+          }}
+        >
+          This came out of {age.year} imagery — more than {IMAGERY_STALE_YEARS} years old. Anything
+          the course has changed since is not in what the model saw.
+        </div>
+      )}
+
+      {/*
+        * R9. The overlay is the corridor frame inference read, not the display
+        * basemap and not the live NAIP mosaic — see `corridorOverlay`.
+        */}
+      {corridor?.status === 'ready' && (
+        <>
+          <HoverButton
+            onClick={onToggle}
+            style={{ ...GHOST_BUTTON, height: 36, fontSize: 13, textAlign: 'left' }}
+            hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
+          >
+            {showing ? 'Back to the display imagery' : 'Show me the imagery you read'}
+          </HoverButton>
+          {showing && corridor.spec.placement === 'envelope' && (
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
+              Laid on its {imagery?.crs ?? 'projected'} footprint — position is good to about a pixel.
+            </div>
+          )}
+        </>
+      )}
+
+      {corridor?.status === 'unrenderable' && (
+        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, lineHeight: 1.6, color: 'var(--green-200)', textWrap: 'pretty' }}>
+          We cannot put that frame on screen yet. {corridor.reason}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Where a caption sits on screen once its coordinate has been projected. */
 interface PlacedLabel {
   key: string;
@@ -160,7 +386,7 @@ interface PlacedLabel {
   y: number;
 }
 
-export function ReviewScreen({ mapper }: { mapper: Mapper }) {
+export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
   const { state, derived, actions } = mapper;
   const {
     hi,
@@ -186,16 +412,32 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
     stepTitle,
     stepNote,
     stepAccept,
+    stepProposals,
     stepProposalCount,
     activeProposal,
     activePosition,
     stepNeedsInPlay,
     rejectedHere,
+    /* R9: the corridor raster inference read, for the overlay and its provenance. */
+    detectionImagery,
   } = derived;
 
   const [map, setMap] = useState<MapLibreMap | null>(null);
   const [imagery, setImagery] = useState<ImageryStatus>('loading');
   const [placed, setPlaced] = useState<PlacedLabel[]>([]);
+  const [corridorAsked, setCorridorAsked] = useState(false);
+
+  /*
+   * The corridor overlay, on demand (R9).
+   *
+   * `corridorOverlay` decides whether the frame can honestly be drawn; when it
+   * cannot, the toggle is not offered and the rail says why instead of showing
+   * imagery from somewhere else. Asking for it can therefore never be true while
+   * there is nothing to show.
+   */
+  const corridor = corridorOverlay(detectionImagery);
+  const corridorSpec = corridor?.status === 'ready' ? corridor.spec : null;
+  const showingCorridor = corridorAsked && corridorSpec !== null;
 
   const course = state.course;
   const holeNum = course?.holes[hi]?.number ?? hi + 1;
@@ -355,6 +597,11 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
           onMapReady={handleMapReady}
           onMapClick={handleMapClick}
           onImageryStatusChange={setImagery}
+          /* Beneath the suggestion layers: the contributor judges a shape
+           * against the imagery, so the shape stays on top of it. */
+          overlay={corridorSpec}
+          overlayVisible={showingCorridor}
+          overlayBeneathLayerId={FILL_LAYER}
         >
           {/* The click target sits above the canvas only to carry the cursor. */}
           {placing && (
@@ -1009,6 +1256,59 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
             <p style={{ margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' }}>
               {stepNote}
             </p>
+
+            {/* R5, R9: where this one came from, before it is answered. */}
+            <ProvenancePanel
+              proposal={activeProposal}
+              imagery={detectionImagery}
+              corridor={corridor}
+              showing={showingCorridor}
+              onToggle={() => setCorridorAsked((shown) => !shown)}
+              now={now}
+            />
+
+            {/*
+              * The rest of this step's queue, each with its own confidence, so
+              * "2 of 3" is a position in a list the contributor can see rather
+              * than a number they have to take on trust.
+              */}
+            {stepProposalCount > 1 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 14 }}>
+                {stepProposals.map((proposal, i) => {
+                  const isActive = proposal.id === activeProposal?.id;
+                  return (
+                    <div
+                      key={proposal.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 10,
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 12,
+                        color: isActive ? '#fff' : 'var(--green-200)',
+                        fontVariantNumeric: 'tabular-nums',
+                      }}
+                    >
+                      <span
+                        style={{
+                          width: 14,
+                          height: 0,
+                          borderTop: `2px ${isActive ? 'solid' : 'dashed'} ${
+                            isActive ? ACTIVE_COLOR : PROPOSED_COLOR
+                          }`,
+                          display: 'block',
+                        }}
+                      />
+                      <span style={{ flex: 1 }}>
+                        {proposal.kind} {i + 1}
+                        {isActive ? ' — asking now' : ''}
+                      </span>
+                      <span>{percent(proposal.confidence)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
             {q.isTees && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 16 }}>

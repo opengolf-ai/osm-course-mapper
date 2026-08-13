@@ -8,7 +8,7 @@ import { INITIAL, computeDerived, type MapperState, type Mapper } from './state/
 import { buildCourseSession, defaultTeeAssign, holeStatusesFrom } from './state/courseSession';
 import type { CourseDetail } from './api/types';
 import type { OsmCourse, OsmLookup } from './api/overpass';
-import type { Proposal } from './api/detect';
+import type { DetectionImagery, Proposal } from './api/detect';
 import type { LngLat } from './geo/coords';
 import { STEPS } from './data/course';
 
@@ -163,6 +163,30 @@ const PROPOSALS: Proposal[] = [
   proposalSquare('p-bunker-2', 'bunker', -121.9476),
 ];
 
+/*
+ * The corridor raster the answer names (R9). Two versions, because the two paths
+ * read differently on screen: what the service returns today is a signed href to
+ * the whole Cloud-Optimized GeoTIFF, which a browser cannot decode and which the
+ * rail therefore states as a gap rather than drawing; a browser-renderable
+ * rendition of the same window is what turns the overlay on.
+ */
+const CORRIDOR_COG: DetectionImagery = {
+  source: 'USDA NAIP via Microsoft Planetary Computer',
+  itemId: 'ca_m_3812_2023',
+  acquired: '2023-07-04',
+  gsdMeters: 0.6,
+  assetHref: 'https://naipeuwest.blob.core.windows.net/naip/ca_m_3812_2023.tif?sig=smoke',
+  boundsWgs84: [-121.9505, 36.5688, -121.9455, 36.5715],
+  crs: 'EPSG:26910',
+  width: 1024,
+  height: 1024,
+};
+
+const CORRIDOR_RENDITION: DetectionImagery = {
+  ...CORRIDOR_COG,
+  assetHref: 'https://example.invalid/corridor/ca_m_3812_2023.png?sig=smoke',
+};
+
 function mapperFor(overrides: Partial<MapperState>): Mapper {
   const state: MapperState = {
     ...INITIAL,
@@ -249,7 +273,30 @@ export function renderAll(): Record<string, string> {
             status: 'ready',
             jobId: 'smoke-job',
             proposals: PROPOSALS,
-            imagery: null,
+            imagery: CORRIDOR_COG,
+            missingTeeSets: [],
+          },
+        })}
+      />,
+    ),
+    /*
+     * R5/R9 on the server: confidence, the acquisition year and the age warning
+     * are chrome, not effects, so they must render without a browser. `now` is
+     * pinned so the warning is a fixture rather than a function of the clock.
+     */
+    reviewCorridor: renderToString(
+      <ReviewScreen
+        now={new Date('2026-08-12T00:00:00Z')}
+        mapper={mapperFor({
+          mode: 'ready',
+          step: 0,
+          confirmed: [],
+          locate: { points: PEBBLE_HOLE_ONE, finished: true },
+          detect: {
+            status: 'ready',
+            jobId: 'smoke-job',
+            proposals: PROPOSALS,
+            imagery: CORRIDOR_RENDITION,
             missingTeeSets: [],
           },
         })}

@@ -19,6 +19,7 @@ import {
   IMAGERY_SOURCE_ID,
   basemapStyle,
   imagerySource,
+  type ImageOverlaySpec,
   type ImagerySourceId,
 } from './imagerySources';
 
@@ -62,6 +63,25 @@ export interface BaseMapProps {
   onImageryStatusChange?: (status: ImageryStatus) => void;
   /** The live map, once it exists, for callers that add their own layers. */
   onMapReady?: (map: MapLibreMap) => void;
+  /**
+   * A georeferenced still image drawn over the basemap — the corridor raster
+   * detection read (R9).
+   *
+   * Deliberately *not* a second `sourceId`. The construction effect below lists
+   * `source` in its dependencies and its cleanup calls `map.remove()`, so
+   * changing the imagery source tears the map down and rebuilds it, discarding
+   * every source and layer a caller added. An overlay must therefore be added to
+   * the map that already exists, which is what the effect below does.
+   */
+  overlay?: ImageOverlaySpec | null;
+  /** Whether the overlay draws. Toggling this never rebuilds the map. */
+  overlayVisible?: boolean;
+  /**
+   * Insert the overlay layer beneath this caller-owned layer, so what the
+   * contributor is being asked about stays on top of the imagery it came from.
+   * Ignored when no such layer exists yet.
+   */
+  overlayBeneathLayerId?: string;
   /** Overlay chrome drawn above the map surface. */
   children?: ReactNode;
 }
@@ -93,6 +113,9 @@ export function BaseMap({
   onMapClick,
   onImageryStatusChange,
   onMapReady,
+  overlay = null,
+  overlayVisible = false,
+  overlayBeneathLayerId,
   children,
 }: BaseMapProps) {
   const source = imagerySource(sourceId);
@@ -210,6 +233,76 @@ export function BaseMap({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- boundsKey stands in for bounds
   }, [mapReady, boundsKey, source.maxzoom]);
 
+  /*
+   * The overlay, added to the map that already exists.
+   *
+   * Its own effect, keyed on the overlay's identity rather than on `source`, so
+   * turning it on and off costs one `setLayoutProperty` and never a rebuild. It
+   * is added hidden and revealed by the effect below: a contributor who has not
+   * asked for it should not watch it fade in.
+   *
+   * By the time this runs, a caller's `onMapReady` has already been called — it
+   * fires in the same tick that sets `mapReady`, before React commits the render
+   * this effect belongs to. So a caller that registers its own `once('load')`
+   * has registered it first, and `overlayBeneathLayerId` resolves.
+   */
+  const overlayKey = overlay ? `${overlay.id}|${overlay.url}|${JSON.stringify(overlay.coordinates)}` : '';
+  const [overlayAdded, setOverlayAdded] = useState(false);
+  useEffect(() => {
+    if (!mapReady || !overlay) return;
+    const map = mapRef.current;
+    if (!map) return;
+    let cancelled = false;
+
+    const add = () => {
+      /* The map may have been torn down while we waited on `load`. */
+      if (cancelled || mapRef.current !== map) return;
+      if (map.getSource(overlay.id)) return;
+      map.addSource(overlay.id, {
+        type: 'image',
+        url: overlay.url,
+        coordinates: overlay.coordinates,
+      } as never);
+      const beneath =
+        overlayBeneathLayerId && map.getLayer(overlayBeneathLayerId) ? overlayBeneathLayerId : undefined;
+      map.addLayer(
+        {
+          id: overlay.id,
+          type: 'raster',
+          source: overlay.id,
+          layout: { visibility: 'none' },
+          /* Zero fade, for the same reason the basemap has none: an edge being
+           * judged should not be judged through a cross-dissolve. */
+          paint: { 'raster-fade-duration': 0, 'raster-opacity': 1 },
+        } as never,
+        beneath,
+      );
+      setOverlayAdded(true);
+    };
+    if (map.isStyleLoaded()) add();
+    else map.once('load', add);
+
+    return () => {
+      cancelled = true;
+      /* The construction effect's cleanup runs first and nulls the ref, so a
+       * torn-down map is never reached into here. */
+      if (mapRef.current !== map) return;
+      if (map.getLayer(overlay.id)) map.removeLayer(overlay.id);
+      if (map.getSource(overlay.id)) map.removeSource(overlay.id);
+      setOverlayAdded(false);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- overlayKey stands in for overlay
+  }, [mapReady, overlayKey, overlayBeneathLayerId]);
+
+  const overlayId = overlay?.id;
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !overlayAdded || !overlayId) return;
+    if (!map.getLayer(overlayId)) return;
+    map.setLayoutProperty(overlayId, 'visibility', overlayVisible ? 'visible' : 'none');
+  }, [overlayAdded, overlayId, overlayVisible]);
+
+  const showingOverlay = overlay !== null && overlayVisible;
   const failed = status === 'error';
 
   return (
@@ -275,6 +368,16 @@ export function BaseMap({
           ...MONO,
         }}
       >
+        {/*
+          * R9: the credit names the pixels actually on screen. While the corridor
+          * overlay is drawing it is on top, so it is credited first and said to be
+          * what is showing — the basemap underneath keeps its own line.
+          */}
+        {showingOverlay && overlay && (
+          <div style={{ color: 'var(--mint-400)' }}>
+            showing what the model read — {overlay.attribution}
+          </div>
+        )}
         <div>
           {source.attribution} · {source.captureContext}
         </div>

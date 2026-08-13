@@ -51,6 +51,17 @@ const CHECKS = [
   ['reviewProposals',   'Bunker 2 of 2 — is that sand?'],
   ['reviewProposals',   '2 / 2 suggested'],
   ['reviewProposals',   'That is not sand'],
+  // R5: the model's confidence and the NAIP acquisition year, always on screen.
+  ['reviewProposals',   'What the model read'],
+  ['reviewProposals',   '86%'],
+  ['reviewProposals',   'NAIP 2023'],
+  // R5: a 2023 frame is past the three-year line, so it says so in words.
+  ['reviewProposals',   'more than 3 years old'],
+  // R9: a signed GeoTIFF href is not something a browser can draw — stated, not faked.
+  ['reviewProposals',   'We cannot put that frame on screen yet'],
+  // R9: with a renderable rendition of the same window, the overlay is offered.
+  ['reviewCorridor',    'Show me the imagery you read'],
+  ['reviewCorridor',    'NAIP 2023'],
   ['reviewDone',        'Hole 1, confirmed.'],
   ['reviewDone',        'Put hole 1 on the map'],
   ['reviewDone',        'all checks done'],
