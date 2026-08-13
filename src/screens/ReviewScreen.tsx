@@ -1,17 +1,18 @@
 /**
  * One hole, on real aerial imagery.
  *
- * The screen opens in the playing-line flow, because that is the only path that
- * produces real geometry today: detection is deferred, and inventing proposals
- * over a real course is what KTD13 rules out. The contributor clicks the tee,
- * any points where the hole bends, then the green; the line is measured along
- * its path and checked against the tee set they started from.
+ * The screen opens in the playing-line flow, because the line is what everything
+ * else is bounded by: the contributor clicks the tee, any points where the hole
+ * bends, then the green; the line is measured along its path and checked against
+ * the tee set they started from. Only once it is finished can detection be asked
+ * for the hole's features, and a detection that fails, times out or finds nothing
+ * leaves the hand-mapping path exactly where it was (R12).
  *
  * Everything drawn is WGS84 GeoJSON on one MapLibre source. Pending, active and
  * confirmed styling comes from each feature's own `status` property through a
  * `match` expression, rather than from three parallel arrays of path strings.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Map as MapLibreMap } from 'maplibre-gl';
 import { STEPS, TEE_IDS, TEE_POSITIONS } from '../data/course';
 import type { LngLat } from '../geo/coords';
@@ -81,6 +82,31 @@ const GHOST_BUTTON = {
   padding: '0 12px',
 } as const;
 
+/**
+ * The rail's version of the search screen's `Notice`: one plate that carries a
+ * stated outcome, tinted for the dark rail. `danger` is for something that went
+ * wrong; the untinted plate is for an answer that is simply empty.
+ */
+function RailNotice({ children, tone }: { children: ReactNode; tone?: 'danger' }) {
+  return (
+    <div
+      style={{
+        background: tone === 'danger' ? 'rgba(180,70,47,.16)' : 'var(--green-900)',
+        border: `1px solid ${tone === 'danger' ? 'rgba(214,132,110,.6)' : 'rgba(255,255,255,.12)'}`,
+        borderRadius: 'var(--radius-md)',
+        padding: '11px 13px',
+        fontFamily: 'var(--font-mono)',
+        fontSize: 12,
+        lineHeight: 1.6,
+        color: tone === 'danger' ? '#f0cabd' : 'var(--green-100)',
+        textWrap: 'pretty',
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
 /** Where a caption sits on screen once its coordinate has been projected. */
 interface PlacedLabel {
   key: string;
@@ -102,6 +128,8 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
     locatePoints,
     locateDone,
     canFinish,
+    canRequestProposals,
+    detecting,
     locateYds,
     locateVerdict,
     features,
@@ -767,6 +795,75 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
                     the {teeSetName} tees say {cardText} — {locateVerdict ?? 'no card to check'}
                   </span>
                 </div>
+
+                {/*
+                 * Detection is an offer on a finished line, never a gate in front
+                 * of one (R1). Whatever it answers — proposals, silence, or
+                 * nothing at all — the button below is still there, so a hole is
+                 * always hand-mappable (R12).
+                 */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 9, marginBottom: 14 }}>
+                  {detecting ? (
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 12,
+                        background: 'var(--green-900)',
+                        border: '1px solid rgba(255,255,255,.12)',
+                        borderRadius: 'var(--radius-md)',
+                        padding: '11px 13px',
+                        fontFamily: 'var(--font-mono)',
+                        fontSize: 12,
+                        color: 'var(--green-100)',
+                      }}
+                    >
+                      <span>Reading the imagery for hole {holeNum} …</span>
+                      <button
+                        onClick={actions.cancelProposals}
+                        style={{
+                          marginLeft: 'auto',
+                          background: 'rgba(255,255,255,.1)',
+                          border: 'none',
+                          borderRadius: 'var(--radius-sm)',
+                          height: 26,
+                          padding: '0 10px',
+                          color: '#fff',
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: 11,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        cancel and map it myself
+                      </button>
+                    </div>
+                  ) : (
+                    <HoverButton
+                      onClick={actions.requestProposals}
+                      disabled={!canRequestProposals}
+                      style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
+                      hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
+                    >
+                      Look for features in the imagery
+                    </HoverButton>
+                  )}
+
+                  {/* Silence and failure are two different answers, said two different ways. */}
+                  {state.detect.status === 'no_coverage' && (
+                    <RailNotice>
+                      No proposals for this hole — {state.detect.message} Nothing went wrong; there is
+                      just nothing for you to confirm. Carry on and map it by hand.
+                    </RailNotice>
+                  )}
+
+                  {state.detect.status === 'failed' && (
+                    <RailNotice tone="danger">
+                      Detection did not finish — {state.detect.message} The hole is still yours to map
+                      by hand.
+                    </RailNotice>
+                  )}
+                </div>
+
                 <Button size="lg" variant="accent" fullWidth onClick={actions.confirmLocate}>
                   Save this line and carry on
                 </Button>

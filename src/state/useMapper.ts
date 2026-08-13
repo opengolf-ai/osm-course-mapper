@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Geometry, LineString, Polygon } from 'geojson';
+import {
+  requestProposals as askTheDetectionService,
+  type DetectRequest,
+  type DetectionImagery,
+  type Proposal,
+  type TeeSetRef,
+} from '../api/detect';
 import type { OsmLookup } from '../api/overpass';
 import { STEPS, TEE_IDS, type HoleStatus, type Step, type TeeId } from '../data/course';
 import {
@@ -70,6 +77,29 @@ export interface LocateState {
   finished: boolean;
 }
 
+/**
+ * Where a detection request for the open hole stands (R1, R12).
+ *
+ * Five states, not four: `no_coverage` is detection saying "there is nothing to
+ * propose here" and `failed` is detection not answering at all. Rendering the
+ * first as the second would tell a contributor the tool is broken when it simply
+ * had nothing to say — and neither one stops them mapping the hole by hand.
+ */
+export type DetectionState =
+  | { status: 'idle' }
+  | { status: 'working' }
+  | {
+      status: 'ready';
+      jobId: string;
+      proposals: Proposal[];
+      /** The corridor raster inference read, for provenance and the U8 overlay. */
+      imagery: DetectionImagery | null;
+      /** Card tee sets detection found no mask for. */
+      missingTeeSets: TeeSetRef[];
+    }
+  | { status: 'no_coverage'; message: string }
+  | { status: 'failed'; message: string };
+
 export interface MapperState {
   screen: Screen;
   /** The course the contributor opened. Null until a detail record loads. */
@@ -89,11 +119,26 @@ export interface MapperState {
   attentionResolved: boolean;
   /** What OpenStreetMap answered for the open course. Drives routing and the board. */
   osm: OsmLookup;
+  /** Where the detection request for the open hole stands. Per hole, never carried across. */
+  detect: DetectionState;
   teeAssign: Record<TeeId, string>;
   holeStatus: HoleStatus[];
 }
 
 const EMPTY_LINE: LocateState = { points: [], finished: false };
+
+/** Nothing asked for yet. Every route into a hole starts here. */
+const NO_DETECTION: DetectionState = { status: 'idle' };
+
+/**
+ * Bounds the service enforces on a request, applied before sending rather than
+ * after being refused: it rejects unknown fields and out-of-range values with a
+ * 422, and a contributor should not read a validation error about a par the
+ * course record supplied and they never touched.
+ */
+const PAR_RANGE = { min: 3, max: 7 } as const;
+const TEE_YARDS_RANGE = { min: 30, max: 1312.3 } as const;
+const MAX_TEE_SETS = 8;
 
 export const INITIAL: MapperState = {
   screen: 'search',
@@ -111,6 +156,7 @@ export const INITIAL: MapperState = {
   lastAction: '',
   attentionResolved: false,
   osm: { status: 'pending' },
+  detect: NO_DETECTION,
   /* Named for real when a course loads — `defaultTeeAssign` reads the course's own sets. */
   teeAssign: { tee1: '', tee2: '', tee3: '', tee4: '' },
   /* No course, no holes. Statuses arrive with the course, from OpenStreetMap. */
@@ -208,6 +254,38 @@ function courseBounds(s: MapperState): MapBounds | null {
     course.longitude + dLng,
     course.latitude + dLat,
   ];
+}
+
+/**
+ * What the detection service is asked about this hole: the line as drawn, plus
+ * whatever the card knows about it.
+ *
+ * Tee sets are built from `course.tees` joined to the hole's own `yardages`
+ * rather than from `scorecardFor`, whose rows drop the colour key — and the key
+ * is what the service echoes back on a matched tee proposal, so the review
+ * sequence can open the tee step prefilled.
+ */
+export function detectRequestFor(s: MapperState): DetectRequest {
+  const hole = s.course?.holes[s.holeIndex] ?? null;
+  const request: DetectRequest = {
+    line: s.locate.points.map((point): LngLat => [point[0], point[1]]),
+  };
+
+  const par = hole?.par ?? null;
+  if (par !== null && par >= PAR_RANGE.min && par <= PAR_RANGE.max) request.par = par;
+
+  const teeSets: TeeSetRef[] = (s.course?.tees ?? [])
+    .map((tee) => ({ name: tee.name, key: tee.color, yards: hole?.yardages[tee.color] }))
+    .filter(
+      (tee): tee is TeeSetRef =>
+        typeof tee.yards === 'number' &&
+        tee.yards >= TEE_YARDS_RANGE.min &&
+        tee.yards <= TEE_YARDS_RANGE.max,
+    )
+    .slice(0, MAX_TEE_SETS);
+  if (teeSets.length > 0) request.teeSets = teeSets;
+
+  return request;
 }
 
 const currentStep = (s: MapperState): Step => STEPS[Math.min(s.step, STEPS.length - 1)];
@@ -329,6 +407,11 @@ export function computeDerived(s: MapperState) {
     locateTolerance,
     locateWithinTolerance,
     locateVerdict,
+    /* R1: there is nothing to detect against until the line is finished. */
+    canRequestProposals: locateDone && s.detect.status !== 'working',
+    detecting: s.detect.status === 'working',
+    /* What the service proposed for this hole. The review sequence drives from here. */
+    proposals: s.detect.status === 'ready' ? s.detect.proposals : [],
     features,
     labels,
     mapBounds,
@@ -349,6 +432,19 @@ export function computeDerived(s: MapperState) {
 export function useMapper() {
   const [state, setState] = useState<MapperState>(INITIAL);
   const advanceTimer = useRef<number | null>(null);
+  /**
+   * The detection request in flight, if there is one. Held in a ref rather than
+   * in state because aborting it is not a render — and because a result that
+   * arrives after the contributor has moved on must be able to recognise that it
+   * is no longer the request anyone is waiting for.
+   */
+  const detectRun = useRef<AbortController | null>(null);
+
+  /** Drop whatever detection is in flight. Leaving a hole is one of the reasons to. */
+  const dropDetection = useCallback(() => {
+    detectRun.current?.abort();
+    detectRun.current = null;
+  }, []);
 
   const patch = useCallback((next: Partial<MapperState> | ((s: MapperState) => Partial<MapperState>)) => {
     setState((s) => ({ ...s, ...(typeof next === 'function' ? next(s) : next) }));
@@ -356,6 +452,7 @@ export function useMapper() {
 
   const go = useCallback(
     (screen: Screen, mode?: ReviewMode) => {
+      dropDetection();
       patch((s) => ({
         screen,
         mode: mode ?? s.mode,
@@ -365,12 +462,14 @@ export function useMapper() {
         extra: screen === 'review' ? [] : s.extra,
         addMode: null,
         locate: screen === 'review' ? EMPTY_LINE : s.locate,
+        /* Proposals belong to the line they were asked about, and that line is gone. */
+        detect: screen === 'review' ? NO_DETECTION : s.detect,
         lastAction: '',
         attentionResolved:
           screen === 'review' && mode === 'attention' ? false : s.attentionResolved,
       }));
     },
-    [patch],
+    [patch, dropDetection],
   );
 
   /**
@@ -385,6 +484,7 @@ export function useMapper() {
    */
   const openCourse = useCallback(
     (session: CourseSession, osm: OsmLookup) => {
+      dropDetection();
       patch({
         course: session,
         screen: osm.status === 'found' ? 'boundary' : 'board',
@@ -401,11 +501,12 @@ export function useMapper() {
         extra: [],
         addMode: null,
         locate: EMPTY_LINE,
+        detect: NO_DETECTION,
         lastAction: '',
         attentionResolved: false,
       });
     },
-    [patch],
+    [patch, dropDetection],
   );
 
   const advance = useCallback(
@@ -514,6 +615,7 @@ export function useMapper() {
   const openHole = useCallback(
     (i: number) => {
       const status = state.holeStatus[i];
+      dropDetection();
       setState((s) => ({
         ...s,
         holeIndex: i,
@@ -532,11 +634,12 @@ export function useMapper() {
         extra: [],
         addMode: null,
         locate: EMPTY_LINE,
+        detect: NO_DETECTION,
         lastAction: '',
         attentionResolved: status === 'attention' ? false : s.attentionResolved,
       }));
     },
-    [state.holeStatus],
+    [state.holeStatus, dropDetection],
   );
 
   const nextHole = useCallback(() => {
@@ -544,6 +647,79 @@ export function useMapper() {
     const next = state.holeStatus.findIndex((st, i) => i > from && st !== 'complete');
     openHole(next < 0 ? from : next);
   }, [state.holeIndex, state.holeStatus, openHole]);
+
+  /**
+   * Ask the detection service what it can see on this hole (R1).
+   *
+   * Only ever from a finished line: the request is bounded by the corridor the
+   * line describes, and there is no corridor until the contributor has said where
+   * the hole plays. Nothing here can leave the hole unmappable — every outcome
+   * the service can produce lands in `detect` as a state the screen states, and
+   * the hand-drawing path stays exactly where it was (R12).
+   */
+  const requestProposals = useCallback(() => {
+    if (!state.locate.finished || state.locate.points.length < 2) return;
+
+    dropDetection();
+    const controller = new AbortController();
+    detectRun.current = controller;
+    patch({ detect: { status: 'working' }, lastAction: '' });
+
+    void askTheDetectionService(detectRequestFor(state), { signal: controller.signal }).then(
+      (result) => {
+        /* Superseded by a later request, or by leaving the hole: not ours to apply. */
+        if (detectRun.current !== controller) return;
+        detectRun.current = null;
+
+        /* A cancellation is what the contributor asked for; `cancelProposals` has
+         * already put the hole back the way they want it. */
+        if (result.status === 'aborted') return;
+
+        if (result.status === 'ok') {
+          patch({
+            detect: {
+              status: 'ready',
+              jobId: result.jobId,
+              proposals: result.proposals,
+              imagery: result.imagery,
+              missingTeeSets: result.missingTeeSets,
+            },
+            /* Into the review sequence, the same transition `confirmLocate` makes. */
+            mode: 'ready',
+            step: 0,
+            confirmed: [],
+            removed: [],
+            extra: [],
+            lastAction: `We found ${result.proposals.length} thing${
+              result.proposals.length === 1 ? '' : 's'
+            } to check with you.`,
+          });
+          return;
+        }
+
+        if (result.status === 'no_coverage') {
+          patch({ detect: { status: 'no_coverage', message: result.message }, lastAction: '' });
+          return;
+        }
+
+        patch({ detect: { status: 'failed', message: result.message }, lastAction: '' });
+      },
+    );
+  }, [state, patch, dropDetection]);
+
+  /**
+   * Stop waiting. The first request of a session is the one most likely to be
+   * slow — a cold container — and a contributor who would rather map the hole
+   * than wait it out needs a way out that is not the timeout (R12).
+   */
+  const cancelProposals = useCallback(() => {
+    dropDetection();
+    patch((s) =>
+      s.detect.status === 'working'
+        ? { detect: NO_DETECTION, lastAction: 'Stopped looking. The hole is yours to map by hand.' }
+        : {},
+    );
+  }, [patch, dropDetection]);
 
   /*
    * A / N / M drive the three review answers without reaching for the mouse — but
@@ -566,6 +742,7 @@ export function useMapper() {
   useEffect(() => {
     return () => {
       if (advanceTimer.current) window.clearTimeout(advanceTimer.current);
+      detectRun.current?.abort();
     };
   }, []);
 
@@ -586,13 +763,19 @@ export function useMapper() {
       upload,
       openHole,
       nextHole,
+      requestProposals,
+      cancelProposals,
       setQuery: (query: string) => patch({ query }),
       setTee: (id: TeeId, value: string) =>
         patch((s) => ({ teeAssign: { ...s.teeAssign, [id]: value } })),
       /** Which tee set the drawn line is checked against (R15). */
       setTeeSet: (color: string) => patch({ teeSet: color }),
       cancelAdd: () => patch({ addMode: null }),
-      resetLocate: () => patch({ locate: EMPTY_LINE, lastAction: '' }),
+      /** Start the line again — and with it whatever was proposed about the old one. */
+      resetLocate: () => {
+        dropDetection();
+        patch({ locate: EMPTY_LINE, detect: NO_DETECTION, lastAction: '' });
+      },
       /** Take back the last point placed. Anything finished goes back to being drawn. */
       undoLastPoint: () =>
         patch((s) => {
