@@ -10,10 +10,12 @@
  * numbers are the whole reason KTD7 exists, so they are asserted directly.
  */
 import { act, renderHook } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Polygon } from 'geojson';
 import { labelPoint, lineYards, yardsBetween, type LngLat } from '../geo/coords';
 import type { CourseDetail } from '../api/types';
+import type { Proposal, ProposalKind } from '../api/detect';
+import { STEPS } from '../data/course';
 import { buildCourseSession } from './courseSession';
 import {
   INITIAL,
@@ -300,6 +302,276 @@ describe('labels on real geometry', () => {
 
     expect(byKey.get('locate-tee')?.position).toEqual(PEBBLE_TEE);
     expect(byKey.get('locate-green')?.position).toEqual(PEBBLE_GREEN);
+  });
+});
+
+/**
+ * The per-feature confirmation sequence (R7, R8, R10, R14).
+ *
+ * Every assertion here is about one guarantee: a proposal becomes confirmed
+ * geometry only through an explicit human act about that one feature. A test that
+ * merely counted confirmations would pass on a batch, so each case pins down
+ * *which* proposal moved and that the others did not.
+ */
+describe('reviewing proposals one at a time', () => {
+  /** A small square near the hole. Distinct per proposal, so geometry is traceable. */
+  function squareAt(lng: number, lat: number): Polygon {
+    return {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [lng, lat],
+          [lng + 0.0002, lat],
+          [lng + 0.0002, lat + 0.0002],
+          [lng, lat + 0.0002],
+          [lng, lat],
+        ],
+      ],
+    };
+  }
+
+  let nextOffset = 0;
+  function proposal(id: string, kind: ProposalKind): Proposal {
+    nextOffset += 1;
+    return {
+      id,
+      kind,
+      geometry: squareAt(-121.947 + nextOffset * 0.0005, 36.5705),
+      confidence: 0.82,
+      areaSquareMeters: 640,
+      vertexCount: 5,
+      notes: [],
+      teeSet: null,
+      acquired: '2023-07-04',
+      gsdMeters: 0.6,
+      source: 'USDA NAIP via Microsoft Planetary Computer',
+      modelId: 'facebook/sam2-hiera-large',
+      itemId: 'ca_m_3812_2023',
+    };
+  }
+
+  const stepIndex = (id: string) => STEPS.findIndex((step) => step.id === id);
+
+  /** The hook, on hole 1, with a finished line and a detection answer already in. */
+  function openedWith(proposals: Proposal[], holeIndex = 0) {
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, { status: 'absent' }));
+    act(() => hook.result.current.actions.openHole(holeIndex));
+    act(() =>
+      hook.result.current.actions.patch({
+        mode: 'ready',
+        locate: { points: [PEBBLE_TEE, PEBBLE_TURN, PEBBLE_GREEN], finished: true },
+        detect: {
+          status: 'ready',
+          jobId: 'job-1',
+          proposals,
+          imagery: null,
+          missingTeeSets: [],
+        },
+      }),
+    );
+    return hook;
+  }
+
+  /** Walk to a named step without deciding anything on the way. */
+  function goToStep(actions: { patch: (p: Partial<MapperState>) => void }, id: string) {
+    act(() => actions.patch({ step: stepIndex(id), proposalIndex: 0 }));
+  }
+
+  beforeEach(() => {
+    nextOffset = 0;
+    /* No service in a unit test: decisions post into a stub and nothing waits. */
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ status: 'ok' }) })),
+    );
+  });
+
+  it('renders every proposal as a suggestion, and confirms none of them on arrival (R8)', () => {
+    const { result } = openedWith([
+      proposal('p-green', 'green'),
+      proposal('p-bunker-1', 'bunker'),
+      proposal('p-bunker-2', 'bunker'),
+    ]);
+
+    const drawnFeatures = result.current.derived.features.filter((f) => f.properties.kind !== 'hole');
+    expect(drawnFeatures).toHaveLength(3);
+    for (const feature of drawnFeatures) {
+      expect(feature.properties.status).toBe('proposed');
+    }
+    expect(result.current.state.confirmed).toEqual([]);
+    /* And nothing on the map claims to be confirmed geometry. */
+    expect(drawnFeatures.some((f) => f.properties.status === 'confirmed')).toBe(false);
+  });
+
+  it('confirms only the active proposal and advances within the step, not past it (R7)', () => {
+    const { result } = openedWith([
+      proposal('p-bunker-1', 'bunker'),
+      proposal('p-bunker-2', 'bunker'),
+      proposal('p-bunker-3', 'bunker'),
+    ]);
+    goToStep(result.current.actions, 'bunkers');
+
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-1');
+    expect(result.current.derived.stepProposalCount).toBe(3);
+
+    act(() => result.current.actions.accept());
+
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1']);
+    expect(result.current.state.step).toBe(stepIndex('bunkers'));
+    expect(result.current.state.proposalIndex).toBe(1);
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-2');
+
+    /* The other two are still suggestions on the map. */
+    const byId = new Map(
+      result.current.derived.features
+        .filter((f) => typeof f.properties.proposalId === 'string')
+        .map((f) => [f.properties.proposalId as string, f.properties.status]),
+    );
+    expect(byId.get('p-bunker-1')).toBe('confirmed');
+    expect(byId.get('p-bunker-2')).toBe('proposed');
+    expect(byId.get('p-bunker-3')).toBe('proposed');
+
+    /* Only after the last one does the step move on. */
+    act(() => result.current.actions.accept());
+    act(() => result.current.actions.accept());
+    expect(result.current.state.step).toBe(stepIndex('bunkers') + 1);
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1', 'p-bunker-2', 'p-bunker-3']);
+  });
+
+  it('records a rejection with its classified kind and geometry rather than discarding it (R10)', () => {
+    const rejected = proposal('p-bunker-1', 'bunker');
+    const { result } = openedWith([rejected, proposal('p-bunker-2', 'bunker')]);
+    goToStep(result.current.actions, 'bunkers');
+
+    act(() => result.current.actions.reject());
+
+    const recorded = result.current.derived.rejectedHere;
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].kind).toBe('bunker');
+    expect(recorded[0].geometry).toEqual(rejected.geometry);
+    expect(recorded[0].confidence).toBe(0.82);
+    expect(recorded[0].acquired).toBe('2023-07-04');
+
+    /* Rejected is not confirmed, and it leaves the map. */
+    expect(result.current.state.confirmed).toEqual([]);
+    expect(
+      result.current.derived.features.some((f) => f.properties.proposalId === 'p-bunker-1'),
+    ).toBe(false);
+    /* And the next proposal in the step is the one now being asked about. */
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-2');
+  });
+
+  it('marks proposed water a hazard only on an explicit in-play answer (R14)', () => {
+    const { result } = openedWith([proposal('p-water-1', 'water'), proposal('p-water-2', 'water')]);
+    goToStep(result.current.actions, 'water');
+
+    const hazardOf = (id: string) =>
+      result.current.derived.features.find((f) => f.properties.proposalId === id)?.properties
+        .hazard;
+
+    /* Proposed and unanswered: water on the imagery, not a hazard on the map. */
+    expect(hazardOf('p-water-1')).toBe(false);
+
+    act(() => result.current.actions.answerInPlay(false));
+    expect(result.current.state.confirmed).toContain('p-water-1');
+    expect(result.current.state.hazards).not.toContain('p-water-1');
+    expect(hazardOf('p-water-1')).toBe(false);
+
+    act(() => result.current.actions.answerInPlay(true));
+    expect(result.current.state.confirmed).toContain('p-water-2');
+    expect(result.current.state.hazards).toContain('p-water-2');
+    expect(hazardOf('p-water-2')).toBe(true);
+  });
+
+  it('keeps a step with nothing proposed, with its add action live', () => {
+    const { result } = openedWith([proposal('p-green', 'green')]);
+    goToStep(result.current.actions, 'bunkers');
+
+    expect(result.current.derived.stepProposalCount).toBe(0);
+    expect(result.current.derived.activeProposal).toBeNull();
+    /* The step is shown, and it says nothing came back rather than saying nothing. */
+    expect(result.current.derived.stepTitle).toBe(STEPS[stepIndex('bunkers')].empty.title);
+    expect(result.current.derived.stepAccept).toBe(STEPS[stepIndex('bunkers')].empty.accept);
+
+    act(() => result.current.actions.missing());
+    expect(result.current.state.addMode).toBe('bunker');
+  });
+
+  it('keeps a rejection after navigating to another hole and back (R10)', () => {
+    const { result } = openedWith([proposal('p-bunker-1', 'bunker')]);
+    goToStep(result.current.actions, 'bunkers');
+    act(() => result.current.actions.reject());
+    expect(result.current.derived.rejectedHere).toHaveLength(1);
+
+    act(() => result.current.actions.openHole(1));
+    expect(result.current.derived.rejectedHere).toHaveLength(0);
+
+    act(() => result.current.actions.openHole(0));
+    expect(result.current.derived.rejectedHere).toHaveLength(1);
+    expect(result.current.derived.rejectedHere[0].id).toBe('p-bunker-1');
+    /* Keyed by hole number, not by array position in the session. */
+    expect(Object.keys(result.current.state.rejections)).toEqual(['1']);
+  });
+
+  it('drives the keyboard shortcuts off the active proposal, one key one feature', () => {
+    const { result } = openedWith([
+      proposal('p-bunker-1', 'bunker'),
+      proposal('p-bunker-2', 'bunker'),
+    ]);
+    goToStep(result.current.actions, 'bunkers');
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' }));
+    });
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1']);
+    expect(result.current.state.step).toBe(stepIndex('bunkers'));
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'n' }));
+    });
+    expect(result.current.state.removed).toEqual(['p-bunker-2']);
+    expect(result.current.derived.rejectedHere.map((p) => p.id)).toEqual(['p-bunker-2']);
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1']);
+  });
+
+  it('never carries an undecided proposal past on the back of an added feature (R7)', () => {
+    const { result } = openedWith([
+      proposal('p-bunker-1', 'bunker'),
+      proposal('p-bunker-2', 'bunker'),
+    ]);
+    goToStep(result.current.actions, 'bunkers');
+
+    /* Adding one we missed is not an answer about the one we proposed, so the
+     * step stays where it is and confirms nothing. */
+    act(() => result.current.actions.advance('Thanks — that one was on us.'));
+
+    expect(result.current.state.step).toBe(stepIndex('bunkers'));
+    expect(result.current.state.proposalIndex).toBe(0);
+    expect(result.current.state.confirmed).toEqual([]);
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-1');
+  });
+
+  it('posts each decision to the store with its geometry and provenance, and no identifier (R15)', async () => {
+    const { result } = openedWith([proposal('p-green', 'green')]);
+    goToStep(result.current.actions, 'green');
+
+    await act(async () => {
+      result.current.actions.accept();
+    });
+
+    const call = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls[0];
+    expect(String(call[0])).toContain('/v1/decisions');
+    const body = JSON.parse((call[1] as { body: string }).body);
+    expect(body.course_id).toBe('pebble');
+    expect(body.hole_number).toBe(1);
+    expect(body.decisions).toHaveLength(1);
+    expect(body.decisions[0].kind).toBe('green');
+    expect(body.decisions[0].outcome).toBe('confirmed');
+    expect(body.decisions[0].geometry.type).toBe('Polygon');
+    expect(body.decisions[0].provenance.item_id).toBe('ca_m_3812_2023');
+    /* The store holds no contributor, session or device identifier — and is sent none. */
+    expect(JSON.stringify(body)).not.toMatch(/user|session|device|contributor/i);
   });
 });
 

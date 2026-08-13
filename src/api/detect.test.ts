@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Polygon } from 'geojson';
 import type { LngLat } from '../geo/coords';
 import {
   DETECT_API_BASE,
+  MAX_DECISIONS_PER_CALL,
   POLL_INTERVAL_MS,
+  decisionFor,
+  recordDecisions,
   requestProposals,
   type DetectRequest,
+  type Proposal,
 } from './detect';
 
 /** A short hole, drawn tee → green, the way the review screen hands it over. */
@@ -363,5 +368,106 @@ describe('requestProposals', () => {
     expect(result.status).toBe('ok');
     if (result.status !== 'ok') return;
     expect(result.proposals.map((p) => p.kind)).toEqual(['green']);
+  });
+});
+
+/**
+ * Persisting what the contributor decided (R10, R15).
+ *
+ * A rejection is a record, not a discard, so both outcomes travel the same path —
+ * and the store takes no contributor, session or device identifier, which is a
+ * property of the payload worth pinning down rather than remembering.
+ */
+describe('recordDecisions', () => {
+  const PROPOSAL: Proposal = {
+    id: '77d2-0',
+    kind: 'green',
+    geometry: GREEN.geometry as Polygon,
+    confidence: 0.86,
+    areaSquareMeters: 620.5,
+    vertexCount: 5,
+    notes: [],
+    teeSet: null,
+    acquired: '2023-07-04',
+    gsdMeters: 0.6,
+    source: 'USDA NAIP via Microsoft Planetary Computer',
+    modelId: 'facebook/sam2-hiera-large',
+    itemId: 'ca_m_3812_2023',
+  };
+
+  it('posts geometry, classified kind and imagery provenance for both outcomes', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ status: 'ok', recorded: 2 }));
+
+    const result = await recordDecisions('opengolf-1234', 7, [
+      decisionFor(PROPOSAL, 'confirmed'),
+      decisionFor({ ...PROPOSAL, id: '77d2-1', kind: 'bunker' }, 'rejected'),
+    ]);
+
+    expect(result).toEqual({ status: 'ok', recorded: 2 });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${DETECT_API_BASE}/v1/decisions`);
+    const body = JSON.parse(String(init.body));
+    expect(body.course_id).toBe('opengolf-1234');
+    expect(body.hole_number).toBe(7);
+    expect(body.decisions.map((d: { outcome: string }) => d.outcome)).toEqual([
+      'confirmed',
+      'rejected',
+    ]);
+    expect(body.decisions[1].kind).toBe('bunker');
+    expect(body.decisions[0].geometry.type).toBe('Polygon');
+    expect(body.decisions[0].provenance).toEqual({
+      acquired: '2023-07-04',
+      gsd_meters: 0.6,
+      source: 'USDA NAIP via Microsoft Planetary Computer',
+      model_id: 'facebook/sam2-hiera-large',
+      item_id: 'ca_m_3812_2023',
+    });
+    /* Nothing identifying is assembled, because the store accepts none. */
+    expect(String(init.body)).not.toMatch(/user|session|device|contributor/i);
+  });
+
+  it('sends the in-play answer only when one was given (R14)', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ status: 'ok', recorded: 1 }));
+
+    await recordDecisions('c', 1, [decisionFor({ ...PROPOSAL, kind: 'water' }, 'confirmed', false)]);
+    await recordDecisions('c', 1, [decisionFor(PROPOSAL, 'confirmed')]);
+
+    const answered = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+    const unasked = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(answered.decisions[0].in_play).toBe(false);
+    /* Absent, not false: nobody was asked, and that is not a "no". */
+    expect('in_play' in unasked.decisions[0]).toBe(false);
+  });
+
+  it('chunks past the store ceiling rather than refusing the call', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ status: 'ok' }));
+    const many = Array.from({ length: MAX_DECISIONS_PER_CALL + 5 }, (_, i) =>
+      decisionFor({ ...PROPOSAL, id: `p-${i}` }, 'confirmed'),
+    );
+
+    const result = await recordDecisions('c', 1, many);
+
+    expect(result).toEqual({ status: 'ok', recorded: MAX_DECISIONS_PER_CALL + 5 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const second = JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body));
+    expect(second.decisions).toHaveLength(5);
+  });
+
+  it('reports a store the service cannot reach as a stated failure', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ status: 'upstream', source: 'configuration' }, 502),
+    );
+
+    const result = await recordDecisions('c', 1, [decisionFor(PROPOSAL, 'rejected')]);
+
+    expect(result.status).toBe('failed');
+    if (result.status !== 'failed') return;
+    expect(result.reason).toBe('upstream');
+    expect(result.statusCode).toBe(502);
+  });
+
+  it('does not call the store when there is nothing to record', async () => {
+    expect(await recordDecisions('c', 1, [])).toEqual({ status: 'ok', recorded: 0 });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

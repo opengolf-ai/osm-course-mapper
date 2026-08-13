@@ -8,9 +8,14 @@
  * for the hole's features, and a detection that fails, times out or finds nothing
  * leaves the hand-mapping path exactly where it was (R12).
  *
- * Everything drawn is WGS84 GeoJSON on one MapLibre source. Pending, active and
- * confirmed styling comes from each feature's own `status` property through a
- * `match` expression, rather than from three parallel arrays of path strings.
+ * Everything drawn is WGS84 GeoJSON on one MapLibre source. Pending, active,
+ * proposed and confirmed styling comes from each feature's own `status` property
+ * through a `match` expression, rather than from parallel arrays of path strings.
+ *
+ * What detection proposes is drawn as a suggestion — its own hue, dashed, lighter
+ * fill — and stays that way until the contributor has answered about that one
+ * feature (R8, KTD8). The review sequence walks them one at a time; nothing here
+ * can confirm a batch, and no answer is inferred from moving on.
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Map as MapLibreMap } from 'maplibre-gl';
@@ -24,26 +29,66 @@ import { LOCATE_CLOSE_ENOUGH, type MapBounds, type Mapper } from '../state/useMa
 const FEATURE_SOURCE = 'review-features';
 const FILL_LAYER = 'review-features-fill';
 const LINE_LAYER = 'review-features-line';
+const PROPOSED_LINE_LAYER = 'review-features-proposed-line';
 const POINT_LAYER = 'review-features-point';
+
+/** What the contributor has confirmed. Nothing else may ever be drawn in it (R8). */
+export const CONFIRMED_COLOR = '#a3dcc7';
+/** The one being asked about right now. */
+export const ACTIVE_COLOR = '#3ecfb4';
+/** Not asked yet — the least-committal thing this map can say about a shape. */
+export const PENDING_COLOR = 'rgba(255,255,255,.42)';
+/**
+ * A machine's suggestion, awaiting a human (R8, KTD8).
+ *
+ * Amber rather than another green on purpose: mint and its tints are the palette
+ * this screen uses for things the contributor has settled, and a suggestion that
+ * shades towards them is a suggestion that reads as settled.
+ */
+export const PROPOSED_COLOR = '#f0c26a';
 
 /**
  * One expression, read by every layer: the feature says what it is and the paint
- * follows. `pending` has nothing to draw until detection lands, and is declared
- * here so the vocabulary stays whole.
+ * follows.
+ *
+ * Every status is an explicit branch, and the fallback is the *pending* colour,
+ * not the confirmed one. The fallback used to be `CONFIRMED_COLOR`, which meant a
+ * status this expression did not know about — `proposed`, before it existed here —
+ * rendered as confirmed geometry. That is the one thing R8 forbids, and it would
+ * have happened silently. An unknown status now reads as "not asked yet", which is
+ * the truthful answer for a shape nobody has ruled on.
  */
-const STATUS_COLOR = [
+export const STATUS_COLOR = [
   'match',
   ['get', 'status'],
   'confirmed',
-  '#a3dcc7',
+  CONFIRMED_COLOR,
   'active',
-  '#3ecfb4',
+  ACTIVE_COLOR,
+  'proposed',
+  PROPOSED_COLOR,
   'pending',
-  'rgba(255,255,255,.42)',
-  '#a3dcc7',
+  PENDING_COLOR,
+  PENDING_COLOR,
 ];
 
-const STATUS_WIDTH = ['match', ['get', 'status'], 'active', 4, 2.5];
+export const STATUS_WIDTH = [
+  'match',
+  ['get', 'status'],
+  'active',
+  4,
+  'proposed',
+  2,
+  2.5,
+];
+
+/**
+ * A suggestion is drawn dashed, and `line-dasharray` is not data-driven the way
+ * `line-color` is — there is no `match` on `status` to be had. So the dashed
+ * suggestion gets its own layer with a filter, and the solid line layer excludes
+ * what this one draws rather than drawing underneath it.
+ */
+const PROPOSED_FILTER = ['all', ['!=', ['geometry-type'], 'Point'], ['==', ['get', 'status'], 'proposed']];
 
 const RAIL_CARD = {
   background: 'var(--green-800)',
@@ -137,6 +182,15 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
     mapBounds,
     scorecard,
     summary,
+    /* The per-feature review (R7): one proposal on screen, and the copy for it. */
+    stepTitle,
+    stepNote,
+    stepAccept,
+    stepProposalCount,
+    activeProposal,
+    activePosition,
+    stepNeedsInPlay,
+    rejectedHere,
   } = derived;
 
   const [map, setMap] = useState<MapLibreMap | null>(null);
@@ -188,15 +242,33 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
         type: 'fill',
         source: FEATURE_SOURCE,
         filter: ['==', ['geometry-type'], 'Polygon'],
-        paint: { 'fill-color': STATUS_COLOR, 'fill-opacity': 0.16 },
+        paint: {
+          'fill-color': STATUS_COLOR,
+          /* A suggestion sits lighter on the imagery than something confirmed. */
+          'fill-opacity': ['case', ['==', ['get', 'status'], 'proposed'], 0.1, 0.16],
+        },
       } as never);
       instance.addLayer({
         id: LINE_LAYER,
         type: 'line',
         source: FEATURE_SOURCE,
-        filter: ['!=', ['geometry-type'], 'Point'],
+        /* Everything but the suggestions, which the dashed layer below owns. */
+        filter: ['all', ['!=', ['geometry-type'], 'Point'], ['!=', ['get', 'status'], 'proposed']],
         layout: { 'line-cap': 'round', 'line-join': 'round' },
         paint: { 'line-color': STATUS_COLOR, 'line-width': STATUS_WIDTH },
+      } as never);
+      instance.addLayer({
+        id: PROPOSED_LINE_LAYER,
+        type: 'line',
+        source: FEATURE_SOURCE,
+        filter: PROPOSED_FILTER,
+        layout: { 'line-cap': 'butt', 'line-join': 'round' },
+        paint: {
+          'line-color': STATUS_COLOR,
+          'line-dasharray': [2, 2],
+          /* The one being asked about is drawn heavier than the ones queued behind it. */
+          'line-width': ['case', ['==', ['get', 'focus'], true], 3.5, 2],
+        },
       } as never);
       instance.addLayer({
         id: POINT_LAYER,
@@ -421,13 +493,22 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
               <span style={{ width: 18, height: 0, borderTop: '2px solid var(--mint-400)', display: 'block' }} />
               asking you now
             </span>
+            {/* R8: the suggestion layer says what it is, in its own hue and dashed. */}
             <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ width: 18, height: 0, borderTop: '2px solid #a3dcc7', display: 'block' }} />
+              <span
+                style={{ width: 18, height: 0, borderTop: `2px dashed ${PROPOSED_COLOR}`, display: 'block' }}
+              />
+              we suggest — not yours yet
+            </span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+              <span
+                style={{ width: 18, height: 0, borderTop: `2px solid ${CONFIRMED_COLOR}`, display: 'block' }}
+              />
               you confirmed
             </span>
             <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
               <span
-                style={{ width: 18, height: 0, borderTop: '2px dashed rgba(255,255,255,.42)', display: 'block' }}
+                style={{ width: 18, height: 0, borderTop: `2px dashed ${PENDING_COLOR}`, display: 'block' }}
               />
               not asked yet
             </span>
@@ -895,7 +976,23 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
 
         {!allDone && !isLocate && (
           <div style={RAIL_CARD}>
-            <div style={{ ...EYEBROW, color: 'var(--mint-400)', marginBottom: 10 }}>{q.kicker}</div>
+            <div
+              style={{
+                ...EYEBROW,
+                color: 'var(--mint-400)',
+                marginBottom: 10,
+                display: 'flex',
+                gap: 10,
+              }}
+            >
+              <span>{q.kicker}</span>
+              {/* Which one of how many — the count comes off the real list, not the copy. */}
+              {stepProposalCount > 0 && (
+                <span style={{ marginLeft: 'auto', color: PROPOSED_COLOR }}>
+                  {activePosition} / {stepProposalCount} suggested
+                </span>
+              )}
+            </div>
             <h3
               style={{
                 fontFamily: 'var(--font-display)',
@@ -907,10 +1004,10 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
                 textWrap: 'pretty',
               }}
             >
-              {q.title}
+              {stepTitle}
             </h3>
             <p style={{ margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' }}>
-              {q.note}
+              {stepNote}
             </p>
 
             {q.isTees && (
@@ -953,27 +1050,64 @@ export function ReviewScreen({ mapper }: { mapper: Mapper }) {
               </div>
             )}
 
+            {/*
+              * One proposal, one answer (R7). The confirming button is about the
+              * feature on screen and nothing behind it, and on the water step it
+              * is the in-play question itself — the only thing that makes a pond
+              * a hazard (R14). With nothing proposed the step still stands: the
+              * contributor confirms the absence, or says we missed one.
+              */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
               <Button size="lg" variant="accent" fullWidth onClick={actions.accept}>
-                {q.accept}
+                {stepAccept}
               </Button>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
+              {stepNeedsInPlay && q.outOfPlay && (
                 <HoverButton
-                  onClick={actions.reject}
+                  onClick={() => actions.answerInPlay(false)}
                   style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
                   hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
                 >
-                  {q.reject}
+                  {q.outOfPlay}
                 </HoverButton>
+              )}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
+                {(activeProposal !== null || q.kind === null) && (
+                  <HoverButton
+                    onClick={actions.reject}
+                    style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
+                    hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
+                  >
+                    {q.reject}
+                  </HoverButton>
+                )}
                 <HoverButton
                   onClick={actions.missing}
-                  style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
+                  style={{
+                    ...GHOST_BUTTON,
+                    height: 44,
+                    fontSize: 14,
+                    gridColumn: activeProposal === null && q.kind !== null ? '1 / -1' : undefined,
+                  }}
                   hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
                 >
                   {q.miss}
                 </HoverButton>
               </div>
             </div>
+
+            {/* R10: a rejection is a record. Say so where it was made. */}
+            {rejectedHere.length > 0 && (
+              <div
+                style={{
+                  marginTop: 12,
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 11,
+                  color: 'var(--green-200)',
+                }}
+              >
+                {rejectedHere.length} turned down on this hole — kept, not discarded.
+              </div>
+            )}
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 14 }}>
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>

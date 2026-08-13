@@ -8,6 +8,7 @@ import { INITIAL, computeDerived, type MapperState, type Mapper } from './state/
 import { buildCourseSession, defaultTeeAssign, holeStatusesFrom } from './state/courseSession';
 import type { CourseDetail } from './api/types';
 import type { OsmCourse, OsmLookup } from './api/overpass';
+import type { Proposal } from './api/detect';
 import type { LngLat } from './geo/coords';
 import { STEPS } from './data/course';
 
@@ -121,6 +122,47 @@ const PEBBLE_HOLE_ONE: LngLat[] = [
   [-121.9461359, 36.5706059],
 ];
 
+/*
+ * What a detection answer looks like once it has landed, so the server render
+ * covers the suggestion layer and the one-at-a-time review as well as the empty
+ * steps. Squares beside the real hole-1 line — placeholder geometry for a render
+ * harness, never drawn over a real course in the app.
+ */
+function proposalSquare(id: string, kind: Proposal['kind'], lng: number): Proposal {
+  return {
+    id,
+    kind,
+    geometry: {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [lng, 36.5703],
+          [lng + 0.0003, 36.5703],
+          [lng + 0.0003, 36.5706],
+          [lng, 36.5706],
+          [lng, 36.5703],
+        ],
+      ],
+    },
+    confidence: 0.86,
+    areaSquareMeters: 900,
+    vertexCount: 5,
+    notes: [],
+    teeSet: null,
+    acquired: '2023-07-04',
+    gsdMeters: 0.6,
+    source: 'USDA NAIP via Microsoft Planetary Computer',
+    modelId: 'facebook/sam2-hiera-large',
+    itemId: 'ca_m_3812_2023',
+  };
+}
+
+const PROPOSALS: Proposal[] = [
+  proposalSquare('p-green', 'green', -121.9464),
+  proposalSquare('p-bunker-1', 'bunker', -121.947),
+  proposalSquare('p-bunker-2', 'bunker', -121.9476),
+];
+
 function mapperFor(overrides: Partial<MapperState>): Mapper {
   const state: MapperState = {
     ...INITIAL,
@@ -191,8 +233,28 @@ export function renderAll(): Record<string, string> {
       />,
     ),
 
+    /* Nothing proposed: every step still stands, and says so rather than vanishing. */
     reviewReady: renderToString(<ReviewScreen mapper={mapperFor({ mode: 'ready' })} />),
     reviewTees: renderToString(<ReviewScreen mapper={mapperFor({ mode: 'ready', step: 2 })} />),
+    /* Proposals landed: the second of two bunkers is the one being asked about. */
+    reviewProposals: renderToString(
+      <ReviewScreen
+        mapper={mapperFor({
+          mode: 'ready',
+          step: 1,
+          proposalIndex: 1,
+          confirmed: ['p-green', 'p-bunker-1'],
+          locate: { points: PEBBLE_HOLE_ONE, finished: true },
+          detect: {
+            status: 'ready',
+            jobId: 'smoke-job',
+            proposals: PROPOSALS,
+            imagery: null,
+            missingTeeSets: [],
+          },
+        })}
+      />,
+    ),
     reviewDone: renderToString(
       <ReviewScreen
         mapper={mapperFor({

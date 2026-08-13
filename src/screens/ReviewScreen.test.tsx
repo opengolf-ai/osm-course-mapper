@@ -79,14 +79,30 @@ vi.mock('maplibre-gl', () => {
  * pinned down against a stubbed `fetch` in `src/api/detect.test.ts`.
  */
 const detectMock = vi.hoisted(() => vi.fn());
-vi.mock('../api/detect', () => ({ requestProposals: detectMock }));
+/**
+ * `recordDecisions` is stubbed alongside it: the review sequence posts every
+ * decision as it is made (R15), and a unit test has no store to post to. What it
+ * sends is pinned down in `src/state/useMapper.test.ts`.
+ */
+const recordMock = vi.hoisted(() =>
+  vi.fn(
+    async (_courseId: string, _holeNumber: number, decisions: Array<{ outcome: string }>) => ({
+      status: 'ok' as const,
+      recorded: decisions.length,
+    }),
+  ),
+);
+vi.mock('../api/detect', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api/detect')>();
+  return { ...actual, requestProposals: detectMock, recordDecisions: recordMock };
+});
 
 import { IMAGERY_SOURCE_ID } from '../map/imagerySources';
 import { IMAGERY_UNAVAILABLE_MESSAGE } from '../map/BaseMap';
 import { buildCourseSession } from '../state/courseSession';
 import { useMapper } from '../state/useMapper';
 import type { CourseDetail } from '../api/types';
-import { ReviewScreen } from './ReviewScreen';
+import { CONFIRMED_COLOR, PROPOSED_COLOR, STATUS_COLOR, ReviewScreen } from './ReviewScreen';
 
 const DETAIL: CourseDetail = {
   id: 'pebble',
@@ -142,6 +158,7 @@ function clickAt(x: number, y: number) {
 beforeEach(() => {
   harness.reset();
   detectMock.mockReset();
+  recordMock.mockClear();
 });
 
 /** Click a button by its label, letting React settle afterwards. */
@@ -185,7 +202,7 @@ describe('drawing on real imagery', () => {
     ]);
   });
 
-  it('drives pending, active and confirmed styling from a feature property', async () => {
+  it('drives pending, active, proposed and confirmed styling from a feature property', async () => {
     await mount();
 
     const paints = harness.layers.map((layer) => JSON.stringify(layer.paint));
@@ -198,6 +215,42 @@ describe('drawing on real imagery', () => {
     expect(all).toContain('confirmed');
     expect(all).toContain('active');
     expect(all).toContain('pending');
+    expect(all).toContain('proposed');
+  });
+
+  /**
+   * R8. The fallback branch of the colour expression used to be the confirmed
+   * colour, so any status the expression did not enumerate — `proposed`, before
+   * it was one — painted as confirmed geometry. That failure is silent on a map,
+   * so it is asserted here rather than left to the eye.
+   */
+  it('does not paint an unhandled status in the confirmed colour', async () => {
+    await mount();
+
+    expect(STATUS_COLOR).toContain('proposed');
+    expect(STATUS_COLOR[STATUS_COLOR.length - 1]).not.toBe(CONFIRMED_COLOR);
+    expect(PROPOSED_COLOR).not.toBe(CONFIRMED_COLOR);
+
+    /* And an unknown status resolves through that fallback, not through a branch. */
+    const branches = STATUS_COLOR.slice(2, -1);
+    expect(branches).not.toContain('mystery-status');
+  });
+
+  it('draws suggestions dashed on their own layer, since line-dasharray is not data-driven', async () => {
+    await mount();
+
+    const dashed = harness.layers.filter(
+      (layer) => (layer.paint as Record<string, unknown>)['line-dasharray'] !== undefined,
+    );
+    expect(dashed).toHaveLength(1);
+    expect(JSON.stringify(dashed[0].filter)).toContain('proposed');
+    /* And the solid line layer stays off them rather than drawing underneath. */
+    const solid = harness.layers.find(
+      (layer) =>
+        layer.type === 'line' && (layer.paint as Record<string, unknown>)['line-dasharray'] === undefined,
+    );
+    expect(JSON.stringify(solid?.filter)).toContain('proposed');
+    expect(JSON.stringify(solid?.filter)).toContain('!=');
   });
 
   it('ignores clicks while the imagery-error state shows (R19)', async () => {
@@ -341,6 +394,131 @@ describe('asking the detection service for proposals', () => {
     expect(screen.getByText(/Detection did not finish/)).toBeDefined();
     expect(screen.queryByText(/No proposals for this hole/)).toBeNull();
     expect(screen.getByText(HAND_MAPPABLE)).toBeDefined();
+  });
+
+  /** The same proposal shape, for a kind and an id. */
+  function like(id: string, kind: 'green' | 'bunker' | 'water', lng: number) {
+    return {
+      ...PROPOSAL,
+      id,
+      kind,
+      geometry: {
+        type: 'Polygon' as const,
+        coordinates: [
+          [
+            [lng, 36.5705],
+            [lng + 0.0002, 36.5705],
+            [lng + 0.0002, 36.5707],
+            [lng, 36.5707],
+            [lng, 36.5705],
+          ],
+        ],
+      },
+    };
+  }
+
+  /** What the map is currently holding, by proposal id. */
+  function statusById(): Map<string, string> {
+    const collection = harness.sources.get('review-features')?.data as {
+      features: Array<{ properties: Record<string, unknown> }>;
+    };
+    return new Map(
+      collection.features
+        .filter((f) => typeof f.properties.proposalId === 'string')
+        .map((f) => [f.properties.proposalId as string, f.properties.status as string]),
+    );
+  }
+
+  it('walks the contributor through the proposals one at a time, confirming only what they answer', async () => {
+    resolvesWith({
+      status: 'ok',
+      jobId: '77d2',
+      proposals: [like('g1', 'green', -121.946), like('b1', 'bunker', -121.9465), like('b2', 'bunker', -121.947)],
+      imagery: null,
+      missingTeeSets: [],
+    });
+    await withFinishedLine();
+    await press(ASK);
+
+    /* Everything arrives as a suggestion. Nothing is confirmed by arriving. */
+    expect([...statusById().values()]).toEqual(['proposed', 'proposed', 'proposed']);
+
+    await press('Yes, that is the green');
+    expect(statusById().get('g1')).toBe('confirmed');
+    expect(statusById().get('b1')).toBe('proposed');
+
+    /* The bunker step opens on the first of two, and says which. */
+    expect(screen.getByText('Bunker 1 of 2 — is that sand?')).toBeDefined();
+
+    await press('Yes, that is sand');
+    /* One confirmation, one feature: the second bunker is still being asked about. */
+    expect(statusById().get('b1')).toBe('confirmed');
+    expect(statusById().get('b2')).toBe('proposed');
+    expect(screen.getByText('Bunker 2 of 2 — is that sand?')).toBeDefined();
+
+    await press('That is not sand');
+    /* Rejected: off the map, and recorded rather than dropped. */
+    expect(statusById().has('b2')).toBe(false);
+    expect(screen.getByText(/1 turned down on this hole/)).toBeDefined();
+    expect(recordMock).toHaveBeenCalledTimes(3);
+    expect(recordMock.mock.calls[2][2][0].outcome).toBe('rejected');
+  });
+
+  it('keeps a step with nothing proposed, with its add action live', async () => {
+    resolvesWith({
+      status: 'ok',
+      jobId: '77d2',
+      proposals: [like('g1', 'green', -121.946)],
+      imagery: null,
+      missingTeeSets: [],
+    });
+    await withFinishedLine();
+    await press(ASK);
+    await press('Yes, that is the green');
+
+    /* No bunkers came back. The step is shown anyway, saying so, with the
+     * "we missed one" route still open — silence and absence are not the same. */
+    expect(screen.getByText('No bunkers proposed on this hole.')).toBeDefined();
+    expect(screen.getByText('There are no bunkers here')).toBeDefined();
+    await press('There is another bunker');
+    expect(screen.getByText('Click the map where the bunker is.')).toBeDefined();
+  });
+
+  it('marks a proposed water body a hazard only on an explicit in-play answer (R14)', async () => {
+    resolvesWith({
+      status: 'ok',
+      jobId: '77d2',
+      proposals: [like('w1', 'water', -121.946), like('w2', 'water', -121.9465)],
+      imagery: null,
+      missingTeeSets: [],
+    });
+    await withFinishedLine();
+    await press(ASK);
+
+    /* Straight to the water step: nothing else was proposed. */
+    await press('Nothing to confirm — carry on');
+    await press('There are no bunkers here');
+    await press('Leave the tees for now');
+    await press('No fairway to confirm');
+
+    expect(screen.getByText('Water 1 of 2 — can a ball find it?')).toBeDefined();
+    const hazardOf = (id: string) => {
+      const collection = harness.sources.get('review-features')?.data as {
+        features: Array<{ properties: Record<string, unknown> }>;
+      };
+      return collection.features.find((f) => f.properties.proposalId === id)?.properties.hazard;
+    };
+    /* Proposed water is water on the imagery, not a hazard on the map. */
+    expect(hazardOf('w1')).toBe(false);
+
+    await press('It is water, but out of play');
+    /* Confirmed as water, and still not a hazard — the answer was no. */
+    expect(statusById().get('w1')).toBe('confirmed');
+    expect(hazardOf('w1')).toBe(false);
+
+    await press('Yes — it is in play');
+    expect(statusById().get('w2')).toBe('confirmed');
+    expect(hazardOf('w2')).toBe(true);
   });
 
   it('cancels the working state, aborting the request and returning the hole to hand-mapping', async () => {

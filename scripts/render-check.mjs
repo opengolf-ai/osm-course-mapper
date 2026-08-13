@@ -3,6 +3,10 @@ const raw = renderAll();
 // React separates adjacent text nodes with <!-- -->; strip so needles match the visible string.
 const out = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v.replaceAll('<!-- -->', '')]));
 
+// Steps in the review sequence, spelled out here so adding one is a deliberate edit:
+// green, bunkers, tees, fairway, water in play, other hazards.
+const STEP_COUNT = 6;
+
 const CHECKS = [
   ['app',               'Map your home course.'],
   ['app',               'course mapper'],
@@ -29,15 +33,24 @@ const CHECKS = [
   // R16: a failed lookup is not zero holes, so no count is printed at all.
   ['boardUnknown',      'Mapped state unknown'],
   ['boardUnknown',      'Unknown'],
-  ['reviewReady',       'Is that the green?'],
-  ['reviewReady',       'check 1 of 5'],
+  // R7/R8: with nothing proposed the step is kept, not skipped, and says which it is.
+  ['reviewReady',       'We did not find a green here.'],
+  ['reviewReady',       'Nothing to confirm — carry on'],
+  ['reviewReady',       `check 1 of ${STEP_COUNT}`],
+  // The suggestion layer names itself in the legend, beside what the contributor owns.
+  ['reviewReady',       'we suggest — not yours yet'],
+  ['reviewReady',       'you confirmed'],
   // Every map screen is real imagery now, so the review screen carries the same credits.
   ['reviewReady',       'Imagery © Esri'],
   ['reviewReady',       'no line drawn yet · Blue says 378'],
   ['reviewReady',       'A accept · N not there · M missed one'],
-  ['reviewTees',        'Which tee is which?'],
+  ['reviewTees',        'No tee boxes proposed on this hole.'],
   ['reviewTees',        'furthest back'],
   ['reviewTees',        '<option value="Blue">Blue · 378 yd</option>'],
+  // R7: one proposal at a time, counted off the real list rather than hardcoded copy.
+  ['reviewProposals',   'Bunker 2 of 2 — is that sand?'],
+  ['reviewProposals',   '2 / 2 suggested'],
+  ['reviewProposals',   'That is not sand'],
   ['reviewDone',        'Hole 1, confirmed.'],
   ['reviewDone',        'Put hole 1 on the map'],
   ['reviewDone',        'all checks done'],

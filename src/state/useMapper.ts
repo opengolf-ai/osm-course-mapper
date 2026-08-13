@@ -1,14 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Geometry, LineString, Polygon } from 'geojson';
 import {
+  decisionFor,
+  recordDecisions,
   requestProposals as askTheDetectionService,
+  type DecisionOutcome,
   type DetectRequest,
   type DetectionImagery,
   type Proposal,
   type TeeSetRef,
 } from '../api/detect';
 import type { OsmLookup } from '../api/overpass';
-import { STEPS, TEE_IDS, type HoleStatus, type Step, type TeeId } from '../data/course';
+import {
+  STEPS,
+  TEE_IDS,
+  stepAccept,
+  stepNote,
+  stepTitle,
+  type HoleStatus,
+  type Step,
+  type TeeId,
+} from '../data/course';
 import {
   courseFeature,
   labelPoint,
@@ -111,8 +123,39 @@ export interface MapperState {
   /** The `yardages` key of the tee set being measured against (R15). Null falls back to the longest. */
   teeSet: string | null;
   step: number;
+  /**
+   * Which proposal within the current step is being asked about (R7).
+   *
+   * The step alone cannot say: a step reviews a variable-length list of proposals
+   * of one kind, and the contributor answers about exactly one of them at a time.
+   * Reset whenever the step changes, and whenever a hole is opened.
+   */
+  proposalIndex: number;
+  /** Proposal ids the contributor confirmed. One entry per explicit human act. */
   confirmed: string[];
+  /** Proposal ids the contributor rejected — the map side of `rejections`. */
   removed: string[];
+  /**
+   * Proposal ids the contributor said a ball can find (R14).
+   *
+   * Separate from `confirmed` because they answer different questions: confirmed
+   * is "yes, that is water", a hazard is "yes, and it is in play". Water can be
+   * confirmed without ever becoming a hazard, and nothing but an explicit yes
+   * puts an id in here.
+   */
+  hazards: string[];
+  /**
+   * Every proposal the contributor rejected on this course, keyed by hole number
+   * (R10).
+   *
+   * Course-level rather than per-hole state because every other slot that could
+   * hold this — `detect`, `removed`, `extra` — is cleared on navigation, so a
+   * per-hole home would keep only the hole last visited. This is an in-session
+   * cache in front of the server-side store (KTD10), not the system of record:
+   * `recordDecisions` posts each rejection as it is made, and this is what the
+   * screen can show without a round trip.
+   */
+  rejections: Record<number, Proposal[]>;
   extra: ExtraShape[];
   addMode: string | null;
   lastAction: string;
@@ -149,8 +192,11 @@ export const INITIAL: MapperState = {
   locate: EMPTY_LINE,
   teeSet: null,
   step: 0,
+  proposalIndex: 0,
   confirmed: [],
   removed: [],
+  hazards: [],
+  rejections: {},
   extra: [],
   addMode: null,
   lastAction: '',
@@ -163,15 +209,6 @@ export const INITIAL: MapperState = {
   holeStatus: [],
 };
 
-/** The noun the "we missed one" branch is about, per review step. */
-function missingNoun(stepId: string): string {
-  if (stepId === 'bunkers') return 'bunker';
-  if (stepId === 'tees') return 'tee box';
-  if (stepId === 'extras') return 'water';
-  if (stepId === 'green') return 'green';
-  return 'fairway edge';
-}
-
 /** What an added feature is, and roughly how big one is, in yards of radius. */
 const ADDED_FEATURE: Record<string, { kind: FeatureKind; radiusYards: number }> = {
   water: { kind: 'water', radiusYards: 40 },
@@ -179,6 +216,13 @@ const ADDED_FEATURE: Record<string, { kind: FeatureKind; radiusYards: number }> 
   green: { kind: 'green', radiusYards: 22 },
   bunker: { kind: 'bunker', radiusYards: 12 },
   'fairway edge': { kind: 'fairway', radiusYards: 28 },
+  /*
+   * The Other Hazards step takes anything we do not classify — a waste area, a
+   * ditch, a stand of trees. `rough` is the nearest kind this client models, and
+   * the contributor's own word rides along in `label`, so nothing they said is
+   * lost even though the kind is approximate.
+   */
+  hazard: { kind: 'rough', radiusYards: 30 },
 };
 
 const METRES_PER_YARD = 0.9144;
@@ -291,6 +335,33 @@ export function detectRequestFor(s: MapperState): DetectRequest {
 const currentStep = (s: MapperState): Step => STEPS[Math.min(s.step, STEPS.length - 1)];
 const isBlocked = (s: MapperState) => s.mode === 'attention' && !s.attentionResolved;
 
+/** Everything detection proposed for the open hole, or nothing at all. */
+export function proposalsOf(s: MapperState): Proposal[] {
+  return s.detect.status === 'ready' ? s.detect.proposals : [];
+}
+
+/** The hole number the open hole carries on the card — the key rejections are filed under. */
+export function openHoleNumber(s: MapperState): number {
+  return s.course?.holes[s.holeIndex]?.number ?? s.holeIndex + 1;
+}
+
+/**
+ * The proposals one step reviews, in the order they came back.
+ *
+ * Derived at runtime from the detection answer rather than declared on the step,
+ * because the step cannot know how many bunkers a hole has. A step with no
+ * detection class behind it, and a step detection said nothing about, both come
+ * back empty — and both are still shown (see `Step.empty`).
+ *
+ * Rejected proposals stay in the list: the list is what the contributor walks,
+ * and a decided proposal keeps its position so the count they were told about
+ * ("bunker 2 of 3") does not renumber underneath them.
+ */
+export function proposalsForStep(s: MapperState, step: Step): Proposal[] {
+  if (!step.kind) return [];
+  return proposalsOf(s).filter((proposal) => proposal.kind === step.kind);
+}
+
 /**
  * Everything the review screen draws, derived from state alone.
  * Pure and exported so screens can be rendered without driving the hook.
@@ -333,7 +404,8 @@ export function computeDerived(s: MapperState) {
    * matched on. Three arrays became one property (KTD6) — a `match` expression on
    * `status` is what the layer paint reads.
    */
-  const holeRef = hole ? String(hole.number) : String(hi + 1);
+  const holeNumber = openHoleNumber(s);
+  const holeRef = String(holeNumber);
   const features: CourseFeature[] = [];
   if (locateLine) {
     features.push(
@@ -357,6 +429,40 @@ export function computeDerived(s: MapperState) {
       ),
     );
   });
+  /*
+   * Proposals (R8). Every one of them draws as `proposed` until the contributor
+   * has said otherwise about that one feature — never `confirmed`, and never
+   * silently, which is what the suggestion layer in `ReviewScreen` is styled for.
+   * A rejected proposal leaves the map entirely; it survives in `rejections`.
+   */
+  const proposals = proposalsOf(s);
+  const confirmedIds = new Set(s.confirmed);
+  const rejectedIds = new Set(s.removed);
+  const hazardIds = new Set(s.hazards);
+  const step = currentStep(s);
+  const stepProposals = proposalsForStep(s, step);
+  const activeProposal = stepProposals[s.proposalIndex] ?? null;
+
+  for (const proposal of proposals) {
+    if (rejectedIds.has(proposal.id)) continue;
+    const isConfirmed = confirmedIds.has(proposal.id);
+    features.push(
+      courseFeature(proposal.kind, proposal.geometry, {
+        ref: holeRef,
+        status: isConfirmed ? 'confirmed' : 'proposed',
+        /* The one being asked about, so the suggestion layer can pick it out. */
+        focus: !isConfirmed && activeProposal?.id === proposal.id,
+        label: proposal.kind,
+        proposalId: proposal.id,
+        /* U8 reads these off the feature as well as off the proposal. */
+        confidence: proposal.confidence,
+        acquired: proposal.acquired,
+        /* R14: false until an explicit in-play yes, never merely by being water. */
+        ...(proposal.kind === 'water' ? { hazard: hazardIds.has(proposal.id) } : {}),
+      }),
+    );
+  }
+
   for (const added of s.extra) {
     features.push({
       ...added.feature,
@@ -365,11 +471,20 @@ export function computeDerived(s: MapperState) {
   }
 
   /* Captions sit at the centroid of the thing they name, not at a fixed offset. */
-  const labels: FeatureLabel[] = s.extra.map((added) => ({
-    key: added.id,
-    text: added.label,
-    position: labelPoint(added.feature.geometry),
-  }));
+  const labels: FeatureLabel[] = proposals
+    .filter((proposal) => !rejectedIds.has(proposal.id))
+    .map((proposal) => ({
+      key: proposal.id,
+      text: confirmedIds.has(proposal.id) ? proposal.kind : `${proposal.kind}?`,
+      position: labelPoint(proposal.geometry),
+    }))
+    .concat(
+      s.extra.map((added) => ({
+        key: added.id,
+        text: added.label,
+        position: labelPoint(added.feature.geometry),
+      })),
+    );
   if (points.length > 0) {
     labels.unshift({ key: 'locate-tee', text: 'your tee', position: points[0] });
   }
@@ -411,18 +526,42 @@ export function computeDerived(s: MapperState) {
     canRequestProposals: locateDone && s.detect.status !== 'working',
     detecting: s.detect.status === 'working',
     /* What the service proposed for this hole. The review sequence drives from here. */
-    proposals: s.detect.status === 'ready' ? s.detect.proposals : [],
+    proposals,
+    /* The corridor raster inference read — provenance, and the U8 overlay. */
+    detectionImagery: s.detect.status === 'ready' ? s.detect.imagery : null,
+    missingTeeSets: s.detect.status === 'ready' ? s.detect.missingTeeSets : [],
+    /* The current step's own list, and the single feature being asked about (R7). */
+    stepProposals,
+    stepProposalCount: stepProposals.length,
+    activeProposal,
+    /** 1-based, for copy. Zero when the step has nothing to review. */
+    activePosition: activeProposal ? s.proposalIndex + 1 : 0,
+    /* Copy templated off the real count — never "we found 2 bunkers" on a hole with three. */
+    stepTitle: stepTitle(step, s.proposalIndex + 1, stepProposals.length),
+    stepNote: stepNote(step, stepProposals.length),
+    stepAccept: stepAccept(step, stepProposals.length),
+    /* R14: the water step offers the in-play answer, and only it does. */
+    stepNeedsInPlay: step.needsInPlay === true && activeProposal !== null,
+    activeIsHazard: activeProposal !== null && hazardIds.has(activeProposal.id),
+    /* What was rejected on this hole, still readable after leaving and coming back (R10). */
+    rejectedHere: s.rejections[holeNumber] ?? [],
     features,
     labels,
     mapBounds,
     doneCount: s.holeStatus.filter((x) => x === 'complete').length,
     /* Straight off this hole's own `yardages` map — no ratio, no hole-1 baseline. */
     scorecard: course ? scorecardFor(course, hi) : [],
-    /* Only what the contributor actually drew — nothing is claimed on their behalf. */
+    /* Only what the contributor actually decided — nothing is claimed on their behalf. */
     summary: [
       locateDone
         ? `playing line, ${locateYds} yd over ${points.length} points`
         : 'no playing line drawn yet',
+      ...(s.confirmed.length > 0
+        ? [`${s.confirmed.length} proposal${s.confirmed.length === 1 ? '' : 's'} you confirmed`]
+        : []),
+      ...(s.removed.length > 0
+        ? [`${s.removed.length} you turned down, recorded either way`]
+        : []),
       ...[...addedByLabel].map(([label, count]) => `${count} ${label}${count === 1 ? '' : 's'}`),
       `tee boxes named — ${TEE_IDS.map((id) => s.teeAssign[id].toLowerCase()).join(', ')}`,
     ],
@@ -457,8 +596,12 @@ export function useMapper() {
         screen,
         mode: mode ?? s.mode,
         step: screen === 'review' ? 0 : s.step,
+        proposalIndex: screen === 'review' ? 0 : s.proposalIndex,
         confirmed: screen === 'review' ? [] : s.confirmed,
         removed: screen === 'review' ? [] : s.removed,
+        hazards: screen === 'review' ? [] : s.hazards,
+        /* Not `rejections`: it is course-level on purpose, and clearing it here
+         * would leave only the last hole's rejections in front of the store. */
         extra: screen === 'review' ? [] : s.extra,
         addMode: null,
         locate: screen === 'review' ? EMPTY_LINE : s.locate,
@@ -496,8 +639,12 @@ export function useMapper() {
         /* Measuring starts from the longest set the course lists; the rail moves it. */
         teeSet: session.tees[0]?.color ?? null,
         step: 0,
+        proposalIndex: 0,
         confirmed: [],
         removed: [],
+        hazards: [],
+        /* A different course: its rejections are not this one's. */
+        rejections: {},
         extra: [],
         addMode: null,
         locate: EMPTY_LINE,
@@ -509,55 +656,169 @@ export function useMapper() {
     [patch, dropDetection],
   );
 
+  /**
+   * Persist one decision (R15, KTD10).
+   *
+   * Fire-and-forget, and per decision rather than per hole: a contributor who
+   * walks away mid-hole has still told us something true about every proposal
+   * they answered, and a rejection they made is exactly the record R10 is about.
+   * A store that is unreachable cannot undo a review that already happened in
+   * front of them, so nothing here surfaces or retries — `rejections` is the
+   * in-session copy that keeps the screen honest either way.
+   */
+  const sendDecision = useCallback(
+    (holeNumber: number, proposal: Proposal, outcome: DecisionOutcome, inPlay?: boolean) => {
+      const courseId = state.course?.id;
+      if (!courseId) return;
+      void recordDecisions(courseId, holeNumber, [decisionFor(proposal, outcome, inPlay)]).catch(
+        () => {},
+      );
+    },
+    [state.course],
+  );
+
+  /**
+   * Where the sequence goes once one proposal has been decided: to the next
+   * proposal in this step, or — only when this was the last of them — to the next
+   * step. Deciding a feature must never carry the ones behind it with it (R7).
+   */
+  const afterDecision = useCallback(
+    (s: MapperState, step: Step, count: number, note: string): Partial<MapperState> => {
+      const next = s.proposalIndex + 1;
+      if (next < count) return { proposalIndex: next, lastAction: note };
+      return { step: s.step + 1, proposalIndex: 0, lastAction: note || step.done };
+    },
+    [],
+  );
+
+  /**
+   * Move past this step without deciding anything.
+   *
+   * It confirms nothing — it used to concatenate the step's whole target list,
+   * which is the batch confirmation KTD1 rules out. And it stays put while a
+   * proposal is still on screen awaiting an answer: adding a feature we missed is
+   * not an answer about the one we did propose.
+   */
   const advance = useCallback(
     (note?: string) => {
       patch((s) => {
-        const st = STEPS[s.step];
-        const add = st ? st.targets.filter((t) => !s.removed.includes(t)) : [];
-        return {
-          confirmed: s.confirmed.concat(add),
-          step: s.step + 1,
-          lastAction: note ?? st?.done ?? '',
-        };
+        const step = STEPS[s.step];
+        if (!step) return { lastAction: note ?? '' };
+        const stepProposals = proposalsForStep(s, step);
+        if (stepProposals[s.proposalIndex]) return { lastAction: note ?? '' };
+        return { step: s.step + 1, proposalIndex: 0, lastAction: note ?? step.done };
       });
     },
     [patch],
   );
 
+  /**
+   * One explicit confirmation, about one proposal (R7, KTD1).
+   *
+   * On a step with nothing proposed this is the contributor saying so — it
+   * confirms no geometry, because there is none, and moves the sequence on.
+   */
   const accept = useCallback(() => {
-    setState((s) => {
-      if (isBlocked(s)) return s;
-      const st = STEPS[s.step];
-      const add = st ? st.targets.filter((t) => !s.removed.includes(t)) : [];
-      return {
-        ...s,
-        confirmed: s.confirmed.concat(add),
-        step: s.step + 1,
-        lastAction: st?.done ?? '',
-      };
-    });
-  }, []);
+    if (isBlocked(state)) return;
+    const step = STEPS[state.step];
+    if (!step) return;
+    const stepProposals = proposalsForStep(state, step);
+    const active = stepProposals[state.proposalIndex] ?? null;
 
+    if (active) {
+      sendDecision(openHoleNumber(state), active, 'confirmed', step.needsInPlay ? true : undefined);
+      const remaining = stepProposals.length - (state.proposalIndex + 1);
+      patch((s) => ({
+        confirmed: s.confirmed.concat([active.id]),
+        /* R14: on the in-play step the confirming answer *is* the in-play yes —
+         * the title asks "can a ball find that water?" and the button answers it,
+         * so this is an explicit human answer, not an inference from a confirm.
+         * `answerInPlay(false)` is the other half of the same question. */
+        hazards: step.needsInPlay ? s.hazards.concat([active.id]) : s.hazards,
+        ...afterDecision(
+          s,
+          step,
+          stepProposals.length,
+          remaining > 0 ? `Confirmed. ${remaining} more to check on this hole.` : step.done,
+        ),
+      }));
+      return;
+    }
+
+    patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: step.done }));
+  }, [state, patch, sendDecision, afterDecision]);
+
+  /**
+   * One rejection, about one proposal (R10).
+   *
+   * The proposal leaves the map and is written down — with the kind the model
+   * classified it as and the geometry it drew — both in `rejections` and at the
+   * store. A false alarm nobody recorded is a false alarm the model repeats.
+   */
   const reject = useCallback(() => {
-    setState((s) => {
-      if (isBlocked(s)) return s;
-      const st = currentStep(s);
-      const drop = st.targets[st.targets.length - 1];
-      const removed = drop ? s.removed.concat([drop]) : s.removed;
-      const stepDef = STEPS[s.step];
-      const add = stepDef ? stepDef.targets.filter((t) => !removed.includes(t)) : [];
-      return {
-        ...s,
-        removed,
-        confirmed: s.confirmed.concat(add),
-        step: s.step + 1,
-        lastAction: 'Dropped it — false alarms happen as often as misses.',
-      };
-    });
-  }, []);
+    if (isBlocked(state)) return;
+    const step = STEPS[state.step];
+    if (!step) return;
+    const stepProposals = proposalsForStep(state, step);
+    const active = stepProposals[state.proposalIndex] ?? null;
+
+    if (active) {
+      const holeNumber = openHoleNumber(state);
+      sendDecision(holeNumber, active, 'rejected');
+      patch((s) => ({
+        removed: s.removed.concat([active.id]),
+        rejections: {
+          ...s.rejections,
+          [holeNumber]: (s.rejections[holeNumber] ?? []).concat([active]),
+        },
+        ...afterDecision(
+          s,
+          step,
+          stepProposals.length,
+          'Dropped it, and noted why — a false alarm is worth as much as a miss.',
+        ),
+      }));
+      return;
+    }
+
+    patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: 'Skipped.' }));
+  }, [state, patch, sendDecision, afterDecision]);
+
+  /**
+   * The in-play answer for a proposed water body (R14).
+   *
+   * Both answers confirm the water — it is there either way, and the imagery said
+   * so. Only `true` makes it a hazard. Spectral classification proposes water; it
+   * never decides whether the water counts, and neither does anything else here:
+   * the only two routes into `hazards` are this call and the in-play confirming
+   * button in `accept`, which asks the same question in the same words.
+   */
+  const answerInPlay = useCallback(
+    (inPlay: boolean) => {
+      if (isBlocked(state)) return;
+      const step = STEPS[state.step];
+      if (!step) return;
+      const stepProposals = proposalsForStep(state, step);
+      const active = stepProposals[state.proposalIndex] ?? null;
+      if (!active) return;
+
+      sendDecision(openHoleNumber(state), active, 'confirmed', inPlay);
+      patch((s) => ({
+        confirmed: s.confirmed.concat([active.id]),
+        hazards: inPlay ? s.hazards.concat([active.id]) : s.hazards,
+        ...afterDecision(
+          s,
+          step,
+          stepProposals.length,
+          inPlay ? 'Marked in play.' : 'Kept as water, not as a hazard.',
+        ),
+      }));
+    },
+    [state, patch, sendDecision, afterDecision],
+  );
 
   const missing = useCallback(() => {
-    setState((s) => (isBlocked(s) ? s : { ...s, addMode: missingNoun(currentStep(s).id) }));
+    setState((s) => (isBlocked(s) ? s : { ...s, addMode: currentStep(s).missNoun }));
   }, []);
 
   /**
@@ -629,8 +890,12 @@ export function useMapper() {
               ? 'locate'
               : 'ready',
         step: 0,
+        proposalIndex: 0,
         confirmed: [],
         removed: [],
+        hazards: [],
+        /* `rejections` deliberately survives: it is keyed by hole number and is
+         * what the contributor sees when they come back to this one (R10). */
         extra: [],
         addMode: null,
         locate: EMPTY_LINE,
@@ -687,12 +952,16 @@ export function useMapper() {
             /* Into the review sequence, the same transition `confirmLocate` makes. */
             mode: 'ready',
             step: 0,
+            proposalIndex: 0,
             confirmed: [],
             removed: [],
+            hazards: [],
             extra: [],
+            /* "To check with you", never "found": nothing here is settled until
+             * the contributor has answered about each one (R7). */
             lastAction: `We found ${result.proposals.length} thing${
               result.proposals.length === 1 ? '' : 's'
-            } to check with you.`,
+            } to check with you, one at a time.`,
           });
           return;
         }
@@ -757,6 +1026,8 @@ export function useMapper() {
       openCourse,
       accept,
       reject,
+      /** R14: the in-play answer, the only thing that makes water a hazard. */
+      answerInPlay,
       missing,
       advance,
       onMapClick,
@@ -800,8 +1071,10 @@ export function useMapper() {
         patch({
           mode: 'ready',
           step: 0,
+          proposalIndex: 0,
           confirmed: [],
           removed: [],
+          hazards: [],
           extra: [],
           lastAction: 'Playing line saved. Check anything else you can see on the hole.',
         }),

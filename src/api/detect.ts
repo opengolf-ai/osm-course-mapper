@@ -485,3 +485,152 @@ export async function requestProposals(
       'Detection is still running after its time budget. The hole is still yours to map by hand.',
   };
 }
+
+/* --- Recording what the contributor decided ------------------------------- */
+
+/**
+ * What became of one proposal. Both outcomes are recorded: a rejection is a
+ * record, not a discard (R10) — it is the only signal that says "the model saw
+ * something here and was wrong", which is exactly what later training needs.
+ */
+export type DecisionOutcome = 'confirmed' | 'rejected';
+
+/** Where a decided feature came from, in the vocabulary the store takes (R15). */
+export interface DecisionProvenance {
+  acquired: string | null;
+  gsdMeters: number | null;
+  source: string | null;
+  modelId: string | null;
+  itemId: string | null;
+}
+
+/** One decided feature, ready to persist. */
+export interface Decision {
+  kind: ProposalKind;
+  outcome: DecisionOutcome;
+  geometry: Polygon | MultiPolygon;
+  confidence: number;
+  provenance: DecisionProvenance;
+  /**
+   * R14: whether the contributor said a ball can find it. Only water carries one,
+   * and only an explicit answer sets it — an absent field is not a "no", it is
+   * "nobody was asked".
+   */
+  inPlay?: boolean;
+}
+
+/** Everything one decision needs, built from the proposal it is about. */
+export function decisionFor(
+  proposal: Proposal,
+  outcome: DecisionOutcome,
+  inPlay?: boolean,
+): Decision {
+  const decision: Decision = {
+    kind: proposal.kind,
+    outcome,
+    geometry: proposal.geometry,
+    confidence: proposal.confidence,
+    provenance: {
+      acquired: proposal.acquired,
+      gsdMeters: proposal.gsdMeters,
+      source: proposal.source,
+      modelId: proposal.modelId,
+      itemId: proposal.itemId,
+    },
+  };
+  if (inPlay !== undefined) decision.inPlay = inPlay;
+  return decision;
+}
+
+/** The store's own ceiling on one call. Longer runs are chunked rather than refused. */
+export const MAX_DECISIONS_PER_CALL = 200;
+
+/**
+ * Whether the decisions reached the store.
+ *
+ * Nothing here is fatal to the contributor: the review sequence has already
+ * happened in front of them, and a store that is unreachable must not undo it.
+ * Callers hold their own in-session copy and treat this as best-effort delivery.
+ */
+export type RecordResult =
+  | { status: 'ok'; recorded: number }
+  | { status: 'failed'; reason: DetectFailureReason; message: string; statusCode?: number }
+  | { status: 'aborted' };
+
+/**
+ * Persist what the contributor decided about one hole (R15, KTD10).
+ *
+ * The store holds no contributor, session or device identifier and accepts none,
+ * so nothing identifying is assembled here — the payload is the course, the hole,
+ * and the geometry with its provenance. Adding an identifier "for debugging"
+ * would change what this endpoint is.
+ */
+export async function recordDecisions(
+  courseId: string,
+  holeNumber: number,
+  decisions: Decision[],
+  options: { signal?: AbortSignal } = {},
+): Promise<RecordResult> {
+  const { signal } = options;
+  if (decisions.length === 0) return { status: 'ok', recorded: 0 };
+  if (signal?.aborted) return { status: 'aborted' };
+
+  let recorded = 0;
+  for (let start = 0; start < decisions.length; start += MAX_DECISIONS_PER_CALL) {
+    const batch = decisions.slice(start, start + MAX_DECISIONS_PER_CALL);
+    const envelope = await readEnvelope(
+      `${DETECT_API_BASE}/v1/decisions`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({
+          course_id: courseId,
+          hole_number: holeNumber,
+          decisions: batch.map((decision) => ({
+            kind: decision.kind,
+            outcome: decision.outcome,
+            geometry: decision.geometry,
+            confidence: decision.confidence,
+            ...(decision.inPlay === undefined ? {} : { in_play: decision.inPlay }),
+            provenance: {
+              acquired: decision.provenance.acquired,
+              gsd_meters: decision.provenance.gsdMeters,
+              source: decision.provenance.source,
+              model_id: decision.provenance.modelId,
+              item_id: decision.provenance.itemId,
+            },
+          })),
+        }),
+      },
+      signal,
+    );
+
+    if (!envelope.ok) {
+      const result = envelope.result;
+      if (result.status === 'aborted') return { status: 'aborted' };
+      return result.status === 'failed'
+        ? result.statusCode === undefined
+          ? { status: 'failed', reason: result.reason, message: result.message }
+          : {
+              status: 'failed',
+              reason: result.reason,
+              message: result.message,
+              statusCode: result.statusCode,
+            }
+        : { status: 'failed', reason: 'malformed', message: 'The store answered unreadably.' };
+    }
+
+    /* A 502 `{"status":"upstream"}` is the service running without a store — a
+     * stated failure, not a success with an empty body. */
+    if (envelope.httpStatus < 200 || envelope.httpStatus >= 300 || envelope.body.status === 'upstream') {
+      const failed = interpretFailure(envelope.body, envelope.httpStatus);
+      return failed.status === 'failed'
+        ? failed
+        : { status: 'failed', reason: 'upstream', message: 'The decision store did not accept it.' };
+    }
+
+    recorded += batch.length;
+  }
+
+  return { status: 'ok', recorded };
+}
