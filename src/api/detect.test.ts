@@ -369,6 +369,147 @@ describe('requestProposals', () => {
     if (result.status !== 'ok') return;
     expect(result.proposals.map((p) => p.kind)).toEqual(['green']);
   });
+
+  /**
+   * Geometry that parses but cannot be drawn.
+   *
+   * A degenerate ring is well-formed JSON, so nothing upstream rejects it — and it
+   * is not the client that fails on it, it is `@turf/centroid` inside the review
+   * screen's derived state, during render, where a throw takes the whole page. So
+   * each of these is asserted to be dropped at the parse boundary, with `GREEN` in
+   * the same answer proving one bad feature does not cost the rest.
+   */
+  describe('geometry the map cannot draw', () => {
+    /** One detection answer carrying GREEN plus a feature with the given geometry. */
+    async function kindsAlongsideGreen(geometry: unknown): Promise<string[]> {
+      fetchMock.mockResolvedValueOnce(submitAccepted()).mockResolvedValueOnce(
+        jsonResponse({
+          job_id: '77d2',
+          status: 'ok',
+          features: {
+            type: 'FeatureCollection',
+            features: [GREEN, { type: 'Feature', geometry, properties: { kind: 'bunker' } }],
+          },
+          imagery: null,
+          missing_tee_sets: [],
+        }),
+      );
+
+      const result = await requestProposals(REQUEST, { wait: immediately });
+      if (result.status !== 'ok') throw new Error(`expected ok, got ${result.status}`);
+      return result.proposals.map((p) => p.kind);
+    }
+
+    const RING = [
+      [-122.9958, 36.1441],
+      [-122.9955, 36.1441],
+      [-122.9955, 36.1444],
+      [-122.9958, 36.1441],
+    ];
+
+    const degenerate: Array<[string, unknown]> = [
+      ['an empty ring', { type: 'Polygon', coordinates: [[]] }],
+      [
+        'a ring of fewer than three positions',
+        {
+          type: 'Polygon',
+          coordinates: [
+            [
+              [-122.9958, 36.1441],
+              [-122.9955, 36.1444],
+            ],
+          ],
+        },
+      ],
+      [
+        'a position that is not a pair',
+        { type: 'Polygon', coordinates: [[[-122.9958, 36.1441], [-122.9955], [-122.9955, 36.1444]]] },
+      ],
+      [
+        'a position that is not an array at all',
+        { type: 'Polygon', coordinates: [[[-122.9958, 36.1441], -122.9955, [-122.9955, 36.1444]]] },
+      ],
+      [
+        'a NaN coordinate',
+        {
+          type: 'Polygon',
+          coordinates: [[[-122.9958, 36.1441], [Number.NaN, 36.1441], [-122.9955, 36.1444]]],
+        },
+      ],
+      [
+        'a null coordinate',
+        {
+          type: 'Polygon',
+          coordinates: [[[-122.9958, 36.1441], [-122.9955, null], [-122.9955, 36.1444]]],
+        },
+      ],
+      [
+        'a coordinate sent as a string',
+        {
+          type: 'Polygon',
+          coordinates: [[[-122.9958, 36.1441], ['-122.9955', '36.1441'], [-122.9955, 36.1444]]],
+        },
+      ],
+      /* Polygon-depth coordinates under a MultiPolygon type: one level too shallow,
+       * which the old length check waved through because the outer array was full. */
+      ['a MultiPolygon nested one level too shallow', { type: 'MultiPolygon', coordinates: [RING] }],
+      ['a MultiPolygon with a degenerate member', { type: 'MultiPolygon', coordinates: [[RING], [[]]] }],
+      ['no rings at all', { type: 'Polygon', coordinates: [] }],
+    ];
+
+    it.each(degenerate)('drops a proposal with %s, keeping the rest of the answer', async (_label, geometry) => {
+      expect(await kindsAlongsideGreen(geometry)).toEqual(['green']);
+    });
+
+    it('still accepts a polygon with an interior ring', async () => {
+      const withHole = {
+        type: 'Polygon',
+        coordinates: [
+          RING,
+          [
+            [-122.99575, 36.14415],
+            [-122.99565, 36.14415],
+            [-122.99565, 36.14425],
+            [-122.99575, 36.14415],
+          ],
+        ],
+      };
+
+      expect(await kindsAlongsideGreen(withHole)).toEqual(['green', 'bunker']);
+    });
+
+    it('still accepts a well-formed MultiPolygon', async () => {
+      expect(await kindsAlongsideGreen({ type: 'MultiPolygon', coordinates: [[RING]] })).toEqual([
+        'green',
+        'bunker',
+      ]);
+    });
+
+    it('keeps the geometry it accepted intact, rings and all', async () => {
+      const withAltitude = {
+        type: 'Polygon',
+        coordinates: [RING.map(([lng, lat]) => [lng, lat, 0])],
+      };
+      fetchMock.mockResolvedValueOnce(submitAccepted()).mockResolvedValueOnce(
+        jsonResponse({
+          job_id: '77d2',
+          status: 'ok',
+          features: {
+            type: 'FeatureCollection',
+            features: [{ type: 'Feature', geometry: withAltitude, properties: { kind: 'bunker' } }],
+          },
+          imagery: null,
+          missing_tee_sets: [],
+        }),
+      );
+
+      const result = await requestProposals(REQUEST, { wait: immediately });
+
+      expect(result.status).toBe('ok');
+      if (result.status !== 'ok') return;
+      expect(result.proposals[0].geometry).toEqual(withAltitude);
+    });
+  });
 });
 
 /**

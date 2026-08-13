@@ -14,7 +14,33 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Polygon } from 'geojson';
 import { labelPoint, lineYards, yardsBetween, type LngLat } from '../geo/coords';
 import type { CourseDetail } from '../api/types';
-import type { Proposal, ProposalKind } from '../api/detect';
+import type { DetectResult, Proposal, ProposalKind } from '../api/detect';
+
+/**
+ * Detection is stubbed at the client boundary, with every request left hanging
+ * until a test resolves it by hand. That is the only way to say *when* an answer
+ * lands, and "after the contributor gave up on it" is the case that matters.
+ *
+ * `recordDecisions` stays real: what it posts is asserted below against a
+ * stubbed `fetch`.
+ */
+const detection = vi.hoisted(() => {
+  const pending: Array<(result: DetectResult) => void> = [];
+  return {
+    pending,
+    request: vi.fn(
+      () =>
+        new Promise<DetectResult>((resolve) => {
+          pending.push(resolve);
+        }),
+    ),
+  };
+});
+vi.mock('../api/detect', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api/detect')>();
+  return { ...actual, requestProposals: detection.request };
+});
+
 import { STEPS } from '../data/course';
 import { buildCourseSession } from './courseSession';
 import {
@@ -535,6 +561,66 @@ describe('reviewing proposals one at a time', () => {
     expect(result.current.state.confirmed).toEqual(['p-bunker-1']);
   });
 
+  it('confirms nothing while the A key auto-repeats under a held finger', () => {
+    const { result } = openedWith([
+      proposal('p-bunker-1', 'bunker'),
+      proposal('p-bunker-2', 'bunker'),
+      proposal('p-bunker-3', 'bunker'),
+    ]);
+    goToStep(result.current.actions, 'bunkers');
+
+    /* What the OS sends while `a` is held down. Without the repeat guard this
+     * walks the whole step through to confirmed and posts every one of them. */
+    act(() => {
+      for (let repeat = 0; repeat < 6; repeat += 1) {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', repeat: true }));
+      }
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'n', repeat: true }));
+    });
+
+    expect(result.current.state.confirmed).toEqual([]);
+    expect(result.current.state.removed).toEqual([]);
+    expect(result.current.state.proposalIndex).toBe(0);
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-1');
+    /* Nothing reached the decision store either — a held key is not a decision. */
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+
+    /* A deliberate press, on the same key, still answers about the one feature. */
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'a' }));
+    });
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1']);
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-2');
+  });
+
+  it('drops an answer bound to a proposal that is no longer the one being asked about', () => {
+    const { result } = openedWith([
+      proposal('p-bunker-1', 'bunker'),
+      proposal('p-bunker-2', 'bunker'),
+    ]);
+    goToStep(result.current.actions, 'bunkers');
+
+    act(() => result.current.actions.accept('p-bunker-1'));
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1']);
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-2');
+
+    /* A second answer still carrying the first id — a queued or repeated event —
+     * must not be spent on the feature that happens to be next. */
+    act(() => result.current.actions.accept('p-bunker-1'));
+    act(() => result.current.actions.reject('p-bunker-1'));
+    act(() => result.current.actions.answerInPlay(true, 'p-bunker-1'));
+
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1']);
+    expect(result.current.state.removed).toEqual([]);
+    expect(result.current.state.hazards).toEqual([]);
+    expect(result.current.state.proposalIndex).toBe(1);
+    expect(result.current.derived.activeProposal?.id).toBe('p-bunker-2');
+
+    /* Bound to the feature actually on screen, the same call goes through. */
+    act(() => result.current.actions.accept('p-bunker-2'));
+    expect(result.current.state.confirmed).toEqual(['p-bunker-1', 'p-bunker-2']);
+  });
+
   it('never carries an undecided proposal past on the back of an added feature (R7)', () => {
     const { result } = openedWith([
       proposal('p-bunker-1', 'bunker'),
@@ -572,6 +658,102 @@ describe('reviewing proposals one at a time', () => {
     expect(body.decisions[0].provenance.item_id).toBe('ca_m_3812_2023');
     /* The store holds no contributor, session or device identifier — and is sent none. */
     expect(JSON.stringify(body)).not.toMatch(/user|session|device|contributor/i);
+  });
+});
+
+/**
+ * A detection answer is only ever about the hole the contributor is still on.
+ *
+ * The success handler resets `confirmed`, `removed`, `hazards`, `extra`, `step`
+ * and `proposalIndex` — which is right when the answer is the one being waited
+ * for, and is the deletion of somebody's work when it is not. Every path out of
+ * the wait has to drop the request behind it.
+ */
+describe('a detection answer that lands after the contributor moved on', () => {
+  /** On hole 1, with a finished line and a request left hanging. */
+  function waitingOnDetection() {
+    const hook = renderHook(() => useMapper());
+    const { result } = hook;
+    act(() => result.current.actions.openCourse(SESSION, { status: 'absent' }));
+    act(() => result.current.actions.openHole(0));
+    act(() => result.current.actions.onMapClick(PEBBLE_TEE));
+    act(() => result.current.actions.onMapClick(PEBBLE_GREEN));
+    act(() => result.current.actions.finishLine());
+    act(() => result.current.actions.requestProposals());
+
+    expect(result.current.state.detect.status).toBe('working');
+    expect(detection.pending).toHaveLength(1);
+    return hook;
+  }
+
+  /** The answer nobody is waiting for any more, delivered late. */
+  async function landsLate() {
+    await act(async () => {
+      detection.pending[0]({
+        status: 'ok',
+        jobId: 'job-late',
+        proposals: [],
+        imagery: null,
+        missingTeeSets: [],
+      });
+    });
+  }
+
+  beforeEach(() => {
+    detection.pending.length = 0;
+    detection.request.mockClear();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ status: 'ok' }) })),
+    );
+  });
+
+  it('cannot delete the hole a contributor mapped by hand after saving the line (R12)', async () => {
+    const { result } = waitingOnDetection();
+
+    /* Not worth waiting for: save the line and map the hole by hand instead. */
+    act(() => result.current.actions.confirmLocate());
+    expect(result.current.state.mode).toBe('ready');
+    /* Nothing is being waited for, so nothing says it is. */
+    expect(result.current.state.detect.status).toBe('idle');
+
+    act(() => result.current.actions.patch({ addMode: 'water' }));
+    act(() => result.current.actions.onMapClick(PEBBLE_TURN));
+    act(() =>
+      result.current.actions.patch({
+        confirmed: ['by-hand-green'],
+        removed: ['by-hand-bunker'],
+        hazards: ['by-hand-green'],
+        step: 2,
+        proposalIndex: 0,
+      }),
+    );
+
+    await landsLate();
+
+    expect(result.current.state.confirmed).toEqual(['by-hand-green']);
+    expect(result.current.state.removed).toEqual(['by-hand-bunker']);
+    expect(result.current.state.hazards).toEqual(['by-hand-green']);
+    expect(result.current.state.extra).toHaveLength(1);
+    expect(result.current.state.step).toBe(2);
+    /* And the late answer is not adopted at all, not even as an idle result. */
+    expect(result.current.state.detect.status).toBe('idle');
+  });
+
+  it('cannot reopen a hole that has already been uploaded', async () => {
+    const { result } = waitingOnDetection();
+
+    act(() => result.current.actions.patch({ mode: 'ready', confirmed: ['by-hand-green'] }));
+    act(() => result.current.actions.upload());
+    expect(result.current.state.screen).toBe('complete');
+    expect(result.current.state.detect.status).toBe('idle');
+
+    await landsLate();
+
+    expect(result.current.state.screen).toBe('complete');
+    expect(result.current.state.holeStatus[0]).toBe('complete');
+    expect(result.current.state.confirmed).toEqual(['by-hand-green']);
+    expect(result.current.state.detect.status).toBe('idle');
   });
 });
 

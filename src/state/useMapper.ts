@@ -363,6 +363,40 @@ export function proposalsForStep(s: MapperState, step: Step): Proposal[] {
 }
 
 /**
+ * The one proposal the sequence is asking about right now, or nothing — a step
+ * detection said nothing about, or the end of the sequence.
+ *
+ * The same lookup the three answers make, so an answer bound to an id is bound
+ * to the id those answers will check it against.
+ */
+function activeProposalId(s: MapperState): string | undefined {
+  const step = STEPS[s.step];
+  if (!step) return undefined;
+  return proposalsForStep(s, step)[s.proposalIndex]?.id;
+}
+
+/**
+ * Whether an answer that was bound to a proposal is still about the proposal on
+ * screen (R7, KTD1).
+ *
+ * An answer is about one feature, and the thing that rendered it knew which one.
+ * Passing that id back makes the binding real: a queued or repeated event that
+ * arrives once the sequence has moved on answers for nothing rather than for
+ * whatever feature happens to be next.
+ *
+ * A caller that omits the id answers about whatever is active, exactly as before
+ * — and a non-string counts as omitted on purpose, which is also why the
+ * parameter is `unknown` rather than `string`. React hands a click handler its
+ * mouse event, so `onClick={actions.accept}` in the rail calls the answer with a
+ * `SyntheticEvent`; that is the plain unbound case, and reading it as an id would
+ * silently deaden every button on the screen.
+ */
+function answersFor(active: Proposal | null, forProposal?: unknown): boolean {
+  if (typeof forProposal !== 'string') return true;
+  return active !== null && active.id === forProposal;
+}
+
+/**
  * Everything the review screen draws, derived from state alone.
  * Pure and exported so screens can be rendered without driving the hook.
  */
@@ -717,36 +751,48 @@ export function useMapper() {
    *
    * On a step with nothing proposed this is the contributor saying so — it
    * confirms no geometry, because there is none, and moves the sequence on.
+   *
+   * `forProposal` is the id this answer was rendered for, when the caller knows
+   * it: see `answersFor`.
    */
-  const accept = useCallback(() => {
-    if (isBlocked(state)) return;
-    const step = STEPS[state.step];
-    if (!step) return;
-    const stepProposals = proposalsForStep(state, step);
-    const active = stepProposals[state.proposalIndex] ?? null;
+  const accept = useCallback(
+    (forProposal?: unknown) => {
+      if (isBlocked(state)) return;
+      const step = STEPS[state.step];
+      if (!step) return;
+      const stepProposals = proposalsForStep(state, step);
+      const active = stepProposals[state.proposalIndex] ?? null;
+      if (!answersFor(active, forProposal)) return;
 
-    if (active) {
-      sendDecision(openHoleNumber(state), active, 'confirmed', step.needsInPlay ? true : undefined);
-      const remaining = stepProposals.length - (state.proposalIndex + 1);
-      patch((s) => ({
-        confirmed: s.confirmed.concat([active.id]),
-        /* R14: on the in-play step the confirming answer *is* the in-play yes —
-         * the title asks "can a ball find that water?" and the button answers it,
-         * so this is an explicit human answer, not an inference from a confirm.
-         * `answerInPlay(false)` is the other half of the same question. */
-        hazards: step.needsInPlay ? s.hazards.concat([active.id]) : s.hazards,
-        ...afterDecision(
-          s,
-          step,
-          stepProposals.length,
-          remaining > 0 ? `Confirmed. ${remaining} more to check on this hole.` : step.done,
-        ),
-      }));
-      return;
-    }
+      if (active) {
+        sendDecision(
+          openHoleNumber(state),
+          active,
+          'confirmed',
+          step.needsInPlay ? true : undefined,
+        );
+        const remaining = stepProposals.length - (state.proposalIndex + 1);
+        patch((s) => ({
+          confirmed: s.confirmed.concat([active.id]),
+          /* R14: on the in-play step the confirming answer *is* the in-play yes —
+           * the title asks "can a ball find that water?" and the button answers it,
+           * so this is an explicit human answer, not an inference from a confirm.
+           * `answerInPlay(false)` is the other half of the same question. */
+          hazards: step.needsInPlay ? s.hazards.concat([active.id]) : s.hazards,
+          ...afterDecision(
+            s,
+            step,
+            stepProposals.length,
+            remaining > 0 ? `Confirmed. ${remaining} more to check on this hole.` : step.done,
+          ),
+        }));
+        return;
+      }
 
-    patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: step.done }));
-  }, [state, patch, sendDecision, afterDecision]);
+      patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: step.done }));
+    },
+    [state, patch, sendDecision, afterDecision],
+  );
 
   /**
    * One rejection, about one proposal (R10).
@@ -754,35 +800,41 @@ export function useMapper() {
    * The proposal leaves the map and is written down — with the kind the model
    * classified it as and the geometry it drew — both in `rejections` and at the
    * store. A false alarm nobody recorded is a false alarm the model repeats.
+   *
+   * Takes the same optional `forProposal` binding `accept` does.
    */
-  const reject = useCallback(() => {
-    if (isBlocked(state)) return;
-    const step = STEPS[state.step];
-    if (!step) return;
-    const stepProposals = proposalsForStep(state, step);
-    const active = stepProposals[state.proposalIndex] ?? null;
+  const reject = useCallback(
+    (forProposal?: unknown) => {
+      if (isBlocked(state)) return;
+      const step = STEPS[state.step];
+      if (!step) return;
+      const stepProposals = proposalsForStep(state, step);
+      const active = stepProposals[state.proposalIndex] ?? null;
+      if (!answersFor(active, forProposal)) return;
 
-    if (active) {
-      const holeNumber = openHoleNumber(state);
-      sendDecision(holeNumber, active, 'rejected');
-      patch((s) => ({
-        removed: s.removed.concat([active.id]),
-        rejections: {
-          ...s.rejections,
-          [holeNumber]: (s.rejections[holeNumber] ?? []).concat([active]),
-        },
-        ...afterDecision(
-          s,
-          step,
-          stepProposals.length,
-          'Dropped it, and noted why — a false alarm is worth as much as a miss.',
-        ),
-      }));
-      return;
-    }
+      if (active) {
+        const holeNumber = openHoleNumber(state);
+        sendDecision(holeNumber, active, 'rejected');
+        patch((s) => ({
+          removed: s.removed.concat([active.id]),
+          rejections: {
+            ...s.rejections,
+            [holeNumber]: (s.rejections[holeNumber] ?? []).concat([active]),
+          },
+          ...afterDecision(
+            s,
+            step,
+            stepProposals.length,
+            'Dropped it, and noted why — a false alarm is worth as much as a miss.',
+          ),
+        }));
+        return;
+      }
 
-    patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: 'Skipped.' }));
-  }, [state, patch, sendDecision, afterDecision]);
+      patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: 'Skipped.' }));
+    },
+    [state, patch, sendDecision, afterDecision],
+  );
 
   /**
    * The in-play answer for a proposed water body (R14).
@@ -794,13 +846,14 @@ export function useMapper() {
    * button in `accept`, which asks the same question in the same words.
    */
   const answerInPlay = useCallback(
-    (inPlay: boolean) => {
+    (inPlay: boolean, forProposal?: unknown) => {
       if (isBlocked(state)) return;
       const step = STEPS[state.step];
       if (!step) return;
       const stepProposals = proposalsForStep(state, step);
       const active = stepProposals[state.proposalIndex] ?? null;
       if (!active) return;
+      if (!answersFor(active, forProposal)) return;
 
       sendDecision(openHoleNumber(state), active, 'confirmed', inPlay);
       patch((s) => ({
@@ -865,13 +918,23 @@ export function useMapper() {
     [state.mode, state.addMode, patch, advance],
   );
 
+  /**
+   * The hole is done and off the board.
+   *
+   * `dropDetection()` for the same reason `go` and `openHole` do it: a request
+   * still in flight would land on a hole nobody is reviewing any more and reset
+   * the very lists the summary is counting. The detection state goes with it —
+   * the review screen is unmounted here, and the only way back into a hole is
+   * `openHole`, which asks again from scratch.
+   */
   const upload = useCallback(() => {
+    dropDetection();
     patch((s) => {
       const holeStatus = s.holeStatus.slice();
       holeStatus[s.holeIndex] = 'complete';
-      return { holeStatus, screen: 'complete' };
+      return { holeStatus, screen: 'complete', detect: NO_DETECTION };
     });
-  }, [patch]);
+  }, [patch, dropDetection]);
 
   const openHole = useCallback(
     (i: number) => {
@@ -991,6 +1054,13 @@ export function useMapper() {
   }, [patch, dropDetection]);
 
   /*
+   * The feature the keys are answering about, read where the listener is bound
+   * rather than inside it: what the contributor saw when they pressed the key is
+   * what their answer is about, and `answersFor` drops the answer if the sequence
+   * has moved on since.
+   */
+  const keyedProposal = activeProposalId(state);
+  /*
    * A / N / M drive the three review answers without reaching for the mouse — but
    * only when the map is not waiting for a click. In click-to-place the
    * contributor's attention is on the imagery, and a stray key that advanced the
@@ -998,15 +1068,24 @@ export function useMapper() {
    */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      /*
+       * An OS auto-repeat is one act, not twenty. Holding `a` down fires
+       * `keydown` continuously, and without this every repeat would confirm the
+       * next proposal and post it to the decision store — walking the whole hole
+       * through to confirmed while the contributor's finger rests on a key.
+       * Nothing about a held key is an explicit per-feature decision (KTD1), and
+       * the absence of this line is invisible in a test that presses once.
+       */
+      if (e.repeat) return;
       if (state.screen !== 'review' || state.addMode || state.mode === 'locate') return;
       const k = e.key.toLowerCase();
-      if (k === 'a') accept();
-      else if (k === 'n') reject();
+      if (k === 'a') accept(keyedProposal);
+      else if (k === 'n') reject(keyedProposal);
       else if (k === 'm') missing();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [state.screen, state.addMode, state.mode, accept, reject, missing]);
+  }, [state.screen, state.addMode, state.mode, keyedProposal, accept, reject, missing]);
 
   useEffect(() => {
     return () => {
@@ -1067,7 +1146,20 @@ export function useMapper() {
                 lastAction: 'That is the line — here is how it measures.',
               },
         ),
-      confirmLocate: () =>
+      /**
+       * Save the line and carry on by hand, without waiting for detection.
+       *
+       * The drop is the whole point of the call order here. A contributor who
+       * gives up on a slow request and starts mapping the hole themselves would
+       * otherwise have that work deleted the moment the late result landed: the
+       * success handler resets `confirmed`, `removed`, `hazards`, `extra`,
+       * `step` and `proposalIndex`. Worse, the spinner and its cancel button
+       * live in the locate panel this leaves behind, so nothing on screen would
+       * even tell them a request was still out. `go`, `openHole` and
+       * `resetLocate` all drop it; this and `upload` were the two that did not.
+       */
+      confirmLocate: () => {
+        dropDetection();
         patch({
           mode: 'ready',
           step: 0,
@@ -1076,8 +1168,13 @@ export function useMapper() {
           removed: [],
           hazards: [],
           extra: [],
+          /* Nothing asked for any more, so nothing stale left to render: this is
+           * only ever reached from the locate panel, and a `ready` answer would
+           * have moved the hole out of it. */
+          detect: NO_DETECTION,
           lastAction: 'Playing line saved. Check anything else you can see on the hole.',
-        }),
+        });
+      },
       resolveAttention: (lastAction: string) => patch({ attentionResolved: true, lastAction }),
       nudge: () =>
         patch({

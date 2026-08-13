@@ -576,6 +576,13 @@ class DecisionBody(BaseModel):
     exporter cannot join against. `geometry` stays a raw mapping — the store
     validates that it is an area with coordinates, and duplicating that here
     would put the same rule in two places.
+
+    `in_play` is the one field here that no model produced. R14 has a proposed
+    water body become a hazard only when a contributor says a ball can find it,
+    and this model forbids extras, so omitting the field would make that answer
+    a 422 the client swallows — the answer would appear to save and never exist.
+    Optional rather than required because the question is only ever put for
+    water: absent means never asked, which is not the same as answered "no".
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -585,6 +592,7 @@ class DecisionBody(BaseModel):
     geometry: dict[str, Any]
     confidence: float = Field(ge=0.0, le=1.0)
     provenance: ProvenanceBody
+    in_play: bool | None = None
 
     def to_input(self) -> DecisionInput:
         return DecisionInput(
@@ -593,6 +601,7 @@ class DecisionBody(BaseModel):
             geometry=self.geometry,
             confidence=self.confidence,
             provenance=self.provenance.to_provenance(),
+            in_play=self.in_play,
         )
 
 
@@ -970,7 +979,10 @@ def _recorded(decision: Any) -> dict[str, Any]:
 
     `provenance` is nested rather than flattened, matching the shape the client
     sent and the shape `ProvenanceBody` reads — a round trip a client can make
-    without a translation table in the middle.
+    without a translation table in the middle. `in_play` is echoed for the same
+    reason and keeps its `null`: a client rebuilding a hole's hazards from this
+    read has to be able to tell "no water question was asked" from "asked, and
+    the answer was no".
     """
     return {
         "id": decision.id,
@@ -982,6 +994,7 @@ def _recorded(decision: Any) -> dict[str, Any]:
         "geometry": decision.geometry,
         "confidence": decision.confidence,
         "provenance": decision.provenance.as_properties(),
+        "in_play": decision.in_play,
         "recorded_at": decision.recorded_at.isoformat(),
     }
 

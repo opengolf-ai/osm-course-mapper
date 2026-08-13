@@ -733,6 +733,63 @@ def test_confirmations_and_rejections_both_persist_through_the_decision_store(
     assert len(listed.json()["decisions"]) == 2
 
 
+def test_the_water_in_play_answer_is_accepted_and_read_back(session_factory, engine) -> None:
+    """R14. The field the client sends must be a field this endpoint accepts.
+
+    `DecisionBody` forbids extras, so an undeclared `in_play` makes the whole
+    batch a 422 — and the client's send path swallows the failure, so a
+    contributor would see "Marked in play." while nothing was stored. This posts
+    the payload the client actually builds, then reads the row back out of the
+    database rather than trusting the response, because a 200 that recorded the
+    decision without its in-play answer is the same bug one layer down.
+
+    The green in the same batch carries no answer and must come back `null`, not
+    `false`: nobody asked whether a ball can find a green.
+    """
+    client = _client(_pipeline(FakeFetch(None), None), session_factory=session_factory)
+
+    response = client.post(
+        "/v1/decisions",
+        json={
+            "course_id": COURSE_ID,
+            "hole_number": HOLE_NUMBER,
+            "decisions": [
+                {
+                    "kind": "water",
+                    "outcome": "confirmed",
+                    "geometry": _geometry(),
+                    "confidence": 0.72,
+                    "in_play": True,
+                    "provenance": _provenance(),
+                },
+                {
+                    "kind": "green",
+                    "outcome": "confirmed",
+                    "geometry": _geometry(0.01),
+                    "confidence": 0.9,
+                    "provenance": _provenance(),
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    echoed = {d["kind"]: d["in_play"] for d in response.json()["recorded"]}
+    assert echoed == {"water": True, "green": None}
+
+    with Session(engine) as session:
+        read = store.decisions_for_hole(session, HOLE)
+    assert isinstance(read, Ok), read
+    assert {d.kind.value: d.in_play for d in read.value} == {"water": True, "green": None}
+
+    listed = client.get(f"/v1/decisions/{COURSE_ID}", params={"hole": HOLE_NUMBER})
+    assert listed.status_code == 200, listed.text
+    assert {d["kind"]: d["in_play"] for d in listed.json()["decisions"]} == {
+        "water": True,
+        "green": None,
+    }
+
+
 def test_a_malformed_decision_is_a_typed_validation_error(session_factory) -> None:
     """R15. The store's own guards, surfaced rather than leaked as a 500."""
     client = _client(_pipeline(FakeFetch(None), None), session_factory=session_factory)

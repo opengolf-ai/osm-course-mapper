@@ -77,6 +77,7 @@ def _decision(
     offset: float = 0.0,
     confidence: float = 0.86,
     acquired: dt.date = dt.date(2023, 7, 4),
+    in_play: bool | None = None,
 ) -> store.DecisionInput:
     return store.DecisionInput(
         kind=kind,
@@ -84,6 +85,7 @@ def _decision(
         geometry=_square(offset),
         confidence=confidence,
         provenance=_provenance(acquired),
+        in_play=in_play,
     )
 
 
@@ -163,6 +165,59 @@ def test_reads_are_scoped_to_one_hole_and_widen_to_the_whole_course(session) -> 
     assert isinstance(whole_course, Ok), whole_course
     assert sorted(d.hole_number for d in whole_course.value) == [7, 8]
     assert all(d.course_id == HOLE.course_id for d in whole_course.value)
+
+
+# --------------------------------------------------------------------------- #
+# The in-play answer
+# --------------------------------------------------------------------------- #
+
+
+def test_the_in_play_answer_for_water_survives_the_round_trip(session) -> None:
+    """R14. The one answer in this table that no model could have produced.
+
+    Spectral classification proposes water; only a contributor says whether a
+    ball can find it, and that judgement is what turns the water into a hazard.
+    A store that accepted the answer and dropped it would leave the client
+    reporting "Marked in play." over nothing, which is the failure R15 exists to
+    prevent — so it is asserted through a write and a separate read rather than
+    off the value handed back by `record_decisions`.
+    """
+    written = store.record_decisions(
+        session,
+        HOLE,
+        [_decision(FeatureKind.WATER, DecisionOutcome.CONFIRMED, in_play=True)],
+    )
+    assert isinstance(written, Ok), written
+    assert written.value[0].in_play is True
+
+    read = store.decisions_for_hole(session, HOLE)
+    assert isinstance(read, Ok), read
+    assert [d.in_play for d in read.value] == [True]
+
+
+def test_asked_and_answered_no_is_not_the_same_record_as_never_asked(session) -> None:
+    """`False` and `None` are two different things and the column keeps both.
+
+    "The contributor looked at this water and said a ball cannot find it" is a
+    judgement; "this is a green, so nobody was ever asked" is the absence of
+    one. Storing the second as `False` would put a judgement into the training
+    set that nobody made, which is the same mistake as inventing a `skipped`
+    outcome — so a non-water decision reads back as `None`, not as `False`.
+    """
+    store.record_decisions(
+        session,
+        HOLE,
+        [
+            _decision(FeatureKind.WATER, DecisionOutcome.CONFIRMED, in_play=False),
+            _decision(FeatureKind.GREEN, DecisionOutcome.CONFIRMED, offset=0.01),
+        ],
+    )
+
+    read = store.decisions_for_hole(session, HOLE)
+    assert isinstance(read, Ok), read
+    by_kind = {d.kind: d for d in read.value}
+    assert by_kind[FeatureKind.WATER].in_play is False
+    assert by_kind[FeatureKind.GREEN].in_play is None
 
 
 # --------------------------------------------------------------------------- #
@@ -317,6 +372,15 @@ def test_no_contributor_or_session_identifier_is_stored() -> None:
     one hole's review pass — which a training run needs, to tell a re-review from
     the original — and cannot link two passes to the same person. The input
     dataclass has no field for it, so a client cannot supply a stable one.
+
+    The decision is asserted twice over, and the second assertion is the one that
+    matters. The frozen set alone fails on *any* new column, which means a
+    genuine feature column — `in_play` was the first — gets edited into the
+    expected set, and an identity column could be edited in beside it by the same
+    reflex. So the identity-shaped names are also named explicitly: a
+    `contributor_id`, `session_id`, `user_email` or `device_id` fails the second
+    assertion no matter what the first one has been updated to say. A judgement
+    the contributor made is fine; a fact about the contributor is not.
     """
     columns = set(models.FeatureDecision.__table__.columns.keys())
     assert columns == {
@@ -326,6 +390,9 @@ def test_no_contributor_or_session_identifier_is_stored() -> None:
         "hole_number",
         "kind",
         "outcome",
+        # R14's in-play answer: a judgement about the water, not about who made
+        # it. It does not weaken the identity assertion below.
+        "in_play",
         "geometry",
         "confidence",
         "imagery_acquired",
@@ -337,11 +404,33 @@ def test_no_contributor_or_session_identifier_is_stored() -> None:
     }, "the decision record's field set is a deliberate privacy decision; see models.py"
 
     supplied = {field.name for field in dataclasses.fields(store.DecisionInput)}
-    assert supplied == {"kind", "outcome", "geometry", "confidence", "provenance"}
+    assert supplied == {"kind", "outcome", "geometry", "confidence", "provenance", "in_play"}
     assert {field.name for field in dataclasses.fields(store.HoleRef)} == {
         "course_id",
         "hole_number",
     }
+
+    # The teeth that survive someone updating the sets above: nothing a person is
+    # identified by may appear anywhere on this path — not in the table, not in
+    # what a caller may supply, not in what comes back out.
+    named = (
+        columns
+        | supplied
+        | {field.name for field in dataclasses.fields(store.HoleRef)}
+        | {field.name for field in dataclasses.fields(store.RecordedDecision)}
+    )
+    identity_shaped = sorted(
+        name
+        for name in named
+        if any(
+            word in name.lower()
+            for word in ("user", "contributor", "session", "ip", "email", "account", "device")
+        )
+    )
+    assert identity_shaped == [], (
+        f"{identity_shaped} names an identity the decision store deliberately does not hold; "
+        "see the privacy note in models.py before adding it"
+    )
 
 
 def test_each_write_call_mints_its_own_batch(session) -> None:

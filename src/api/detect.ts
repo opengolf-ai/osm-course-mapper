@@ -287,11 +287,60 @@ function toTeeSet(raw: unknown): TeeSetRef | null {
   return { name, yards, key };
 }
 
+/**
+ * One `[lng, lat]`, with an optional altitude GeoJSON allows and we ignore.
+ *
+ * A mask that vectorised badly can carry a `null` where a coordinate should be,
+ * or — from a service serialising floats — a `NaN` that arrives as a string or as
+ * a bare token some parsers accept. None of those are a position; all of them
+ * reach the map as a point that cannot be projected.
+ */
+function isPosition(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length >= 2 &&
+    Number.isFinite(value[0]) &&
+    Number.isFinite(value[1])
+  );
+}
+
+/** A ring with enough readable positions to bound an area. */
+function isRing(value: unknown): boolean {
+  return Array.isArray(value) && value.length >= 3 && value.every(isPosition);
+}
+
+/** A Polygon's coordinates: an outer ring, then any interior rings. */
+function isPolygonCoordinates(value: unknown): boolean {
+  return Array.isArray(value) && value.length > 0 && value.every(isRing);
+}
+
+/**
+ * One geometry, or null when it is not one this client can draw.
+ *
+ * The ring depth is checked all the way down, not just at the top: an empty ring
+ * or a two-position one is a well-formed JSON array that satisfies "coordinates
+ * is a non-empty array", and it survives all the way to `@turf/centroid` — which
+ * runs inside the review screen's derived-state memo, during render. A throw
+ * there is not a dropped feature, it is a blank page and a lost hole, since
+ * nothing in `src/` catches it. So a degenerate ring is refused here, where the
+ * cost of one malformed feature is that one feature, the same choice `toProposal`
+ * already makes for an unreadable kind.
+ */
 function toGeometry(raw: unknown): Polygon | MultiPolygon | null {
   const record = asRecord(raw);
-  if (record.type !== 'Polygon' && record.type !== 'MultiPolygon') return null;
-  if (!Array.isArray(record.coordinates) || record.coordinates.length === 0) return null;
-  return record as unknown as Polygon | MultiPolygon;
+  const coordinates = record.coordinates;
+
+  if (record.type === 'Polygon') {
+    return isPolygonCoordinates(coordinates) ? (record as unknown as Polygon) : null;
+  }
+  if (record.type === 'MultiPolygon') {
+    const ok =
+      Array.isArray(coordinates) &&
+      coordinates.length > 0 &&
+      coordinates.every(isPolygonCoordinates);
+    return ok ? (record as unknown as MultiPolygon) : null;
+  }
+  return null;
 }
 
 /**

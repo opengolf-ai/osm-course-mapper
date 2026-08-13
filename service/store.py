@@ -8,10 +8,12 @@ rather than a general-purpose data-access layer.
 **Shapes in, shapes out.** `DecisionInput` is what the endpoint assembles from a
 proposal the contributor answered: it holds exactly the proposal's own fields
 (`kind`, `geometry`, `confidence`, `provenance`, all straight off
-`vectorize.ProposedFeature`) plus the answer. `RecordedDecision` is what comes
-back, and it reassembles a `vectorize.Provenance` rather than returning five
-flat columns — the caller already knows that type, and a store that invented a
-second representation of provenance would put the mapping in the endpoint.
+`vectorize.ProposedFeature`) plus the answer — the outcome, and for water the
+contributor's in-play judgement, which no model produces. `RecordedDecision` is
+what comes back, and it reassembles a `vectorize.Provenance` rather than
+returning five flat columns — the caller already knows that type, and a store
+that invented a second representation of provenance would put the mapping in the
+endpoint.
 
 **Session in, never a connection string.** Every function takes a `Session` the
 caller opened. Nothing here reads an environment variable, at import time or at
@@ -91,6 +93,11 @@ class DecisionInput:
     geometry: dict[str, Any]
     confidence: float
     provenance: Provenance
+    #: R14's in-play answer, when the contributor was asked one. `None` is not a
+    #: default so much as a third state: the question is only put for water, so
+    #: `None` means "never asked" and `False` means "asked, and a ball cannot
+    #: find it". See `models.in_play` for why the distinction is kept.
+    in_play: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,7 @@ class RecordedDecision:
     geometry: dict[str, Any]
     confidence: float
     provenance: Provenance
+    in_play: bool | None
     recorded_at: dt.datetime
 
 
@@ -180,6 +188,7 @@ def _to_row(hole: HoleRef, decision: DecisionInput, batch_id: uuid.UUID) -> Feat
         outcome=decision.outcome,
         geometry=decision.geometry,
         confidence=float(decision.confidence),
+        in_play=decision.in_play,
         imagery_acquired=decision.provenance.acquired,
         imagery_gsd_meters=float(decision.provenance.gsd_meters),
         imagery_source=decision.provenance.source,
@@ -205,6 +214,7 @@ def _from_row(row: FeatureDecision) -> RecordedDecision:
             model_id=row.model_id,
             item_id=row.imagery_item_id,
         ),
+        in_play=row.in_play,
         recorded_at=_as_utc(row.recorded_at),
     )
 

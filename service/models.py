@@ -51,6 +51,11 @@ answers "these decisions were submitted together", which a training export needs
 in order to tell a re-review of a hole from the original pass — and it cannot
 link two passes to the same person.
 
+`in_play` is a judgement the contributor made, not a fact about the contributor,
+and the distinction is the whole line this schema draws. R14 needs to know that
+*someone* said a ball can find this water; it never needs to know who, and the
+column carries no way to find out.
+
 `recorded_at` is the one field that carries any timing information. It is kept
 because a store nobody can order or age out is not reviewable and not
 operable, and because a training export selecting a flight window also wants to
@@ -97,6 +102,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     Date,
     DateTime,
     Enum,
@@ -216,6 +222,17 @@ class FeatureDecision(Base):
     outcome: Mapped[DecisionOutcome] = mapped_column(
         _string_enum(DecisionOutcome, "decision_outcome"), nullable=False
     )
+
+    #: R14's in-play answer: whether a ball can find this water. Nullable, and
+    #: the three states are genuinely three. `NULL` means the question was never
+    #: asked — every non-water decision, and the water rows written before this
+    #: column existed. `False` means it was asked and answered no: the water is
+    #: real but it is not a hazard. `True` is the only value that makes it one.
+    #: Collapsing `NULL` into `False` would tell a training run that a green was
+    #: judged out of play, which nobody ever said. Only a human can answer this —
+    #: spectral classification proposes water and never decides whether it counts
+    #: — so it is stored beside the outcome rather than derived from the kind.
+    in_play: Mapped[bool | None] = mapped_column(Boolean(), nullable=True)
 
     #: The GeoJSON Polygon in WGS84 exactly as it was proposed and shown — the
     #: shape the contributor answered about, not a re-derived one.
