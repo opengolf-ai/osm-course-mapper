@@ -944,14 +944,19 @@ export function useMapper() {
         ...s,
         holeIndex: i,
         screen: 'review',
-        /* Nothing known about the hole — whether because OSM holds nothing or
-         * because it never answered — means starting from the playing line. */
-        mode:
-          status === 'attention'
-            ? 'attention'
-            : status === 'unmapped' || status === 'unknown'
-              ? 'locate'
-              : 'ready',
+        /*
+         * Opening a hole always starts from the playing line, because opening
+         * one clears whatever was on it — no drawn line, no proposals. The
+         * review sequence is driven by proposals, so entering it with none
+         * walks the contributor through empty questions ("we did not find a
+         * green here") over a hole with nothing drawn on it and no way to draw.
+         *
+         * A hole OpenStreetMap already holds is no exception. `complete` means
+         * OSM has the hole, not that this app has its geometry — it carries
+         * which hole numbers exist, not their shape — so there is still nothing
+         * on screen to review. Drawing the line is what produces something.
+         */
+        mode: status === 'attention' ? 'attention' : 'locate',
         step: 0,
         proposalIndex: 0,
         confirmed: [],

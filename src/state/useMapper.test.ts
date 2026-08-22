@@ -184,6 +184,40 @@ describe('drawing, undoing and finishing', () => {
     return hook;
   }
 
+  it('starts on the line even for a hole OpenStreetMap already holds', () => {
+    /*
+     * `complete` means OSM has the hole, not that this app has its geometry —
+     * the lookup carries which hole numbers exist, not their shape. Opening one
+     * into the review sequence walked the contributor through empty questions
+     * ("we did not find a green here") over a hole with nothing drawn on it and
+     * no way to draw one.
+     */
+    const hook = renderHook(() => useMapper());
+    act(() =>
+      hook.result.current.actions.openCourse(SESSION, {
+        status: 'found',
+        course: {
+          osmId: 'relation/3741806',
+          name: 'Pebble Beach Golf Links',
+          boundary: { type: 'Polygon', coordinates: [[[-121.95, 36.56], [-121.94, 36.56], [-121.94, 36.57], [-121.95, 36.56]]] },
+          acres: 176,
+          bbox: [-121.95, 36.56, -121.94, 36.57],
+          /* Hole 1 is already on the map, so its status is `complete`. */
+          mappedHoleRefs: [1],
+          landmarks: [],
+          matchedBy: 'name',
+        },
+      }),
+    );
+    expect(hook.result.current.state.holeStatus[0]).toBe('complete');
+
+    act(() => hook.result.current.actions.openHole(0));
+
+    expect(hook.result.current.state.mode).toBe('locate');
+    /* And nothing is being reviewed, so no empty question is asked. */
+    expect(hook.result.current.derived.proposals).toEqual([]);
+  });
+
   it('places tee, turn points and green in the order they are clicked', () => {
     const { result } = openedOnHoleOne();
     expect(result.current.state.mode).toBe('locate');
