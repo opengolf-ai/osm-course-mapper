@@ -16,6 +16,8 @@ export default mergeConfig(
         ['src/state/**', 'jsdom'],
       ],
       globals: true,
+      /* Only the DOM trees need it; the node-environment tests have no window. */
+      setupFiles: ['./src/test-setup.ts'],
       include: ['src/**/*.{test,spec}.{ts,tsx}'],
     },
   }),

@@ -8,6 +8,7 @@ import { CompleteModal } from './screens/CompleteModal';
 import { ReviewScreen } from './screens/ReviewScreen';
 import { SearchScreen } from './screens/SearchScreen';
 import { buildCourseSession } from './state/courseSession';
+import { parsePath, routeFor, routeToPath, type Route } from './state/url';
 import { useMapper } from './state/useMapper';
 
 /**
@@ -80,6 +81,125 @@ export default function App() {
   );
 
   useEffect(() => () => inFlight.current?.abort(), []);
+
+  /*
+   * ---------- The address bar ----------
+   *
+   * Every screen has a URL, so the browser's own back and forward buttons work
+   * and a link survives a refresh. Three effects, in the order they have to run:
+   * read the address once on mount, write it whenever the app moves, and read it
+   * again whenever the contributor uses the back button.
+   *
+   * `synced` is what keeps those from fighting. It holds the path this component
+   * last agreed with, so applying an address never bounces back out as a new
+   * history entry.
+   */
+  const synced = useRef<string | null>(null);
+  /* A deep link names a course that is not loaded yet. Hold the rest of the
+     address until the fetch lands, then finish the navigation. */
+  const pendingRoute = useRef<Route | null>(null);
+
+  const holeNumberAt = useCallback(
+    (index: number) => course?.holes[index]?.number ?? index + 1,
+    [course],
+  );
+
+  const indexOfHole = useCallback(
+    (holeNumber: number) => {
+      if (!course) return 0;
+      const found = course.holes.findIndex((h) => h.number === holeNumber);
+      /* A number the record does not carry still addresses a position, so a
+         hand-typed /hole/3 opens something rather than dead-ending. */
+      if (found >= 0) return found;
+      return Math.min(Math.max(holeNumber - 1, 0), Math.max(course.holes.length - 1, 0));
+    },
+    [course],
+  );
+
+  const currentRoute = routeFor({
+    screen: state.screen,
+    mode: state.mode,
+    courseId: course?.id ?? null,
+    holeNumber: course ? holeNumberAt(state.holeIndex) : null,
+  });
+
+  /** Move the app to an address. Never touches history — the caller owns that. */
+  const applyRoute = useCallback(
+    (route: Route) => {
+      if (route.screen === 'search') {
+        actions.go('search');
+        return;
+      }
+      /* Every other screen reads the course. If it is not the one loaded, the
+         fetch has to finish first; park the address and let openCourse land. */
+      if (!course || course.id !== route.courseId) {
+        pendingRoute.current = route;
+        openCourse(route.courseId);
+        return;
+      }
+      switch (route.screen) {
+        case 'boundary':
+          /* Only a course OpenStreetMap holds a line for has a boundary screen
+             to show. A link to one that does not lands on the board rather than
+             on a screen with nothing in it. */
+          actions.go(state.osm.status === 'found' ? 'boundary' : 'board');
+          return;
+        case 'board':
+          actions.go('board');
+          return;
+        case 'review': {
+          const index = indexOfHole(route.holeNumber);
+          /* A different hole starts clean; the same hole in a different mode
+             keeps the work already on it. */
+          if (index !== state.holeIndex) actions.openHole(index);
+          actions.go('review', route.mode);
+          return;
+        }
+        case 'complete':
+          actions.patch({ holeIndex: indexOfHole(route.holeNumber), screen: 'complete' });
+          return;
+      }
+    },
+    [course, openCourse, actions, indexOfHole, state.holeIndex, state.osm.status],
+  );
+
+  /* Read the address once, on mount. Until this runs, nothing is written — a
+     deep link must not be overwritten by the initial state's own URL. */
+  useEffect(() => {
+    const route = parsePath(window.location.pathname);
+    synced.current = window.location.pathname;
+    if (route.screen !== 'search') applyRoute(route);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount only, by design
+  }, []);
+
+  /* A deep link's remaining address, applied once its course has landed. */
+  useEffect(() => {
+    const pending = pendingRoute.current;
+    if (!pending || pending.screen === 'search' || !course || course.id !== pending.courseId) return;
+    pendingRoute.current = null;
+    applyRoute(pending);
+  }, [course, applyRoute]);
+
+  /* Write the address whenever the app moves somewhere new. */
+  useEffect(() => {
+    if (synced.current === null) return; /* mount read has not happened yet */
+    const path = routeToPath(currentRoute);
+    if (path === synced.current) return;
+    synced.current = path;
+    window.history.pushState(null, '', path);
+  }, [currentRoute]);
+
+  /* Back and forward: read the address and move to it, without writing one. */
+  useEffect(() => {
+    const onPopState = () => {
+      const path = window.location.pathname;
+      const route = parsePath(path);
+      synced.current = path;
+      applyRoute(route);
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [applyRoute]);
 
   /*
    * Every screen and review mode stays reachable directly, so no state is
