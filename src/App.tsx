@@ -45,6 +45,10 @@ export default function App() {
         const result = await getCourse(courseId, controller.signal);
         if (controller.signal.aborted || result.status === 'aborted') return;
         if (result.status !== 'ok') {
+          /* Release the address. The link stays in the bar so a refresh retries
+             it, but the app must be free to write one again when the
+             contributor navigates somewhere else. */
+          pendingRoute.current = null;
           setLoad({
             kind: 'failed',
             message: result.status === 'failed' ? result.message : 'the record held no course data',
@@ -204,6 +208,14 @@ export default function App() {
   /* Write the address whenever the app moves somewhere new. */
   useEffect(() => {
     if (synced.current === null) return; /* mount read has not happened yet */
+    /*
+     * A deep link is still resolving. The address already names where we are
+     * going; the app just cannot get there until the course lands. Writing the
+     * loading screen's own route over it would throw the destination away —
+     * the address bar would snap to `/` and a refresh would lose the hole too.
+     */
+    if (pendingRoute.current !== null) return;
+
     const path = routeToPath(currentRoute);
     if (path === synced.current) return;
     /* Only the first write after applying an address is a correction of it. */

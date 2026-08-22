@@ -219,6 +219,58 @@ describe('a pasted link', () => {
     expect(path()).not.toBe(`/c/${COURSE_ID}/hole/1/locate`);
   });
 
+  it('keeps the address while the course it names is still loading', async () => {
+    /*
+     * The bug this pins: while the course loads there is no course, so the app's
+     * own route is the search screen -- and writing that over the address
+     * replaced the link with `/` before it ever resolved. The destination was
+     * gone from the bar, and a refresh could not get it back.
+     */
+    let releaseDetail: (() => void) | null = null;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url.includes('overpass')) return jsonResponse({ elements: [] });
+        /* Hold the course record open so the loading window is observable. */
+        await new Promise<void>((resolve) => { releaseDetail = resolve; });
+        return jsonResponse(detailFixture());
+      }),
+    );
+
+    window.history.replaceState(null, '', `/c/${COURSE_ID}/hole/2`);
+    render(<App />);
+    await settle();
+
+    /* Still loading, and the address still names where we are going. */
+    expect(path()).toBe(`/c/${COURSE_ID}/hole/2`);
+
+    await act(async () => { releaseDetail?.(); await new Promise((r) => setTimeout(r, 0)); });
+    await settle();
+
+    expect(path()).toBe(`/c/${COURSE_ID}/hole/2/locate`);
+    expect(document.body.textContent).toContain('Show us where this hole plays.');
+  });
+
+  it('releases the address when the course it names cannot be opened', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown) => {
+        if (String(input).includes('overpass')) return jsonResponse({ elements: [] });
+        return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+      }),
+    );
+
+    window.history.replaceState(null, '', `/c/${COURSE_ID}/hole/2`);
+    render(<App />);
+    await settle();
+    await settle();
+
+    /* The link stays put so a refresh retries it, and the failure is stated. */
+    expect(path()).toBe(`/c/${COURSE_ID}/hole/2`);
+    expect(document.body.textContent).toContain('Could not open that course');
+  });
+
   it('falls back to search when the address is unreadable', async () => {
     window.history.replaceState(null, '', '/c/course-1/hole/nonsense');
     render(<App />);
