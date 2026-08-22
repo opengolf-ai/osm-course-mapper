@@ -183,8 +183,40 @@ describe('a pasted link', () => {
     await settle();
     await settle();
 
-    expect(path()).toBe(`/c/${COURSE_ID}/hole/3`);
+    /* The fixture's course has no OpenStreetMap data, so every hole opens on
+       the draw-the-line step and the address corrects itself to say so. */
+    expect(path()).toBe(`/c/${COURSE_ID}/hole/3/locate`);
     expect(document.body.textContent).toContain('Hole 3');
+  });
+
+  it('asks for a line when the hole it names has none', async () => {
+    /*
+     * Hole 1 is the case that breaks quietly: it resolves to index 0, which is
+     * also where holeIndex starts, so a guard that only opens the hole when the
+     * index changes never opens it at all -- leaving the review screen in its
+     * default mode with no line and nothing asking for one.
+     */
+    window.history.replaceState(null, '', `/c/${COURSE_ID}/hole/1`);
+    render(<App />);
+    await settle();
+    await settle();
+
+    expect(document.body.textContent).toContain('Show us where this hole plays.');
+    /* And the address says so, so backing out of drawing goes somewhere real. */
+    expect(path()).toBe(`/c/${COURSE_ID}/hole/1/locate`);
+  });
+
+  it('correcting the address does not trap the back button', async () => {
+    window.history.replaceState(null, '', `/c/${COURSE_ID}/hole/1`);
+    render(<App />);
+    await settle();
+    await settle();
+    expect(path()).toBe(`/c/${COURSE_ID}/hole/1/locate`);
+
+    /* The correction replaced the entry it came from rather than stacking on
+       it, so one press leaves the hole instead of bouncing back to it. */
+    await goBack();
+    expect(path()).not.toBe(`/c/${COURSE_ID}/hole/1/locate`);
   });
 
   it('falls back to search when the address is unreadable', async () => {

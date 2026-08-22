@@ -95,6 +95,15 @@ export default function App() {
    * history entry.
    */
   const synced = useRef<string | null>(null);
+  /*
+   * The address an applied route came from. Opening a hole can land somewhere
+   * more specific than the link said — `/hole/1` on an unmapped hole becomes
+   * `/hole/1/locate` — and that correction has to replace the entry it came
+   * from. Pushed instead, the contributor's first back press would land on the
+   * address that immediately corrects itself again, and the button would look
+   * broken.
+   */
+  const correctingFrom = useRef<string | null>(null);
   /* A deep link names a course that is not loaded yet. Hold the rest of the
      address until the fetch lands, then finish the navigation. */
   const pendingRoute = useRef<Route | null>(null);
@@ -148,11 +157,22 @@ export default function App() {
           actions.go('board');
           return;
         case 'review': {
-          const index = indexOfHole(route.holeNumber);
-          /* A different hole starts clean; the same hole in a different mode
-             keeps the work already on it. */
-          if (index !== state.holeIndex) actions.openHole(index);
-          actions.go('review', route.mode);
+          /*
+           * Always open the hole, even when its index already matches. Hole 1
+           * resolves to index 0, which is also where `holeIndex` starts, so a
+           * guard on "did the index change" skips the one hole a pasted link is
+           * most likely to name — leaving the screen in its default mode with
+           * no line drawn and nothing asking for one.
+           */
+          actions.openHole(indexOfHole(route.holeNumber));
+          /*
+           * `ready` is the absence of a mode in the address, not a mode to
+           * impose. Opening the hole already picked one from what
+           * OpenStreetMap holds — a hole with no line wants `locate` — and
+           * forcing `ready` over that is what left the screen with nothing to
+           * do. Only a mode the address names explicitly overrides it.
+           */
+          if (route.mode !== 'ready') actions.go('review', route.mode);
           return;
         }
         case 'complete':
@@ -160,7 +180,7 @@ export default function App() {
           return;
       }
     },
-    [course, openCourse, actions, indexOfHole, state.holeIndex, state.osm.status],
+    [course, openCourse, actions, indexOfHole, state.osm.status],
   );
 
   /* Read the address once, on mount. Until this runs, nothing is written — a
@@ -168,6 +188,7 @@ export default function App() {
   useEffect(() => {
     const route = parsePath(window.location.pathname);
     synced.current = window.location.pathname;
+    correctingFrom.current = window.location.pathname;
     if (route.screen !== 'search') applyRoute(route);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount only, by design
   }, []);
@@ -185,8 +206,12 @@ export default function App() {
     if (synced.current === null) return; /* mount read has not happened yet */
     const path = routeToPath(currentRoute);
     if (path === synced.current) return;
+    /* Only the first write after applying an address is a correction of it. */
+    const correcting = correctingFrom.current !== null && correctingFrom.current === synced.current;
+    correctingFrom.current = null;
     synced.current = path;
-    window.history.pushState(null, '', path);
+    if (correcting) window.history.replaceState(null, '', path);
+    else window.history.pushState(null, '', path);
   }, [currentRoute]);
 
   /* Back and forward: read the address and move to it, without writing one. */
@@ -195,6 +220,7 @@ export default function App() {
       const path = window.location.pathname;
       const route = parsePath(path);
       synced.current = path;
+      correctingFrom.current = path;
       applyRoute(route);
     };
     window.addEventListener('popstate', onPopState);
