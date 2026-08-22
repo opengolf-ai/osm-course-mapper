@@ -901,18 +901,45 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
             padding: 16,
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
-            <span style={{ ...EYEBROW, color: 'var(--green-200)' }}>The card</span>
-            <span
-              style={{
-                fontFamily: 'var(--font-mono)',
-                fontSize: 11,
-                color: 'var(--mint-400)',
-                marginLeft: 'auto',
-              }}
-            >
-              par {holePar ?? '—'} · index {holeHandicapIndex ?? '—'}
-            </span>
+          {/*
+            * The card names the hole it belongs to. The map carries a "Hole N"
+            * chip, but the rail is where a contributor reads numbers, and a
+            * scorecard with no subject is one more thing to hold in your head
+            * while deciding whether 412 yards looks right.
+            */}
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+              <span style={{ ...EYEBROW, color: 'var(--green-200)' }}>Hole {holeNum}</span>
+              <span
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 11,
+                  color: 'var(--mint-400)',
+                  marginLeft: 'auto',
+                }}
+              >
+                par {holePar ?? '—'} · index {holeHandicapIndex ?? '—'}
+              </span>
+            </div>
+            {course?.name && (
+              /* Truncated rather than wrapped: club names run long, and a
+                 two-line title would push the yardages the contributor is
+                 actually reading further down the rail. */
+              <div
+                title={course.name}
+                style={{
+                  marginTop: 4,
+                  fontSize: 14,
+                  fontWeight: 600,
+                  color: 'var(--green-100)',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {course.name}
+              </div>
+            )}
           </div>
           {scorecard.length === 0 && (
             <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green-200)' }}>
