@@ -345,18 +345,30 @@ describe('asking the detection service for proposals', () => {
     detectMock.mockResolvedValue(result);
   }
 
-  it('offers the request only once the line is finished', async () => {
+  it('starts looking as soon as the line is finished, without a second ask', async () => {
+    resolvesWith({
+      status: 'ok',
+      jobId: '77d2',
+      proposals: [PROPOSAL],
+      imagery: null,
+      missingTeeSets: [],
+    });
     await mount();
-    expect(screen.queryByText(ASK)).toBeNull();
 
     await clickAt(-121_949, 36_569);
-    await clickAt(-121_946, 36_570);
-    /* Two points drawn is not a finished line. */
-    expect(screen.queryByText(ASK)).toBeNull();
-
-    await press('Finish the line');
-    expect(screen.getByText(ASK)).toBeDefined();
+    /* A line still being drawn is not a question to ask the service. */
     expect(detectMock).not.toHaveBeenCalled();
+    await clickAt(-121_946, 36_570);
+    expect(detectMock).not.toHaveBeenCalled();
+
+    /*
+     * Finishing at the green is the request. The contributor has already said
+     * where the hole runs; making them press a second button asks them to state
+     * the same intent twice.
+     */
+    await press('Finish the line');
+    expect(detectMock).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Is that the green?')).toBeDefined();
   });
 
   it('asks about the drawn line with the hole card, and lands proposals in the review sequence', async () => {
@@ -369,7 +381,6 @@ describe('asking the detection service for proposals', () => {
     });
     await withFinishedLine();
 
-    await press(ASK);
 
     const request = detectMock.mock.calls[0][0];
     expect(request.line).toEqual([
@@ -388,7 +399,6 @@ describe('asking the detection service for proposals', () => {
     resolvesWith({ status: 'no_coverage', message: 'No NAIP imagery covers this location.' });
     await withFinishedLine();
 
-    await press(ASK);
 
     expect(screen.getByText(/No proposals for this hole/)).toBeDefined();
     expect(screen.getByText(/No NAIP imagery covers this location/)).toBeDefined();
@@ -405,7 +415,6 @@ describe('asking the detection service for proposals', () => {
     });
     await withFinishedLine();
 
-    await press(ASK);
 
     expect(screen.getByText(/Detection did not finish/)).toBeDefined();
     expect(screen.getByText(/still yours to map by hand/)).toBeDefined();
@@ -419,7 +428,6 @@ describe('asking the detection service for proposals', () => {
     resolvesWith({ status: 'failed', reason: 'network', message: 'Failed to fetch' });
     await withFinishedLine();
 
-    await press(ASK);
 
     expect(screen.getByText(/Detection did not finish/)).toBeDefined();
     expect(screen.queryByText(/No proposals for this hole/)).toBeNull();
@@ -468,7 +476,6 @@ describe('asking the detection service for proposals', () => {
       missingTeeSets: [],
     });
     await withFinishedLine();
-    await press(ASK);
 
     /* Everything arrives as a suggestion. Nothing is confirmed by arriving. */
     expect([...statusById().values()]).toEqual(['proposed', 'proposed', 'proposed']);
@@ -503,7 +510,6 @@ describe('asking the detection service for proposals', () => {
       missingTeeSets: [],
     });
     await withFinishedLine();
-    await press(ASK);
     await press('Yes, that is the green');
 
     /* No bunkers came back. The step is shown anyway, saying so, with the
@@ -523,7 +529,6 @@ describe('asking the detection service for proposals', () => {
       missingTeeSets: [],
     });
     await withFinishedLine();
-    await press(ASK);
 
     /* Straight to the water step: nothing else was proposed. */
     await press('Nothing to confirm — carry on');
@@ -560,7 +565,6 @@ describe('asking the detection service for proposals', () => {
     });
     await withFinishedLine();
 
-    await press(ASK);
     expect(screen.getByText(/Reading the imagery for hole 1/)).toBeDefined();
     expect(seen?.aborted).toBe(false);
 
@@ -651,7 +655,6 @@ describe('provenance and the imagery the model read', () => {
     await clickAt(-121_949, 36_569);
     await clickAt(-121_946, 36_570);
     await press('Finish the line');
-    await press(ASK);
     return view;
   }
 

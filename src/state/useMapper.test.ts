@@ -678,8 +678,8 @@ describe('a detection answer that lands after the contributor moved on', () => {
     act(() => result.current.actions.openHole(0));
     act(() => result.current.actions.onMapClick(PEBBLE_TEE));
     act(() => result.current.actions.onMapClick(PEBBLE_GREEN));
+    /* Finishing the line is the request — no second ask. */
     act(() => result.current.actions.finishLine());
-    act(() => result.current.actions.requestProposals());
 
     expect(result.current.state.detect.status).toBe('working');
     expect(detection.pending).toHaveLength(1);

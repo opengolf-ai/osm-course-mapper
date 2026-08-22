@@ -985,59 +985,83 @@ export function useMapper() {
    * the service can produce lands in `detect` as a state the screen states, and
    * the hand-drawing path stays exactly where it was (R12).
    */
+  /**
+   * Ask the service what is on a finished line.
+   *
+   * Takes the points rather than reading them off state, because the caller that
+   * matters most — finishing the line — knows them before React has applied the
+   * `finished` flag. Reading state here would see a line that is not finished
+   * yet and refuse the very request that finishing is meant to start.
+   */
+  const runDetection = useCallback(
+    (points: readonly LngLat[]) => {
+      if (points.length < 2) return;
+
+      dropDetection();
+      const controller = new AbortController();
+      detectRun.current = controller;
+      patch({ detect: { status: 'working' }, lastAction: '' });
+
+      const request = detectRequestFor({
+        ...state,
+        locate: { points: [...points], finished: true },
+      });
+      void askTheDetectionService(request, { signal: controller.signal }).then(
+        (result) => {
+          /* Superseded by a later request, or by leaving the hole: not ours to apply. */
+          if (detectRun.current !== controller) return;
+          detectRun.current = null;
+
+          /* A cancellation is what the contributor asked for; `cancelProposals` has
+           * already put the hole back the way they want it. */
+          if (result.status === 'aborted') return;
+
+          if (result.status === 'ok') {
+            patch({
+              detect: {
+                status: 'ready',
+                jobId: result.jobId,
+                proposals: result.proposals,
+                imagery: result.imagery,
+                missingTeeSets: result.missingTeeSets,
+              },
+              /* Into the review sequence, the same transition `confirmLocate` makes. */
+              mode: 'ready',
+              step: 0,
+              proposalIndex: 0,
+              confirmed: [],
+              removed: [],
+              hazards: [],
+              extra: [],
+              /* "To check with you", never "found": nothing here is settled until
+               * the contributor has answered about each one (R7). */
+              lastAction: `We found ${result.proposals.length} thing${
+                result.proposals.length === 1 ? '' : 's'
+              } to check with you, one at a time.`,
+            });
+            return;
+          }
+
+          if (result.status === 'no_coverage') {
+            patch({ detect: { status: 'no_coverage', message: result.message }, lastAction: '' });
+            return;
+          }
+
+          patch({ detect: { status: 'failed', message: result.message }, lastAction: '' });
+        },
+      );
+    },
+    [state, patch, dropDetection],
+  );
+
+  /**
+   * Ask again by hand. Detection runs on its own when the line is finished, so
+   * this is the retry after a failure or an empty answer — not the normal path.
+   */
   const requestProposals = useCallback(() => {
-    if (!state.locate.finished || state.locate.points.length < 2) return;
-
-    dropDetection();
-    const controller = new AbortController();
-    detectRun.current = controller;
-    patch({ detect: { status: 'working' }, lastAction: '' });
-
-    void askTheDetectionService(detectRequestFor(state), { signal: controller.signal }).then(
-      (result) => {
-        /* Superseded by a later request, or by leaving the hole: not ours to apply. */
-        if (detectRun.current !== controller) return;
-        detectRun.current = null;
-
-        /* A cancellation is what the contributor asked for; `cancelProposals` has
-         * already put the hole back the way they want it. */
-        if (result.status === 'aborted') return;
-
-        if (result.status === 'ok') {
-          patch({
-            detect: {
-              status: 'ready',
-              jobId: result.jobId,
-              proposals: result.proposals,
-              imagery: result.imagery,
-              missingTeeSets: result.missingTeeSets,
-            },
-            /* Into the review sequence, the same transition `confirmLocate` makes. */
-            mode: 'ready',
-            step: 0,
-            proposalIndex: 0,
-            confirmed: [],
-            removed: [],
-            hazards: [],
-            extra: [],
-            /* "To check with you", never "found": nothing here is settled until
-             * the contributor has answered about each one (R7). */
-            lastAction: `We found ${result.proposals.length} thing${
-              result.proposals.length === 1 ? '' : 's'
-            } to check with you, one at a time.`,
-          });
-          return;
-        }
-
-        if (result.status === 'no_coverage') {
-          patch({ detect: { status: 'no_coverage', message: result.message }, lastAction: '' });
-          return;
-        }
-
-        patch({ detect: { status: 'failed', message: result.message }, lastAction: '' });
-      },
-    );
-  }, [state, patch, dropDetection]);
+    if (!state.locate.finished) return;
+    runDetection(state.locate.points);
+  }, [state.locate.finished, state.locate.points, runDetection]);
 
   /**
    * Stop waiting. The first request of a session is the one most likely to be
@@ -1137,15 +1161,25 @@ export function useMapper() {
           };
         }),
       /** Close the line. Refused below two points — that is not yet a hole (R8). */
-      finishLine: () =>
-        patch((s) =>
-          s.locate.points.length < 2
-            ? {}
-            : {
-                locate: { points: s.locate.points, finished: true },
-                lastAction: 'That is the line — here is how it measures.',
-              },
-        ),
+      /**
+       * Close the line and go straight into looking at it.
+       *
+       * Finishing at the green *is* the request — the contributor has said where
+       * the hole runs, and asking them to press a second button before anything
+       * happens makes them state the same intent twice. Detection is started
+       * here rather than from an effect watching `finished`, because cancelling
+       * returns detection to idle and an effect would read that as "not started
+       * yet" and fire again, forever.
+       */
+      finishLine: () => {
+        const points = state.locate.points;
+        if (points.length < 2 || state.locate.finished) return;
+        patch({
+          locate: { points, finished: true },
+          lastAction: 'That is the line — looking for what is on it …',
+        });
+        runDetection(points);
+      },
       /**
        * Save the line and carry on by hand, without waiting for detection.
        *

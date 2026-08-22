@@ -1010,8 +1010,9 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
               Show us where this hole plays.
             </h3>
             <p style={{ margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' }}>
-              Click the tee, then a point wherever the hole bends, then the green you putt on. We
-              measure along the line you drew — the same way your card counts a dogleg.
+              Click the furthest back tee, follow the fairway wherever the hole bends, then finish
+              on the green you putt on. We measure along the line you drew — the same way your card
+              counts a dogleg — and go looking for the hole's features as soon as you finish.
             </p>
 
             {/* R15: the card the line is checked against is the set you played. */}
@@ -1047,13 +1048,13 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
               {[
                 {
                   num: '1',
-                  label: 'Where you tee off',
+                  label: 'The furthest back tee',
                   done: locatePoints.length >= 1,
                   state: locatePoints.length >= 1 ? 'marked' : 'click the map',
                 },
                 {
                   num: '2',
-                  label: 'Where the hole bends',
+                  label: 'Follow the fairway',
                   done: turnPoints > 0,
                   state:
                     turnPoints > 0
@@ -1066,7 +1067,7 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                   num: '3',
                   label: 'The green you putt on',
                   done: locateDone,
-                  state: locateDone ? 'marked' : locatePoints.length >= 1 ? 'click, then finish' : 'next',
+                  state: locateDone ? 'marked' : locatePoints.length >= 1 ? 'click it, then finish' : 'next',
                 },
               ].map((p) => {
                 const ring = p.done ? 'var(--mint-400)' : locatePoints.length >= 1 ? '#fff' : 'var(--green-200)';
