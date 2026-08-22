@@ -12,13 +12,14 @@ no PR description to carry them) and no configured issue tracker.
 - **Reviewers:** correctness, security, adversarial, reliability, julik-frontend-races,
   api-contract, testing, maintainability
 - **Fixed and committed in `3566e10`:** findings #1, #2, #4, #5 (all P1)
+- **Later fixed:** findings #6 and #8 — see "Resolved after the fact" below
 
 Finding numbers below are the review's stable identifiers, so they still line up
 with `review.json`.
 
 ## Open actionable findings
 
-### #6 — P2 — Corridor overlay waits on a load event that already fired
+### #6 — RESOLVED — Corridor overlay waits on a load event that already fired
 `src/map/BaseMap.tsx:282`
 
 The overlay can silently never attach, so the contributor cannot check a proposal
@@ -47,7 +48,7 @@ leave detection pinned at `working`.
 
 Found independently by correctness and reliability. Validated.
 
-### #8 — P2 — Corridor overlay image-load failures are never surfaced
+### #8 — still open — Corridor overlay image-load failures are never surfaced
 `src/map/BaseMap.tsx:189`
 
 The rail claims to be showing the imagery the model read while the map shows
@@ -94,6 +95,17 @@ client copy appends text the service's default message already ends with.
 **Fix:** drop the trailing sentence from the client copy.
 
 Not validated — outside the batch cap.
+
+## Resolved after the fact
+
+**#6 turned out to be reachable in the review screen too, and it was breaking
+the core flow.** The same `isStyleLoaded()` / `once('load')` pattern guarded the
+review feature source, so on a real map the source and all four layers were
+never added: a contributor drew a line and saw nothing on the map, because the
+HTML captions render independently of it. Both sites now attempt the add
+immediately and retry on `styledata`. Regression tests cover the busy-style
+window at both. Accepting this as a P2 residual under-read it — it was a P1 in
+the drawing path.
 
 ## Pre-existing (not introduced by this work)
 

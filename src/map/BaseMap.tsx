@@ -279,11 +279,31 @@ export function BaseMap({
       );
       setOverlayAdded(true);
     };
-    if (map.isStyleLoaded()) add();
-    else map.once('load', add);
+    /*
+     * `isStyleLoaded()` reports false whenever any tile is still loading, which
+     * is routinely long after `load` has fired — and this effect first runs
+     * when a corridor arrives, long after construction. Waiting on
+     * `once('load')` there waits for an event that will never come again and
+     * the overlay silently never attaches. Attempt now, retry on `styledata`.
+     */
+    const attach = () => {
+      try {
+        if (map.getSource(overlay.id)) {
+          map.off('styledata', attach);
+          return;
+        }
+        add();
+        map.off('styledata', attach);
+      } catch {
+        /* The style will not take a source yet; `styledata` brings us back. */
+      }
+    };
+    attach();
+    map.on('styledata', attach);
 
     return () => {
       cancelled = true;
+      map.off('styledata', attach);
       /* The construction effect's cleanup runs first and nulls the ref, so a
        * torn-down map is never reached into here. */
       if (mapRef.current !== map) return;

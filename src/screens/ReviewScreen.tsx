@@ -386,6 +386,61 @@ interface PlacedLabel {
   y: number;
 }
 
+  /** The review source and its layers. Module scope: it closes over no state. */
+const addFeatureLayers = (instance: MapLibreMap) => {
+  {
+    instance.addSource(FEATURE_SOURCE, {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] },
+    });
+    instance.addLayer({
+      id: FILL_LAYER,
+      type: 'fill',
+      source: FEATURE_SOURCE,
+      filter: ['==', ['geometry-type'], 'Polygon'],
+      paint: {
+        'fill-color': STATUS_COLOR,
+        /* A suggestion sits lighter on the imagery than something confirmed. */
+        'fill-opacity': ['case', ['==', ['get', 'status'], 'proposed'], 0.1, 0.16],
+      },
+    } as never);
+    instance.addLayer({
+      id: LINE_LAYER,
+      type: 'line',
+      source: FEATURE_SOURCE,
+      /* Everything but the suggestions, which the dashed layer below owns. */
+      filter: ['all', ['!=', ['geometry-type'], 'Point'], ['!=', ['get', 'status'], 'proposed']],
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: { 'line-color': STATUS_COLOR, 'line-width': STATUS_WIDTH },
+    } as never);
+    instance.addLayer({
+      id: PROPOSED_LINE_LAYER,
+      type: 'line',
+      source: FEATURE_SOURCE,
+      filter: PROPOSED_FILTER,
+      layout: { 'line-cap': 'butt', 'line-join': 'round' },
+      paint: {
+        'line-color': STATUS_COLOR,
+        'line-dasharray': [2, 2],
+        /* The one being asked about is drawn heavier than the ones queued behind it. */
+        'line-width': ['case', ['==', ['get', 'focus'], true], 3.5, 2],
+      },
+    } as never);
+    instance.addLayer({
+      id: POINT_LAYER,
+      type: 'circle',
+      source: FEATURE_SOURCE,
+      filter: ['==', ['geometry-type'], 'Point'],
+      paint: {
+        'circle-radius': 5,
+        'circle-color': STATUS_COLOR,
+        'circle-stroke-width': 2,
+        'circle-stroke-color': 'rgba(6,43,38,.8)',
+      },
+    } as never);
+  }
+};
+
 export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
   const { state, derived, actions } = mapper;
   const {
@@ -471,62 +526,35 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
     frame.current = { hole: hi, bounds: mapBounds ?? undefined };
   }
 
-  /* One source and three layers, added once the style exists. */
+  /*
+   * One source and four layers, added as soon as the style will take them.
+   *
+   * `isStyleLoaded()` is not "has the style loaded" — it returns false whenever
+   * any tile or image is still loading, which is routinely long after `load`
+   * has already fired. Waiting on `once('load')` in that window waits for an
+   * event that will never come again, and the source is never added: `setData`
+   * then finds nothing, and the drawn line, the points and every proposal are
+   * silently absent while the HTML captions above them still render.
+   *
+   * So this attempts the add immediately and retries on `styledata`, which
+   * fires on every style event. The add is idempotent and removes its own
+   * listener once it sticks.
+   */
   const handleMapReady = useCallback((instance: MapLibreMap) => {
     const draw = () => {
-      if (instance.getSource(FEATURE_SOURCE)) return;
-      instance.addSource(FEATURE_SOURCE, {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] },
-      });
-      instance.addLayer({
-        id: FILL_LAYER,
-        type: 'fill',
-        source: FEATURE_SOURCE,
-        filter: ['==', ['geometry-type'], 'Polygon'],
-        paint: {
-          'fill-color': STATUS_COLOR,
-          /* A suggestion sits lighter on the imagery than something confirmed. */
-          'fill-opacity': ['case', ['==', ['get', 'status'], 'proposed'], 0.1, 0.16],
-        },
-      } as never);
-      instance.addLayer({
-        id: LINE_LAYER,
-        type: 'line',
-        source: FEATURE_SOURCE,
-        /* Everything but the suggestions, which the dashed layer below owns. */
-        filter: ['all', ['!=', ['geometry-type'], 'Point'], ['!=', ['get', 'status'], 'proposed']],
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': STATUS_COLOR, 'line-width': STATUS_WIDTH },
-      } as never);
-      instance.addLayer({
-        id: PROPOSED_LINE_LAYER,
-        type: 'line',
-        source: FEATURE_SOURCE,
-        filter: PROPOSED_FILTER,
-        layout: { 'line-cap': 'butt', 'line-join': 'round' },
-        paint: {
-          'line-color': STATUS_COLOR,
-          'line-dasharray': [2, 2],
-          /* The one being asked about is drawn heavier than the ones queued behind it. */
-          'line-width': ['case', ['==', ['get', 'focus'], true], 3.5, 2],
-        },
-      } as never);
-      instance.addLayer({
-        id: POINT_LAYER,
-        type: 'circle',
-        source: FEATURE_SOURCE,
-        filter: ['==', ['geometry-type'], 'Point'],
-        paint: {
-          'circle-radius': 5,
-          'circle-color': STATUS_COLOR,
-          'circle-stroke-width': 2,
-          'circle-stroke-color': 'rgba(6,43,38,.8)',
-        },
-      } as never);
+      try {
+        if (instance.getSource(FEATURE_SOURCE)) {
+          instance.off('styledata', draw);
+          return;
+        }
+        addFeatureLayers(instance);
+        instance.off('styledata', draw);
+      } catch {
+        /* The style will not take layers yet; `styledata` brings us back. */
+      }
     };
-    if (instance.isStyleLoaded()) draw();
-    else instance.once('load', draw);
+    draw();
+    instance.on('styledata', draw);
     setMap(instance);
   }, []);
 

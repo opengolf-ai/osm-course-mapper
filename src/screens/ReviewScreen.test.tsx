@@ -23,7 +23,15 @@ const harness = vi.hoisted(() => {
     layout,
     constructed: 0,
     removed: 0,
+    /*
+     * Real MapLibre refuses layers while the style is busy, and reports
+     * `isStyleLoaded()` false long after `load` has already fired. Opt in to
+     * that window to exercise the retry; off by default so every other test
+     * keeps the simple immediate path.
+     */
+    styleBusy: false,
     reset() {
+      this.styleBusy = false;
       listeners.clear();
       sources.clear();
       layers.length = 0;
@@ -50,7 +58,8 @@ vi.mock('maplibre-gl', () => {
       return this;
     }
     once(_type: string, handler: () => void) {
-      handler();
+      /* A busy style stands for "load already fired": it will not fire again. */
+      if (!harness.styleBusy) handler();
       return this;
     }
     off() {
@@ -61,13 +70,17 @@ vi.mock('maplibre-gl', () => {
     }
     fitBounds() {}
     isStyleLoaded() {
-      return true;
+      return !harness.styleBusy;
     }
     getSource(id: string) {
       const entry = harness.sources.get(id);
       return entry && { setData: (data: unknown) => (entry.data = data), spec: entry.spec };
     }
     addSource(id: string, spec: { data?: unknown }) {
+      /* Scoped to the review source so the basemap's own setup is unaffected. */
+      if (harness.styleBusy && id === 'review-features') {
+        throw new Error('Style is not done loading');
+      }
       harness.sources.set(id, { data: spec.data, spec: spec as Record<string, unknown> });
     }
     /* Real `addLayer` inserts *before* `beforeId` — the fake splices, so
@@ -213,6 +226,38 @@ describe('drawing on real imagery', () => {
     const data = JSON.stringify([...harness.sources.values()].map((s) => s.data));
     expect(data).toContain('-121.949');
     expect(data).toContain('36.569');
+  });
+
+  it('still adds its layers when the style was busy and load had already fired', async () => {
+    /*
+     * The bug this pins. `isStyleLoaded()` reports false whenever any tile is
+     * still loading — routinely long after `load` fired — so waiting on
+     * `once('load')` waited for an event that never came again. The source was
+     * never added, `setData` found nothing, and the drawn line, the points and
+     * every proposal were silently absent while the HTML captions above them
+     * still rendered, which is exactly what it looked like from the outside.
+     */
+    harness.styleBusy = true;
+    await mount();
+    expect(harness.sources.has('review-features')).toBe(false);
+
+    /* The tiles land: MapLibre fires styledata, and the retry takes it. */
+    harness.styleBusy = false;
+    await act(async () => {
+      harness.emit('styledata', {});
+    });
+
+    expect(harness.sources.has('review-features')).toBe(true);
+    expect(harness.indexOf('review-features-line')).toBeGreaterThanOrEqual(0);
+    expect(harness.indexOf('review-features-point')).toBeGreaterThanOrEqual(0);
+
+    /* And what the contributor draws now reaches it. */
+    await clickAt(-121_949, 36_569);
+    await clickAt(-121_946, 36_570);
+    const collection = harness.sources.get('review-features')?.data as {
+      features: Array<{ geometry: { type: string } }>;
+    };
+    expect(collection.features.some((f) => f.geometry.type === 'LineString')).toBe(true);
   });
 
   it('sends the finished line to the map as a GeoJSON LineString', async () => {
