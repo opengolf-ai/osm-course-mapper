@@ -56,6 +56,7 @@ import numpy as np
 import rasterio
 from pyproj import Geod, Transformer
 from rasterio.crs import CRS
+from rasterio.features import geometry_mask
 from rasterio.transform import Affine
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window
@@ -388,6 +389,40 @@ def _covering_window(
     return Window(col_off, row_off, max(width, 1), max(height, 1))
 
 
+
+def _clip_to_corridor(
+    pixels: np.ndarray, transform: Affine, crs: CRS, corridor: Corridor
+) -> np.ndarray:
+    """Zero every pixel outside the corridor band around the drawn line.
+
+    The read is windowed to the corridor's *bounding box*, and on a dogleg that
+    box is roughly twice the corridor's own area — the rest is whatever else the
+    course has there: a neighbouring fairway, the clubhouse, a car park.
+    Segmentation cannot tell those apart, so masks from them reached
+    classification and competed to be this hole's features. Measured on a real
+    dogleg it produced five tee proposals for a hole with one visible tee, all
+    of the extras lying outside the band entirely.
+
+    Zeroing rather than cropping keeps the raster rectangular, so the transform,
+    the bounds guarantee and every downstream pixel index stay exactly as they
+    were. Zero already means "not our data" here — a boundless read fills
+    uncovered ground the same way — so `segment_corridor`'s existing
+    majority-covered filter drops these masks with no change of its own.
+
+    Clipping does not make segmentation faster: the model still sees a
+    rectangle of the same size. What it buys is precision.
+    """
+    band = shapely_transform(
+        Transformer.from_crs(WGS84, crs, always_xy=True).transform,
+        corridor.polygon_wgs84,
+    )
+    inside = geometry_mask(
+        [band], out_shape=pixels.shape[1:], transform=transform, invert=True
+    )
+    clipped = pixels.copy()
+    clipped[:, ~inside] = 0
+    return clipped
+
 def fetch_corridor_raster(
     coordinates: Sequence[tuple[float, float]],
     *,
@@ -495,6 +530,8 @@ def fetch_corridor_raster(
     # treated as 0.6 m.
     gsd = item.properties.get("gsd")
     gsd_meters = float(gsd) if gsd is not None else abs(read_transform.a)
+
+    pixels = _clip_to_corridor(pixels, read_transform, crs, corridor)
 
     return Ok(
         CorridorRaster(

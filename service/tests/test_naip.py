@@ -215,7 +215,11 @@ def test_newest_of_several_overlapping_items_is_the_one_read(tmp_path: Path) -> 
     assert raster.item_id == "ca-2022"
     assert raster.acquired.year == 2022
     # The pixels, not just the metadata, came from the newest tile.
-    assert np.all(raster.pixels == 22)
+    # The fill value identifies which item was read. Only the corridor's own
+    # pixels carry it now — everything outside the band is zeroed on the way out.
+    carried = raster.pixels[raster.pixels > 0]
+    assert carried.size > 0
+    assert np.all(carried == 22)
     # And its own ground resolution travelled with them, rather than a default.
     assert raster.gsd_meters == pytest.approx(0.6)
 
@@ -273,6 +277,38 @@ def test_degenerate_line_is_rejected(exploding_opener) -> None:
 
     assert isinstance(result, Invalid)
     assert catalog.calls == []
+
+
+def test_ground_outside_the_corridor_is_zeroed_not_returned(tmp_path: Path) -> None:
+    """A dogleg's bounding box holds far more than the hole.
+
+    The read is windowed to the corridor's *bounding box*, which on a bend is
+    roughly twice the corridor's own area — the rest is whatever else sits
+    there: another fairway, the clubhouse, a car park. Segmentation cannot tell
+    those apart, so on a real hole their features reached classification and
+    competed to be this one's: five tee proposals for a hole with one visible
+    tee, every extra lying outside the band.
+    """
+    dogleg = [(-121.9490, 36.5680), (-121.9520, 36.5700), (-121.9500, 36.5725)]
+    tile = tmp_path / "dogleg.tif"
+    _write_tile(tile, line=dogleg, epsg=32610, gsd=0.6, fill=22)
+    catalog = FakeCatalog([_item(tile, item_id="ca-2022", year=2022, gsd=0.6)])
+
+    result = naip.fetch_corridor_raster(dogleg, catalog=catalog)
+
+    assert isinstance(result, Ok)
+    raster = result.value
+    inside = raster.pixels.any(axis=0)
+    assert inside.any(), "the corridor itself must survive the clip"
+    assert not inside.all(), "a dogleg's bbox corners lie outside the corridor"
+
+    # The band is a real slice of the box, not nearly all of it — otherwise the
+    # clip would buy nothing. Measured on a live dogleg it was 48%.
+    covered = float(inside.mean())
+    assert 0.2 < covered < 0.95
+
+    # Whatever survived is the item's own data, unaltered.
+    assert set(np.unique(raster.pixels[:, inside]).tolist()) == {22}
 
 
 def test_bbox_with_no_naip_coverage_returns_a_stated_no_coverage_result(
