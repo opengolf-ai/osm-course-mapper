@@ -21,12 +21,22 @@ import type { LngLat } from '../geo/coords';
 /**
  * Where the detection service answers.
  *
- * A module constant, the same convention `API_BASE` follows in `opengolf.ts`.
- * This URL ships in the browser bundle and is not a secret: production sits
+ * Set `VITE_DETECT_API_BASE` to point this somewhere; the fallback is a service
+ * running locally, which is where it answers during development.
+ *
+ * This used to be a hardcoded deployment URL guessed from a workspace name that
+ * was never deployed. Every request went to a host that answered 404 with no
+ * cross-origin headers, so the browser reported a bare "Failed to fetch" and
+ * the contributor was told detection had failed — when nothing had been stood
+ * up to fail. A wrong address is worse than an absent one, because it looks
+ * like a broken service rather than a missing setting.
+ *
+ * The URL ships in the browser bundle and is not a secret: production sits
  * behind an authenticating identity proxy, which owns access control, so the
- * service itself carries no auth logic and knowing its address grants nothing.
+ * service carries no auth logic and knowing its address grants nothing.
  */
-export const DETECT_API_BASE = 'https://opengolf--golf-hole-detection-fastapi-app.modal.run';
+export const DETECT_API_BASE =
+  import.meta.env.VITE_DETECT_API_BASE ?? 'http://localhost:8000';
 
 /** How long to leave between polls. Long enough not to hammer a cold container. */
 export const POLL_INTERVAL_MS = 2_000;
@@ -219,8 +229,17 @@ async function readEnvelope(
     response = await fetch(url, { ...init, signal });
   } catch (error) {
     if (isAbort(error, signal)) return { ok: false, result: { status: 'aborted' } };
-    const message = error instanceof Error ? error.message : 'Network request failed';
-    return { ok: false, result: failure('network', message) };
+    /*
+     * A browser reports every unreachable host as a bare "Failed to fetch",
+     * which read as "detection is broken" when the truth was that no service
+     * was running at all. Name the address so the next person sees which of
+     * those two it is without opening the network tab.
+     */
+    const cause = error instanceof Error ? error.message : 'the request did not complete';
+    return {
+      ok: false,
+      result: failure('network', `could not reach the detection service at ${DETECT_API_BASE} (${cause})`),
+    };
   }
 
   let body: unknown;
