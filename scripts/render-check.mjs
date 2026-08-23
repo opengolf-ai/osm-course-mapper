@@ -3,42 +3,103 @@ const raw = renderAll();
 // React separates adjacent text nodes with <!-- -->; strip so needles match the visible string.
 const out = Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, v.replaceAll('<!-- -->', '')]));
 
+// Steps in the review sequence, spelled out here so adding one is a deliberate edit:
+// green, bunkers, tees, fairway, water in play, other hazards.
+const STEP_COUNT = 6;
+
 const CHECKS = [
   ['app',               'Map your home course.'],
   ['app',               'course mapper'],
-  ['boundary',          'Is this the whole course?'],
+  // Search renders its idle state on the server: live results arrive from an effect, never from SSR.
+  ['app',               'Type a course name to search courses in the United States.'],
+  // The boundary is adopted from OpenStreetMap and presented, never approved.
+  ['boundary',          'Here is the course, as OpenStreetMap has it'],
   ['boundary',          '176 '],
-  ['boundary',          'Carmel Bay shoreline'],
-  ['boundaryFlagged',   'You flagged something.'],
-  ['board',             'Jack Neville'],
-  ['board',             'Ready to review'],
-  ['board',             'Needs attention'],
+  ['boundary',          'Holes already on the map'],
+  ['boundary',          'Pebble Beach Clubhouse'],
+  ['boundary',          'Continue to the holes'],
+  ['boundary',          'Imagery © Esri'],
+  ['boundaryBare',      'holds no clubhouse'],
+  // The board's name and card line come from the loaded course record, not a constant.
+  ['board',             'Pebble Beach Golf Links'],
+  ['board',             'par 72 · 6,802 yd · 18 holes'],
+  ['board',             'of 18 holes on the map'],
+  ['board',             'par 4 · 378 yd'],
   ['board',             'On the map'],
   ['board',             'Nothing yet'],
-  ['reviewReady',       'Is that the green?'],
-  ['reviewReady',       'check 1 of 5'],
-  ['reviewReady',       'tee to green 378 yd · card says 378'],
+  // Tile art is a neutral placeholder now — no generated fairway standing in for a real hole.
+  ['board',             'no thumbnail yet'],
+  ['boardAbsent',       'holds no boundary'],
+  // R16: a failed lookup is not zero holes, so no count is printed at all.
+  ['boardUnknown',      'Mapped state unknown'],
+  ['boardUnknown',      'Unknown'],
+  // R7/R8: with nothing proposed the step is kept, not skipped, and says which it is.
+  ['reviewReady',       'We did not find a green here.'],
+  ['reviewReady',       'Nothing to confirm — carry on'],
+  ['reviewReady',       `check 1 of ${STEP_COUNT}`],
+  // The suggestion layer names itself in the legend, beside what the contributor owns.
+  ['reviewReady',       'we suggest — not yours yet'],
+  ['reviewReady',       'you confirmed'],
+  // Every map screen is real imagery now, so the review screen carries the same credits.
+  ['reviewReady',       'Imagery © Esri'],
+  ['reviewReady',       'no line drawn yet · Blue says 378'],
   ['reviewReady',       'A accept · N not there · M missed one'],
-  ['reviewTees',        'Which tee is which?'],
+  ['reviewTees',        'No tee boxes proposed on this hole.'],
   ['reviewTees',        'furthest back'],
   ['reviewTees',        '<option value="Blue">Blue · 378 yd</option>'],
+  // R7: one proposal at a time, counted off the real list rather than hardcoded copy.
+  ['reviewProposals',   'Bunker 2 of 2 — is that sand?'],
+  ['reviewProposals',   '2 / 2 suggested'],
+  ['reviewProposals',   'That is not sand'],
+  // R5: the model's confidence and the NAIP acquisition year, always on screen.
+  ['reviewProposals',   'What the model read'],
+  ['reviewProposals',   '86%'],
+  ['reviewProposals',   'NAIP 2023'],
+  // R5: a 2023 frame is past the three-year line, so it says so in words.
+  ['reviewProposals',   'more than 3 years old'],
+  // R9: a signed GeoTIFF href is not something a browser can draw — stated, not faked.
+  ['reviewProposals',   'We cannot put that frame on screen yet'],
+  // R9: with a renderable rendition of the same window, the overlay is offered.
+  ['reviewCorridor',    'Show me the imagery you read'],
+  ['reviewCorridor',    'NAIP 2023'],
   ['reviewDone',        'Hole 1, confirmed.'],
   ['reviewDone',        'Put hole 1 on the map'],
   ['reviewDone',        'all checks done'],
-  ['reviewDone',        '2 bunkers'],
+  // The summary states only what was actually drawn — the real OSM way for Pebble hole 1.
+  ['reviewDone',        'playing line, 382 yd over 3 points'],
   ['reviewAttention',   'This one does not add up.'],
   ['reviewAttention',   'The green up by the cypress'],
   ['reviewAttention',   'matches the card'],
-  ['reviewAttention',   'tee to green 250 yd · card says 331'],
+  ['reviewAttention',   '250 yd tee to green · Blue says 331'],
   ['reviewLocateEmpty', 'Show us where this hole plays.'],
   ['reviewLocateEmpty', 'Click where you tee off.'],
-  ['reviewLocateEmpty', 'first, the outline of the hole'],
-  ['reviewLocateEmpty', 'tee to green — yd'],
-  ['reviewLocateDone',  'Find the rest of the hole'],
-  ['reviewLocateDone',  'yd tee to green'],
+  ['reviewLocateEmpty', 'draw the line the hole plays'],
+  ['reviewLocateEmpty', 'no line drawn yet · Blue says 495'],
+  ['reviewLocateEmpty', '0 points marked'],
+  // R15: the tee set is chosen, not assumed.
+  ['reviewLocateEmpty', 'from the Blue tees'],
+  ['reviewLocateEmpty', 'from the Red tees'],
+  // Mid-draw: undo and finish are both offered, and finish is not yet the point.
+  ['reviewLocateDrawing', 'Undo last point'],
+  ['reviewLocateDrawing', 'Finish the line'],
+  ['reviewLocateDrawing', '2 points marked'],
+  ['reviewLocateDrawing', 'Click where the hole bends, then the green you putt on.'],
+  // The dogleg measures 382 along its path against a 378 card — inside 10%.
+  ['reviewLocateDone',  'Save this line and carry on'],
+  ['reviewLocateDone',  '382 yd along your line · Blue says 378'],
+  ['reviewLocateDone',  'the Blue tees say 378 — close enough'],
+  // R8/R10: a hole already in OpenStreetMap opens showing it, and says whose it is.
+  ['reviewOsmHole',     'Already in OpenStreetMap'],
+  ['reviewOsmHole',     'Here is this hole, as the map has it.'],
+  ['reviewOsmHole',     'a green'],
+  // The apostrophe renders escaped, so the needle stops short of it.
+  ['reviewOsmHole',     '382 yd along OpenStreetMap'],
+  ['reviewOsmHole',     'Draw my own line instead'],
   ['reviewAddMode',     'Click the map where the bunker is.'],
   ['complete',          'Hole 1 is on the map.'],
+  ['complete',          'Anyone pulling Pebble Beach Golf Links'],
   ['complete',          'signed as your OpenStreetMap account'],
+  ['complete',          '3 of 18 holes done'],
 ];
 
 let bad = 0;

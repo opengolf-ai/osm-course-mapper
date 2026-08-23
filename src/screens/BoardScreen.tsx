@@ -1,18 +1,15 @@
-import {
-  COURSE_META,
-  COURSE_NAME,
-  MINIS,
-  PARS,
-  STATUS_META,
-  YDS,
-  type HoleStatus,
-} from '../data/course';
+import type { OsmLookup } from '../api/overpass';
+import { STATUS_META, type HoleStatus } from '../data/course';
+import { holeYardage, type CourseSession } from '../state/courseSession';
 import { Badge } from '../ds';
 import { HoverButton } from '../components/HoverButton';
 
 interface BoardScreenProps {
+  course: CourseSession;
   holeStatus: HoleStatus[];
   doneCount: number;
+  /** What OpenStreetMap answered for this course. Decides the header and the banner. */
+  osm: OsmLookup;
   onOpenHole: (index: number) => void;
   onBack: () => void;
 }
@@ -22,16 +19,61 @@ const PROGRESS_FILL: Record<HoleStatus, string> = {
   ready: 'rgba(62,207,180,.28)',
   attention: 'var(--amber-500)',
   unmapped: 'rgba(255,255,255,.12)',
+  /* Hatched, so an unknown course does not read as an empty one at a glance. */
+  unknown:
+    'repeating-linear-gradient(45deg, rgba(188,217,232,.34) 0 3px, rgba(255,255,255,.06) 3px 6px)',
 };
 
-const STROKE: Record<HoleStatus, string> = {
-  complete: '#a3dcc7',
-  attention: '#eec98a',
-  ready: '#3ecfb4',
-  unmapped: '#3ecfb4',
+/** The tile's image slot until real per-hole imagery lands: flat, and plainly empty. */
+const TILE_PLACEHOLDER: React.CSSProperties = {
+  position: 'relative',
+  height: 88,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  background:
+    'repeating-linear-gradient(135deg, rgba(255,255,255,.035) 0 6px, rgba(255,255,255,0) 6px 12px), var(--green-950)',
+  borderBottom: '1px solid rgba(255,255,255,.08)',
 };
 
-export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: BoardScreenProps) {
+/** The one banner the board carries, stating what the OpenStreetMap lookup found. */
+function osmBanner(osm: OsmLookup, courseName: string): { tone: 'warning' | 'info'; text: string } | null {
+  if (osm.status === 'absent') {
+    return {
+      tone: 'info',
+      text:
+        `OpenStreetMap holds no boundary for ${courseName} yet, so there was nothing to show you ` +
+        'first. Every hole here starts from scratch.',
+    };
+  }
+  if (osm.status === 'unknown') {
+    return {
+      tone: 'warning',
+      text:
+        `We could not check OpenStreetMap — ${osm.message}. What is already mapped is unknown, ` +
+        'not empty, so nothing below is counted until it answers.',
+    };
+  }
+  if (osm.status === 'pending') {
+    return { tone: 'info', text: 'Still checking what OpenStreetMap already holds for this course.' };
+  }
+  return null;
+}
+
+export function BoardScreen({
+  course,
+  holeStatus,
+  doneCount,
+  osm,
+  onOpenHole,
+  onBack,
+}: BoardScreenProps) {
+  /* The course decides how many tiles there are; the status list only colors them. */
+  const statusAt = (i: number): HoleStatus => holeStatus[i] ?? 'unmapped';
+  /* R16: with no answer from OpenStreetMap there is no number to print. */
+  const countKnown = osm.status === 'found' || osm.status === 'absent';
+  const banner = osmBanner(osm, course.name);
+
   return (
     <section>
       <div
@@ -54,7 +96,7 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
               margin: '0 0 6px',
             }}
           >
-            {COURSE_NAME}
+            {course.name}
           </h1>
           <div
             style={{
@@ -64,33 +106,66 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
               fontVariantNumeric: 'tabular-nums',
             }}
           >
-            {COURSE_META}
+            {course.meta}
           </div>
+          {/* Said out loud rather than shown as blank tiles, per R5. */}
+          {!course.cardAvailable && (
+            <div style={{ fontSize: 13, color: 'var(--amber-500)', marginTop: 6 }}>
+              A scorecard is not in this course’s record — pars and yardages are unknown.
+            </div>
+          )}
         </div>
         <div style={{ width: 360 }}>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
-            <span
-              style={{
-                fontFamily: 'var(--font-mono)',
-                fontSize: 22,
-                color: '#fff',
-                fontVariantNumeric: 'tabular-nums',
-              }}
-            >
-              {doneCount}
-            </span>
-            <span style={{ fontSize: 14, color: 'var(--green-200)' }}>of 18 holes on the map</span>
+            {countKnown ? (
+              <>
+                <span
+                  style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 22,
+                    color: '#fff',
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  {doneCount}
+                </span>
+                <span style={{ fontSize: 14, color: 'var(--green-200)' }}>
+                  of {course.holes.length} holes on the map
+                </span>
+              </>
+            ) : (
+              <span style={{ fontSize: 14, color: 'var(--green-200)' }}>
+                Mapped state unknown — OpenStreetMap has not answered
+              </span>
+            )}
           </div>
           <div style={{ display: 'flex', gap: 3 }}>
-            {holeStatus.map((st, i) => (
+            {course.holes.map((hole, i) => (
               <span
-                key={i}
-                style={{ flex: 1, height: 8, borderRadius: 2, background: PROGRESS_FILL[st] }}
+                key={hole.number}
+                style={{ flex: 1, height: 8, borderRadius: 2, background: PROGRESS_FILL[statusAt(i)] }}
               />
             ))}
           </div>
         </div>
       </div>
+
+      {banner && (
+        <div
+          style={{
+            margin: '18px 32px 0',
+            background: banner.tone === 'warning' ? 'rgba(201,138,21,.14)' : 'rgba(43,127,168,.14)',
+            border: `1px solid ${banner.tone === 'warning' ? 'rgba(201,138,21,.5)' : 'rgba(43,127,168,.5)'}`,
+            borderRadius: 'var(--radius-lg)',
+            padding: '13px 16px',
+            fontSize: 14,
+            color: banner.tone === 'warning' ? '#f6e3bd' : '#cfe6f2',
+            textWrap: 'pretty',
+          }}
+        >
+          {banner.text}
+        </div>
+      )}
 
       <div
         style={{
@@ -100,11 +175,13 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
           padding: '22px 32px 8px',
         }}
       >
-        {holeStatus.map((st, i) => {
+        {course.holes.map((hole, i) => {
+          const st = statusAt(i);
           const meta = STATUS_META[st];
+          const yd = holeYardage(course, i);
           return (
             <HoverButton
-              key={i}
+              key={hole.number}
               onClick={() => onOpenHole(i)}
               style={{
                 display: 'block',
@@ -123,41 +200,23 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
                 borderColor: 'rgba(255,255,255,.22)',
               }}
             >
-              <div style={{ position: 'relative', height: 88, background: '#2a3f24' }}>
-                <svg
-                  viewBox="0 0 120 88"
-                  preserveAspectRatio="none"
-                  style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block' }}
+              {/*
+               * A neutral placeholder, not a drawing of a hole. Per-hole thumbnails
+               * off real imagery are deferred, and a generated silhouette here would
+               * be a shape claiming to be this hole when it is not.
+               */}
+              <div style={TILE_PLACEHOLDER}>
+                <span
+                  style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 10,
+                    letterSpacing: '.12em',
+                    textTransform: 'uppercase',
+                    color: 'rgba(211,239,228,.42)',
+                  }}
                 >
-                  <rect width="120" height="88" fill="#2c4126" />
-                  <ellipse cx="20" cy="18" rx="26" ry="20" fill="#1d2f16" />
-                  <ellipse cx="104" cy="74" rx="24" ry="18" fill="#1d2f16" />
-                  <path d={MINIS[i % 3]} fill="#527d3b" />
-                  {st !== 'unmapped' && (
-                    <g>
-                      <ellipse
-                        cx={92}
-                        cy={20}
-                        rx={9}
-                        ry={7}
-                        fill="#8bb256"
-                        stroke={STROKE[st]}
-                        strokeWidth={1.6}
-                        strokeDasharray={st === 'complete' ? undefined : '3 3'}
-                      />
-                      <ellipse
-                        cx={74}
-                        cy={34}
-                        rx={5}
-                        ry={3.4}
-                        fill="#ded1a8"
-                        stroke={STROKE[st]}
-                        strokeWidth={1.2}
-                        strokeDasharray={st === 'complete' ? undefined : '3 3'}
-                      />
-                    </g>
-                  )}
-                </svg>
+                  no thumbnail yet
+                </span>
               </div>
               <div style={{ padding: '12px 14px 14px' }}>
                 <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 9 }}>
@@ -170,7 +229,7 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
                       letterSpacing: '-.02em',
                     }}
                   >
-                    {i + 1}
+                    {hole.number}
                   </span>
                   <span
                     style={{
@@ -181,7 +240,7 @@ export function BoardScreen({ holeStatus, doneCount, onOpenHole, onBack }: Board
                       whiteSpace: 'nowrap',
                     }}
                   >
-                    par {PARS[i]} · {YDS[i]} yd
+                    par {hole.par ?? '—'} · {yd ?? '—'} yd
                   </span>
                 </div>
                 <Badge tone={meta.tone} dot>

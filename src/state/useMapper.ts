@@ -1,76 +1,480 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Geometry, LineString, Polygon } from 'geojson';
 import {
-  INITIAL_STATUS,
-  REVIEW_DIAGONAL,
-  REVIEW_VIEWBOX,
-  SHAPES,
+  decisionFor,
+  recordDecisions,
+  requestProposals as askTheDetectionService,
+  type DecisionOutcome,
+  type DetectRequest,
+  type DetectionImagery,
+  type Proposal,
+  type TeeSetRef,
+} from '../api/detect';
+import type { OsmHole, OsmHoleFeature, OsmLookup } from '../api/overpass';
+import {
   STEPS,
-  TEES,
   TEE_IDS,
-  YARDAGE_TOLERANCE,
-  YDS,
+  stepAccept,
+  stepNote,
+  stepTitle,
   type HoleStatus,
   type Step,
   type TeeId,
 } from '../data/course';
-import { corridorPath, distance, ell, rr, type Point } from '../data/geometry';
+import {
+  courseFeature,
+  labelPoint,
+  lineYards,
+  playingLine,
+  polygon,
+  type CourseFeature,
+  type FeatureKind,
+  type LngLat,
+} from '../geo/coords';
+import {
+  defaultTeeAssign,
+  holeStatusesFrom,
+  holeYardage,
+  scorecardFor,
+  type CourseSession,
+} from './courseSession';
 
 export type Screen = 'search' | 'boundary' | 'board' | 'review' | 'complete';
 export type ReviewMode = 'ready' | 'locate' | 'attention';
 
+/**
+ * How far a measured playing line may sit from the card before it reads as a
+ * mismatch, as a fraction of the card yardage (KTD8).
+ *
+ * This replaced a flat 25 yards, which was tuned back when the measurement was
+ * derived from the card and so could never disagree with it. A real measurement
+ * can, and 25 yards is punishing on a 543-yard par 5 while it is loose enough on
+ * a 106-yard par 3 to accept a line drawn to the wrong green.
+ */
+export const YARDAGE_TOLERANCE_FRACTION = 0.1;
+
+/** The two verdicts a finished line gets. Exported so screens and tests agree on the words. */
+export const LOCATE_CLOSE_ENOUGH = 'close enough';
+export const LOCATE_CHECK_YOUR_WORK = 'check your work';
+
+/** A geographic extent in WGS84: `[west, south, east, north]`, the order `BaseMap` takes. */
+export type MapBounds = [number, number, number, number];
+
+/**
+ * A feature the contributor added themselves — the "we missed one" branch.
+ *
+ * Geometry, not a path string (KTD6): what is stored here has to be able to
+ * become an OpenStreetMap way, and a `d` attribute in a viewBox cannot.
+ */
 export interface ExtraShape {
   id: string;
-  d: string;
   label: string;
+  feature: CourseFeature<Polygon>;
 }
+
+/** Where a caption is anchored on the imagery: a real coordinate, projected at draw time. */
+export interface FeatureLabel {
+  key: string;
+  text: string;
+  position: LngLat;
+}
+
+/**
+ * Where the playing line on screen came from.
+ *
+ * The distinction is the whole reason this field exists: a line lifted off
+ * OpenStreetMap is not something the contributor drew, and drawing it in the
+ * colour reserved for what they confirmed would credit them with a shape they
+ * have never looked at (R8). The moment they touch it — undo a point, start
+ * over — it becomes `drawn`, because from then on it is theirs.
+ */
+export type LineSource = 'drawn' | 'osm';
+
+/**
+ * The ordered points of the playing line, whether the contributor has said they
+ * are done, and where the line came from. Fewer than two points is a line still
+ * being drawn, so it can never be finished (R8).
+ */
+export interface LocateState {
+  points: LngLat[];
+  finished: boolean;
+  source: LineSource;
+}
+
+/**
+ * Where a detection request for the open hole stands (R1, R12).
+ *
+ * Five states, not four: `no_coverage` is detection saying "there is nothing to
+ * propose here" and `failed` is detection not answering at all. Rendering the
+ * first as the second would tell a contributor the tool is broken when it simply
+ * had nothing to say — and neither one stops them mapping the hole by hand.
+ */
+export type DetectionState =
+  | { status: 'idle' }
+  | { status: 'working' }
+  | {
+      status: 'ready';
+      jobId: string;
+      proposals: Proposal[];
+      /** The corridor raster inference read, for provenance and the U8 overlay. */
+      imagery: DetectionImagery | null;
+      /** Card tee sets detection found no mask for. */
+      missingTeeSets: TeeSetRef[];
+    }
+  | { status: 'no_coverage'; message: string }
+  | { status: 'failed'; message: string };
 
 export interface MapperState {
   screen: Screen;
+  /** The course the contributor opened. Null until a detail record loads. */
+  course: CourseSession | null;
   query: string;
   mode: ReviewMode;
   holeIndex: number;
-  locate: { tee: Point | null; green: Point | null };
+  locate: LocateState;
+  /** The `yardages` key of the tee set being measured against (R15). Null falls back to the longest. */
+  teeSet: string | null;
   step: number;
+  /**
+   * Which proposal within the current step is being asked about (R7).
+   *
+   * The step alone cannot say: a step reviews a variable-length list of proposals
+   * of one kind, and the contributor answers about exactly one of them at a time.
+   * Reset whenever the step changes, and whenever a hole is opened.
+   */
+  proposalIndex: number;
+  /** Proposal ids the contributor confirmed. One entry per explicit human act. */
   confirmed: string[];
+  /** Proposal ids the contributor rejected — the map side of `rejections`. */
   removed: string[];
+  /**
+   * Proposal ids the contributor said a ball can find (R14).
+   *
+   * Separate from `confirmed` because they answer different questions: confirmed
+   * is "yes, that is water", a hazard is "yes, and it is in play". Water can be
+   * confirmed without ever becoming a hazard, and nothing but an explicit yes
+   * puts an id in here.
+   */
+  hazards: string[];
+  /**
+   * Every proposal the contributor rejected on this course, keyed by hole number
+   * (R10).
+   *
+   * Course-level rather than per-hole state because every other slot that could
+   * hold this — `detect`, `removed`, `extra` — is cleared on navigation, so a
+   * per-hole home would keep only the hole last visited. This is an in-session
+   * cache in front of the server-side store (KTD10), not the system of record:
+   * `recordDecisions` posts each rejection as it is made, and this is what the
+   * screen can show without a round trip.
+   */
+  rejections: Record<number, Proposal[]>;
   extra: ExtraShape[];
+  /**
+   * What OpenStreetMap already outlines on the open hole — its green, bunkers,
+   * fairway, tees (R10).
+   *
+   * Per hole and never carried across, like `detect`: these are shapes filed
+   * against one hole number, and showing the 3rd's bunkers over the 4th would be
+   * worse than showing none. Read-only here — nothing in the review sequence
+   * confirms or rejects them, because there is nothing to decide: they are
+   * already in the map.
+   */
+  existing: OsmHoleFeature[];
+  /**
+   * What OpenStreetMap calls the open hole — "Lakes #3" — when that is not
+   * simply its number on the card.
+   *
+   * A club with three nines pairs them into three eighteens, so card hole 12 can
+   * be OSM's Valley #3. The contributor is looking at a hole they know by one
+   * name and a map that files it under another; saying which is the difference
+   * between "this looks wrong" and "this is the same hole".
+   */
+  osmHoleRef: string | null;
   addMode: string | null;
   lastAction: string;
   attentionResolved: boolean;
-  flagged: boolean;
+  /** What OpenStreetMap answered for the open course. Drives routing and the board. */
+  osm: OsmLookup;
+  /** Where the detection request for the open hole stands. Per hole, never carried across. */
+  detect: DetectionState;
   teeAssign: Record<TeeId, string>;
   holeStatus: HoleStatus[];
 }
 
+const EMPTY_LINE: LocateState = { points: [], finished: false, source: 'drawn' };
+
+/** The hole OpenStreetMap holds for this number, or null when it holds none. */
+export function osmHoleFor(osm: OsmLookup, holeNumber: number): OsmHole | null {
+  if (osm.status !== 'found') return null;
+  return osm.course.holes.find((hole) => hole.ref === holeNumber) ?? null;
+}
+
+/**
+ * The line and the outlines OSM already holds for a hole, as the state that
+ * opens on it.
+ *
+ * A hole with nothing in OpenStreetMap opens exactly as it always did — an empty
+ * line and no outlines — so this is additive: it can only ever put on screen
+ * something that genuinely exists in the map.
+ */
+export function seedFromOsm(hole: OsmHole | null): {
+  locate: LocateState;
+  existing: OsmHoleFeature[];
+  osmHoleRef: string | null;
+} {
+  if (!hole || hole.line.coordinates.length < 2) {
+    return { locate: EMPTY_LINE, existing: [], osmHoleRef: null };
+  }
+  return {
+    /* Finished, because it is: OSM's line is a whole line, not a half-drawn one.
+     * That is what puts the rail straight into "here is what is here" rather
+     * than asking for a tee click over a hole that already has one. */
+    locate: {
+      points: hole.line.coordinates.map(([lng, lat]) => [lng, lat] as LngLat),
+      finished: true,
+      source: 'osm',
+    },
+    existing: hole.features,
+    /* Only worth saying when it is not just the card number back again. */
+    osmHoleRef: hole.nine ? hole.osmRef : null,
+  };
+}
+
+/** Nothing asked for yet. Every route into a hole starts here. */
+const NO_DETECTION: DetectionState = { status: 'idle' };
+
+/**
+ * Bounds the service enforces on a request, applied before sending rather than
+ * after being refused: it rejects unknown fields and out-of-range values with a
+ * 422, and a contributor should not read a validation error about a par the
+ * course record supplied and they never touched.
+ */
+const PAR_RANGE = { min: 3, max: 7 } as const;
+const TEE_YARDS_RANGE = { min: 30, max: 1312.3 } as const;
+const MAX_TEE_SETS = 8;
+
 export const INITIAL: MapperState = {
   screen: 'search',
+  course: null,
   query: '',
   mode: 'ready',
   holeIndex: 0,
-  locate: { tee: null, green: null },
+  locate: EMPTY_LINE,
+  teeSet: null,
   step: 0,
+  proposalIndex: 0,
   confirmed: [],
   removed: [],
+  hazards: [],
+  rejections: {},
   extra: [],
+  existing: [],
+  osmHoleRef: null,
   addMode: null,
   lastAction: '',
   attentionResolved: false,
-  flagged: false,
-  teeAssign: { tee1: 'Blue', tee2: 'Gold', tee3: 'White', tee4: 'Red' },
-  holeStatus: INITIAL_STATUS.slice(),
+  osm: { status: 'pending' },
+  detect: NO_DETECTION,
+  /* Named for real when a course loads — `defaultTeeAssign` reads the course's own sets. */
+  teeAssign: { tee1: '', tee2: '', tee3: '', tee4: '' },
+  /* No course, no holes. Statuses arrive with the course, from OpenStreetMap. */
+  holeStatus: [],
 };
 
-/** The noun the "we missed one" branch is about, per review step. */
-function missingNoun(stepId: string): string {
-  if (stepId === 'bunkers') return 'bunker';
-  if (stepId === 'tees') return 'tee box';
-  if (stepId === 'extras') return 'water';
-  if (stepId === 'green') return 'green';
-  return 'fairway edge';
+/** What an added feature is, and roughly how big one is, in yards of radius. */
+const ADDED_FEATURE: Record<string, { kind: FeatureKind; radiusYards: number }> = {
+  water: { kind: 'water', radiusYards: 40 },
+  'tee box': { kind: 'tee', radiusYards: 14 },
+  green: { kind: 'green', radiusYards: 22 },
+  bunker: { kind: 'bunker', radiusYards: 12 },
+  'fairway edge': { kind: 'fairway', radiusYards: 28 },
+  /*
+   * The Other Hazards step takes anything we do not classify — a waste area, a
+   * ditch, a stand of trees. `rough` is the nearest kind this client models, and
+   * the contributor's own word rides along in `label`, so nothing they said is
+   * lost even though the kind is approximate.
+   */
+  hazard: { kind: 'rough', radiusYards: 30 },
+};
+
+const METRES_PER_YARD = 0.9144;
+const METRES_PER_DEGREE_LATITUDE = 111_320;
+
+/**
+ * A rough circle around a click, in real coordinates.
+ *
+ * The contributor is saying "there is one here", not tracing its edge, so the
+ * shape is a placeholder of about the right size rather than a claim about the
+ * feature's outline. Vertex editing is the deferred escape hatch for that.
+ */
+export function bufferedAround(center: LngLat, radiusYards: number, steps = 24): Polygon {
+  const metres = radiusYards * METRES_PER_YARD;
+  const dLat = metres / METRES_PER_DEGREE_LATITUDE;
+  /* Longitude degrees shrink towards the poles; the clamp keeps the maths finite. */
+  const dLng = dLat / Math.max(Math.cos((center[1] * Math.PI) / 180), 0.01);
+  const ring: LngLat[] = [];
+  for (let i = 0; i < steps; i += 1) {
+    const angle = (i / steps) * Math.PI * 2;
+    ring.push([center[0] + Math.cos(angle) * dLng, center[1] + Math.sin(angle) * dLat]);
+  }
+  return polygon(ring);
+}
+
+/** Every coordinate in a geometry, flattened, for framing. */
+function coordinatesOf(geometry: Geometry): LngLat[] {
+  switch (geometry.type) {
+    case 'Point':
+      return [geometry.coordinates as LngLat];
+    case 'MultiPoint':
+    case 'LineString':
+      return geometry.coordinates as LngLat[];
+    case 'MultiLineString':
+    case 'Polygon':
+      return geometry.coordinates.flat() as LngLat[];
+    case 'MultiPolygon':
+      return geometry.coordinates.flat(2) as LngLat[];
+    default:
+      return [];
+  }
+}
+
+/**
+ * The extent of a set of points, opened out so the geometry is not flush to the
+ * edge.
+ *
+ * The margin is a sixth of the span rather than a third. `BaseMap` already
+ * fits with 56px of screen padding on top of this, and the frame's job is to put
+ * the contributor on the hole — a third of the hole's length of empty grass on
+ * every side is most of the screen spent on the ones either side of it.
+ */
+function boundsOf(points: readonly LngLat[], padFraction = 0.16): MapBounds | null {
+  if (points.length === 0) return null;
+  let west = points[0][0];
+  let east = points[0][0];
+  let south = points[0][1];
+  let north = points[0][1];
+  for (const [lng, lat] of points) {
+    west = Math.min(west, lng);
+    east = Math.max(east, lng);
+    south = Math.min(south, lat);
+    north = Math.max(north, lat);
+  }
+  /* A single point, or a line with no spread on one axis, still needs an extent. */
+  const padLng = Math.max((east - west) * padFraction, 0.0008);
+  const padLat = Math.max((north - south) * padFraction, 0.0008);
+  return [west - padLng, south - padLat, east + padLng, north + padLat];
+}
+
+/** The whole course: OSM's own extent when it holds one, otherwise a box around its coordinate. */
+function courseBounds(s: MapperState): MapBounds | null {
+  if (s.osm.status === 'found') return s.osm.course.bbox;
+  const course = s.course;
+  if (!course) return null;
+  const dLat = 0.009;
+  const dLng = dLat / Math.max(Math.cos((course.latitude * Math.PI) / 180), 0.01);
+  return [
+    course.longitude - dLng,
+    course.latitude - dLat,
+    course.longitude + dLng,
+    course.latitude + dLat,
+  ];
+}
+
+/**
+ * What the detection service is asked about this hole: the line as drawn, plus
+ * whatever the card knows about it.
+ *
+ * Tee sets are built from `course.tees` joined to the hole's own `yardages`
+ * rather than from `scorecardFor`, whose rows drop the colour key — and the key
+ * is what the service echoes back on a matched tee proposal, so the review
+ * sequence can open the tee step prefilled.
+ */
+export function detectRequestFor(s: MapperState): DetectRequest {
+  const hole = s.course?.holes[s.holeIndex] ?? null;
+  const request: DetectRequest = {
+    line: s.locate.points.map((point): LngLat => [point[0], point[1]]),
+  };
+
+  const par = hole?.par ?? null;
+  if (par !== null && par >= PAR_RANGE.min && par <= PAR_RANGE.max) request.par = par;
+
+  const teeSets: TeeSetRef[] = (s.course?.tees ?? [])
+    .map((tee) => ({ name: tee.name, key: tee.color, yards: hole?.yardages[tee.color] }))
+    .filter(
+      (tee): tee is TeeSetRef =>
+        typeof tee.yards === 'number' &&
+        tee.yards >= TEE_YARDS_RANGE.min &&
+        tee.yards <= TEE_YARDS_RANGE.max,
+    )
+    .slice(0, MAX_TEE_SETS);
+  if (teeSets.length > 0) request.teeSets = teeSets;
+
+  return request;
 }
 
 const currentStep = (s: MapperState): Step => STEPS[Math.min(s.step, STEPS.length - 1)];
 const isBlocked = (s: MapperState) => s.mode === 'attention' && !s.attentionResolved;
+
+/** Everything detection proposed for the open hole, or nothing at all. */
+export function proposalsOf(s: MapperState): Proposal[] {
+  return s.detect.status === 'ready' ? s.detect.proposals : [];
+}
+
+/** The hole number the open hole carries on the card — the key rejections are filed under. */
+export function openHoleNumber(s: MapperState): number {
+  return s.course?.holes[s.holeIndex]?.number ?? s.holeIndex + 1;
+}
+
+/**
+ * The proposals one step reviews, in the order they came back.
+ *
+ * Derived at runtime from the detection answer rather than declared on the step,
+ * because the step cannot know how many bunkers a hole has. A step with no
+ * detection class behind it, and a step detection said nothing about, both come
+ * back empty — and both are still shown (see `Step.empty`).
+ *
+ * Rejected proposals stay in the list: the list is what the contributor walks,
+ * and a decided proposal keeps its position so the count they were told about
+ * ("bunker 2 of 3") does not renumber underneath them.
+ */
+export function proposalsForStep(s: MapperState, step: Step): Proposal[] {
+  if (!step.kind) return [];
+  return proposalsOf(s).filter((proposal) => proposal.kind === step.kind);
+}
+
+/**
+ * The one proposal the sequence is asking about right now, or nothing — a step
+ * detection said nothing about, or the end of the sequence.
+ *
+ * The same lookup the three answers make, so an answer bound to an id is bound
+ * to the id those answers will check it against.
+ */
+function activeProposalId(s: MapperState): string | undefined {
+  const step = STEPS[s.step];
+  if (!step) return undefined;
+  return proposalsForStep(s, step)[s.proposalIndex]?.id;
+}
+
+/**
+ * Whether an answer that was bound to a proposal is still about the proposal on
+ * screen (R7, KTD1).
+ *
+ * An answer is about one feature, and the thing that rendered it knew which one.
+ * Passing that id back makes the binding real: a queued or repeated event that
+ * arrives once the sequence has moved on answers for nothing rather than for
+ * whatever feature happens to be next.
+ *
+ * A caller that omits the id answers about whatever is active, exactly as before
+ * — and a non-string counts as omitted on purpose, which is also why the
+ * parameter is `unknown` rather than `string`. React hands a click handler its
+ * mouse event, so `onClick={actions.accept}` in the rail calls the answer with a
+ * `SyntheticEvent`; that is the plain unbound case, and reading it as an id would
+ * silently deaden every button on the screen.
+ */
+function answersFor(active: Proposal | null, forProposal?: unknown): boolean {
+  if (typeof forProposal !== 'string') return true;
+  return active !== null && active.id === forProposal;
+}
 
 /**
  * Everything the review screen draws, derived from state alone.
@@ -78,64 +482,259 @@ const isBlocked = (s: MapperState) => s.mode === 'attention' && !s.attentionReso
  */
 export function computeDerived(s: MapperState) {
   const hi = s.holeIndex;
-  const cardYds = YDS[hi];
+  const course = s.course;
+  const hole = course?.holes[hi] ?? null;
+  /*
+   * The yardage of the tee set the contributor started from (R15), not whichever
+   * set happens to be longest. Null, never 0, when the record carries no yardage
+   * at all: the screens say "—" for it.
+   */
+  const fromSelectedTee = hole && s.teeSet ? hole.yardages[s.teeSet] : undefined;
+  const cardYds = fromSelectedTee ?? (course ? holeYardage(course, hi) : null);
   const q = currentStep(s);
   const allDone = s.step >= STEPS.length;
   const isLocate = s.mode === 'locate';
-  const blocked = isBlocked(s) && !isLocate;
 
-  const { tee, green } = s.locate;
-  const locateDone = !!(tee && green);
-  const locateYds = locateDone ? Math.round(distance(tee!, green!) * (cardYds / REVIEW_DIAGONAL)) : 0;
-  const locateOff = Math.abs(locateYds - cardYds);
-  const corridor = locateDone ? corridorPath(tee!, green!) : null;
+  const points = s.locate.points;
+  const locateLine: LineString | null = points.length >= 2 ? playingLine(points) : null;
+  /* Measured along every segment (KTD7) — a dogleg's card follows the path, not the chord. */
+  const measuredYards = lineYards(points);
+  const locateYds = Math.round(measuredYards);
+  const locateDone = s.locate.finished && points.length >= 2;
+  const canFinish = points.length >= 2 && !s.locate.finished;
 
-  const activeIds = s.addMode
-    ? []
-    : blocked
-      ? ['greenAlt', 'green']
-      : allDone
-        ? []
-        : q.targets.filter((t) => !s.removed.includes(t));
+  const locateTolerance = cardYds === null ? null : cardYds * YARDAGE_TOLERANCE_FRACTION;
+  const locateOff = cardYds === null ? Infinity : Math.abs(measuredYards - cardYds);
+  const locateWithinTolerance = locateTolerance !== null && locateOff <= locateTolerance;
+  const locateVerdict =
+    !locateDone || cardYds === null
+      ? null
+      : locateWithinTolerance
+        ? LOCATE_CLOSE_ENOUGH
+        : LOCATE_CHECK_YOUR_WORK;
 
-  const allIds = Object.keys(SHAPES).filter((k) => (k === 'greenAlt' ? blocked : true));
-  const confirmedIds = s.confirmed.filter((c) => allIds.includes(c));
-  const pendingIds = allIds.filter(
-    (k) => !confirmedIds.includes(k) && !activeIds.includes(k) && !s.removed.includes(k),
+  /*
+   * One collection for the map, every feature carrying the status its styling is
+   * matched on. Three arrays became one property (KTD6) — a `match` expression on
+   * `status` is what the layer paint reads.
+   */
+  const holeNumber = openHoleNumber(s);
+  const holeRef = String(holeNumber);
+  /*
+   * A line lifted off OpenStreetMap is `existing`, not `confirmed`: it is
+   * already in the map and nobody in this session has ruled on it. Drawing it in
+   * the confirmed colour would credit the contributor with a shape they have not
+   * so much as looked at (R8).
+   */
+  const fromOsm = s.locate.source === 'osm';
+  const lineStatus = fromOsm ? 'existing' : locateDone ? 'confirmed' : 'active';
+  const features: CourseFeature[] = [];
+
+  /*
+   * What OpenStreetMap outlines on this hole, under everything else (R10).
+   *
+   * First into the collection so the contributor's own work, and anything they
+   * are being asked about, draws over the top of it rather than under it.
+   */
+  for (const feature of s.existing) {
+    features.push(
+      courseFeature(feature.kind, feature.geometry, {
+        ref: holeRef,
+        status: 'existing',
+        label: feature.name ?? feature.tag.replace(/_/g, ' '),
+        osmId: feature.id,
+      }),
+    );
+  }
+
+  if (locateLine) {
+    features.push(
+      courseFeature('hole', locateLine, {
+        ref: holeRef,
+        status: lineStatus,
+        label: 'playing line',
+      }),
+    );
+  }
+  /*
+   * The ends of the line, and every point in between the contributor placed
+   * themselves. An OSM way carries as many vertices as its mapper felt like
+   * drawing — a dozen down one fairway is normal — and a circle on each of them
+   * reads as a dozen decisions somebody made, so only its tee and its green get
+   * one.
+   */
+  points.forEach((position, i) => {
+    const isEnd = i === 0 || i === points.length - 1;
+    if (fromOsm && !isEnd) return;
+    features.push(
+      courseFeature(
+        'hole',
+        { type: 'Point', coordinates: [...position] },
+        {
+          ref: holeRef,
+          status: lineStatus,
+          label: i === 0 ? 'tee' : i === points.length - 1 && locateDone ? 'green' : 'turn',
+        },
+      ),
+    );
+  });
+  /*
+   * Proposals (R8). Every one of them draws as `proposed` until the contributor
+   * has said otherwise about that one feature — never `confirmed`, and never
+   * silently, which is what the suggestion layer in `ReviewScreen` is styled for.
+   * A rejected proposal leaves the map entirely; it survives in `rejections`.
+   */
+  const proposals = proposalsOf(s);
+  const confirmedIds = new Set(s.confirmed);
+  const rejectedIds = new Set(s.removed);
+  const hazardIds = new Set(s.hazards);
+  const step = currentStep(s);
+  const stepProposals = proposalsForStep(s, step);
+  const activeProposal = stepProposals[s.proposalIndex] ?? null;
+
+  for (const proposal of proposals) {
+    if (rejectedIds.has(proposal.id)) continue;
+    const isConfirmed = confirmedIds.has(proposal.id);
+    features.push(
+      courseFeature(proposal.kind, proposal.geometry, {
+        ref: holeRef,
+        status: isConfirmed ? 'confirmed' : 'proposed',
+        /* The one being asked about, so the suggestion layer can pick it out. */
+        focus: !isConfirmed && activeProposal?.id === proposal.id,
+        label: proposal.kind,
+        proposalId: proposal.id,
+        /* U8 reads these off the feature as well as off the proposal. */
+        confidence: proposal.confidence,
+        acquired: proposal.acquired,
+        /* R14: false until an explicit in-play yes, never merely by being water. */
+        ...(proposal.kind === 'water' ? { hazard: hazardIds.has(proposal.id) } : {}),
+      }),
+    );
+  }
+
+  for (const added of s.extra) {
+    features.push({
+      ...added.feature,
+      properties: { ...added.feature.properties, status: 'confirmed', label: added.label },
+    });
+  }
+
+  /* Captions sit at the centroid of the thing they name, not at a fixed offset. */
+  const labels: FeatureLabel[] = proposals
+    .filter((proposal) => !rejectedIds.has(proposal.id))
+    .map((proposal) => ({
+      key: proposal.id,
+      text: confirmedIds.has(proposal.id) ? proposal.kind : `${proposal.kind}?`,
+      position: labelPoint(proposal.geometry),
+    }))
+    .concat(
+      s.extra.map((added) => ({
+        key: added.id,
+        text: added.label,
+        position: labelPoint(added.feature.geometry),
+      })),
+    );
+  /* What OSM outlines is named by what OSM calls it — no question mark, because
+   * nothing here is being asked about. */
+  labels.unshift(
+    ...s.existing.map((feature) => ({
+      key: feature.id,
+      text: feature.name ?? feature.tag.replace(/_/g, ' '),
+      position: labelPoint(feature.geometry),
+    })),
   );
+  if (points.length > 0) {
+    labels.unshift({ key: 'locate-tee', text: fromOsm ? 'tee' : 'your tee', position: points[0] });
+  }
+  if (points.length >= 2) {
+    labels.push({
+      key: 'locate-green',
+      text: fromOsm ? 'green' : locateDone ? 'your green' : 'last point',
+      position: points[points.length - 1],
+    });
+  }
 
-  const measured =
-    s.mode === 'attention' ? (s.attentionResolved ? 374 : 250) : locateYds || cardYds;
+  /* Frame the hole when there is geometry for one; otherwise the whole course. */
+  const drawn = features.flatMap((feature) => coordinatesOf(feature.geometry));
+  const mapBounds = boundsOf(drawn) ?? courseBounds(s);
 
-  const bunkersRemoved = s.removed.filter((r) => r.startsWith('bunker')).length;
+  const addedByLabel = new Map<string, number>();
+  for (const added of s.extra) {
+    addedByLabel.set(added.label, (addedByLabel.get(added.label) ?? 0) + 1);
+  }
 
   return {
     hi,
     cardYds,
+    holePar: hole?.par ?? null,
+    holeHandicapIndex: hole?.handicapIndex ?? null,
     q,
     allDone,
     isLocate,
-    blocked,
+    locatePoints: points,
+    locateLine,
     locateDone,
+    canFinish,
     locateYds,
     locateOff,
-    locateWithinTolerance: locateOff <= YARDAGE_TOLERANCE,
-    corridor,
-    activeIds,
-    confirmedIds,
-    pendingIds,
-    measured,
+    locateTolerance,
+    locateWithinTolerance,
+    locateVerdict,
+    /* Where the line on screen came from, so the rail can say so rather than
+     * calling OpenStreetMap's work "your line" (R8). */
+    lineFromOsm: fromOsm,
+    /* What OpenStreetMap already outlines on this hole, for the rail's list. */
+    existing: s.existing,
+    /* What OSM calls this hole, when its own name for it differs from the card's. */
+    osmHoleRef: s.osmHoleRef,
+    /* R1: there is nothing to detect against until the line is finished. */
+    canRequestProposals: locateDone && s.detect.status !== 'working',
+    detecting: s.detect.status === 'working',
+    /* What the service proposed for this hole. The review sequence drives from here. */
+    proposals,
+    /* The corridor raster inference read — provenance, and the U8 overlay. */
+    detectionImagery: s.detect.status === 'ready' ? s.detect.imagery : null,
+    missingTeeSets: s.detect.status === 'ready' ? s.detect.missingTeeSets : [],
+    /* The current step's own list, and the single feature being asked about (R7). */
+    stepProposals,
+    stepProposalCount: stepProposals.length,
+    activeProposal,
+    /** 1-based, for copy. Zero when the step has nothing to review. */
+    activePosition: activeProposal ? s.proposalIndex + 1 : 0,
+    /* Copy templated off the real count — never "we found 2 bunkers" on a hole with three. */
+    stepTitle: stepTitle(step, s.proposalIndex + 1, stepProposals.length),
+    stepNote: stepNote(step, stepProposals.length),
+    stepAccept: stepAccept(step, stepProposals.length),
+    /* R14: the water step offers the in-play answer, and only it does. */
+    stepNeedsInPlay: step.needsInPlay === true && activeProposal !== null,
+    activeIsHazard: activeProposal !== null && hazardIds.has(activeProposal.id),
+    /* What was rejected on this hole, still readable after leaving and coming back (R10). */
+    rejectedHere: s.rejections[holeNumber] ?? [],
+    features,
+    labels,
+    mapBounds,
     doneCount: s.holeStatus.filter((x) => x === 'complete').length,
-    scorecard: TEES.map((t) => ({
-      name: t.name,
-      yd: Math.round(cardYds * (t.yd / 378)),
-      swatch: t.swatch,
-    })),
+    /* Straight off this hole's own `yardages` map — no ratio, no hole-1 baseline. */
+    scorecard: course ? scorecardFor(course, hi) : [],
+    /* Only what the contributor actually decided — nothing is claimed on their behalf. */
     summary: [
-      '1 green',
-      `${2 - bunkersRemoved + s.extra.length} bunkers`,
-      `4 tee boxes — ${TEE_IDS.map((id) => s.teeAssign[id].toLowerCase()).join(', ')}`,
-      'fairway, tee to green',
+      /* Never "you drew" over a line that came out of OpenStreetMap. */
+      fromOsm
+        ? `OpenStreetMap's playing line, ${locateYds} yd over ${points.length} points`
+        : locateDone
+          ? `playing line, ${locateYds} yd over ${points.length} points`
+          : 'no playing line drawn yet',
+      ...(s.existing.length > 0
+        ? [`${s.existing.length} feature${s.existing.length === 1 ? '' : 's'} OpenStreetMap already holds`]
+        : []),
+      ...(s.confirmed.length > 0
+        ? [`${s.confirmed.length} proposal${s.confirmed.length === 1 ? '' : 's'} you confirmed`]
+        : []),
+      ...(s.removed.length > 0
+        ? [`${s.removed.length} you turned down, recorded either way`]
+        : []),
+      ...[...addedByLabel].map(([label, count]) => `${count} ${label}${count === 1 ? '' : 's'}`),
+      `tee boxes named — ${TEE_IDS.map((id) => s.teeAssign[id].toLowerCase()).join(', ')}`,
     ],
   };
 }
@@ -143,6 +742,19 @@ export function computeDerived(s: MapperState) {
 export function useMapper() {
   const [state, setState] = useState<MapperState>(INITIAL);
   const advanceTimer = useRef<number | null>(null);
+  /**
+   * The detection request in flight, if there is one. Held in a ref rather than
+   * in state because aborting it is not a render — and because a result that
+   * arrives after the contributor has moved on must be able to recognise that it
+   * is no longer the request anyone is waiting for.
+   */
+  const detectRun = useRef<AbortController | null>(null);
+
+  /** Drop whatever detection is in flight. Leaving a hole is one of the reasons to. */
+  const dropDetection = useCallback(() => {
+    detectRun.current?.abort();
+    detectRun.current = null;
+  }, []);
 
   const patch = useCallback((next: Partial<MapperState> | ((s: MapperState) => Partial<MapperState>)) => {
     setState((s) => ({ ...s, ...(typeof next === 'function' ? next(s) : next) }));
@@ -150,119 +762,295 @@ export function useMapper() {
 
   const go = useCallback(
     (screen: Screen, mode?: ReviewMode) => {
+      dropDetection();
       patch((s) => ({
         screen,
         mode: mode ?? s.mode,
         step: screen === 'review' ? 0 : s.step,
+        proposalIndex: screen === 'review' ? 0 : s.proposalIndex,
         confirmed: screen === 'review' ? [] : s.confirmed,
         removed: screen === 'review' ? [] : s.removed,
+        hazards: screen === 'review' ? [] : s.hazards,
+        /* Not `rejections`: it is course-level on purpose, and clearing it here
+         * would leave only the last hole's rejections in front of the store. */
         extra: screen === 'review' ? [] : s.extra,
+        existing: screen === 'review' ? [] : s.existing,
+        osmHoleRef: screen === 'review' ? null : s.osmHoleRef,
         addMode: null,
-        locate: screen === 'review' ? { tee: null, green: null } : s.locate,
+        locate: screen === 'review' ? EMPTY_LINE : s.locate,
+        /* Proposals belong to the line they were asked about, and that line is gone. */
+        detect: screen === 'review' ? NO_DETECTION : s.detect,
         lastAction: '',
         attentionResolved:
           screen === 'review' && mode === 'attention' ? false : s.attentionResolved,
       }));
     },
-    [patch],
+    [patch, dropDetection],
   );
 
+  /**
+   * Adopt a loaded course and whatever OpenStreetMap holds for it. Everything
+   * sized to the previous course — the hole statuses, the hole index, the tee
+   * names — is rebuilt here, so opening a nine-hole course after an eighteen
+   * never leaves nine stale tiles behind.
+   *
+   * An adopted boundary opens on the boundary screen for orientation (R11);
+   * anything else — absent, or a lookup that failed — opens straight on the
+   * board, which states what happened (R12).
+   */
+  const openCourse = useCallback(
+    (session: CourseSession, osm: OsmLookup) => {
+      dropDetection();
+      patch({
+        course: session,
+        screen: osm.status === 'found' ? 'boundary' : 'board',
+        mode: 'ready',
+        holeIndex: 0,
+        osm,
+        holeStatus: holeStatusesFrom(session, osm),
+        teeAssign: defaultTeeAssign(session),
+        /* Measuring starts from the longest set the course lists; the rail moves it. */
+        teeSet: session.tees[0]?.color ?? null,
+        step: 0,
+        proposalIndex: 0,
+        confirmed: [],
+        removed: [],
+        hazards: [],
+        /* A different course: its rejections are not this one's. */
+        rejections: {},
+        extra: [],
+        existing: [],
+        osmHoleRef: null,
+        addMode: null,
+        locate: EMPTY_LINE,
+        detect: NO_DETECTION,
+        lastAction: '',
+        attentionResolved: false,
+      });
+    },
+    [patch, dropDetection],
+  );
+
+  /**
+   * Persist one decision (R15, KTD10).
+   *
+   * Fire-and-forget, and per decision rather than per hole: a contributor who
+   * walks away mid-hole has still told us something true about every proposal
+   * they answered, and a rejection they made is exactly the record R10 is about.
+   * A store that is unreachable cannot undo a review that already happened in
+   * front of them, so nothing here surfaces or retries — `rejections` is the
+   * in-session copy that keeps the screen honest either way.
+   */
+  const sendDecision = useCallback(
+    (holeNumber: number, proposal: Proposal, outcome: DecisionOutcome, inPlay?: boolean) => {
+      const courseId = state.course?.id;
+      if (!courseId) return;
+      void recordDecisions(courseId, holeNumber, [decisionFor(proposal, outcome, inPlay)]).catch(
+        () => {},
+      );
+    },
+    [state.course],
+  );
+
+  /**
+   * Where the sequence goes once one proposal has been decided: to the next
+   * proposal in this step, or — only when this was the last of them — to the next
+   * step. Deciding a feature must never carry the ones behind it with it (R7).
+   */
+  const afterDecision = useCallback(
+    (s: MapperState, step: Step, count: number, note: string): Partial<MapperState> => {
+      const next = s.proposalIndex + 1;
+      if (next < count) return { proposalIndex: next, lastAction: note };
+      return { step: s.step + 1, proposalIndex: 0, lastAction: note || step.done };
+    },
+    [],
+  );
+
+  /**
+   * Move past this step without deciding anything.
+   *
+   * It confirms nothing — it used to concatenate the step's whole target list,
+   * which is the batch confirmation KTD1 rules out. And it stays put while a
+   * proposal is still on screen awaiting an answer: adding a feature we missed is
+   * not an answer about the one we did propose.
+   */
   const advance = useCallback(
     (note?: string) => {
       patch((s) => {
-        const st = STEPS[s.step];
-        const add = st ? st.targets.filter((t) => !s.removed.includes(t)) : [];
-        return {
-          confirmed: s.confirmed.concat(add),
-          step: s.step + 1,
-          lastAction: note ?? st?.done ?? '',
-        };
+        const step = STEPS[s.step];
+        if (!step) return { lastAction: note ?? '' };
+        const stepProposals = proposalsForStep(s, step);
+        if (stepProposals[s.proposalIndex]) return { lastAction: note ?? '' };
+        return { step: s.step + 1, proposalIndex: 0, lastAction: note ?? step.done };
       });
     },
     [patch],
   );
 
-  const accept = useCallback(() => {
-    setState((s) => {
-      if (isBlocked(s)) return s;
-      const st = STEPS[s.step];
-      const add = st ? st.targets.filter((t) => !s.removed.includes(t)) : [];
-      return {
-        ...s,
-        confirmed: s.confirmed.concat(add),
-        step: s.step + 1,
-        lastAction: st?.done ?? '',
-      };
-    });
-  }, []);
+  /**
+   * One explicit confirmation, about one proposal (R7, KTD1).
+   *
+   * On a step with nothing proposed this is the contributor saying so — it
+   * confirms no geometry, because there is none, and moves the sequence on.
+   *
+   * `forProposal` is the id this answer was rendered for, when the caller knows
+   * it: see `answersFor`.
+   */
+  const accept = useCallback(
+    (forProposal?: unknown) => {
+      if (isBlocked(state)) return;
+      const step = STEPS[state.step];
+      if (!step) return;
+      const stepProposals = proposalsForStep(state, step);
+      const active = stepProposals[state.proposalIndex] ?? null;
+      if (!answersFor(active, forProposal)) return;
 
-  const reject = useCallback(() => {
-    setState((s) => {
-      if (isBlocked(s)) return s;
-      const st = currentStep(s);
-      const drop = st.targets[st.targets.length - 1];
-      const removed = drop ? s.removed.concat([drop]) : s.removed;
-      const stepDef = STEPS[s.step];
-      const add = stepDef ? stepDef.targets.filter((t) => !removed.includes(t)) : [];
-      return {
-        ...s,
-        removed,
-        confirmed: s.confirmed.concat(add),
-        step: s.step + 1,
-        lastAction: 'Dropped it — false alarms happen as often as misses.',
-      };
-    });
-  }, []);
+      if (active) {
+        sendDecision(
+          openHoleNumber(state),
+          active,
+          'confirmed',
+          step.needsInPlay ? true : undefined,
+        );
+        const remaining = stepProposals.length - (state.proposalIndex + 1);
+        patch((s) => ({
+          confirmed: s.confirmed.concat([active.id]),
+          /* R14: on the in-play step the confirming answer *is* the in-play yes —
+           * the title asks "can a ball find that water?" and the button answers it,
+           * so this is an explicit human answer, not an inference from a confirm.
+           * `answerInPlay(false)` is the other half of the same question. */
+          hazards: step.needsInPlay ? s.hazards.concat([active.id]) : s.hazards,
+          ...afterDecision(
+            s,
+            step,
+            stepProposals.length,
+            remaining > 0 ? `Confirmed. ${remaining} more to check on this hole.` : step.done,
+          ),
+        }));
+        return;
+      }
+
+      patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: step.done }));
+    },
+    [state, patch, sendDecision, afterDecision],
+  );
+
+  /**
+   * One rejection, about one proposal (R10).
+   *
+   * The proposal leaves the map and is written down — with the kind the model
+   * classified it as and the geometry it drew — both in `rejections` and at the
+   * store. A false alarm nobody recorded is a false alarm the model repeats.
+   *
+   * Takes the same optional `forProposal` binding `accept` does.
+   */
+  const reject = useCallback(
+    (forProposal?: unknown) => {
+      if (isBlocked(state)) return;
+      const step = STEPS[state.step];
+      if (!step) return;
+      const stepProposals = proposalsForStep(state, step);
+      const active = stepProposals[state.proposalIndex] ?? null;
+      if (!answersFor(active, forProposal)) return;
+
+      if (active) {
+        const holeNumber = openHoleNumber(state);
+        sendDecision(holeNumber, active, 'rejected');
+        patch((s) => ({
+          removed: s.removed.concat([active.id]),
+          rejections: {
+            ...s.rejections,
+            [holeNumber]: (s.rejections[holeNumber] ?? []).concat([active]),
+          },
+          ...afterDecision(
+            s,
+            step,
+            stepProposals.length,
+            'Dropped it, and noted why — a false alarm is worth as much as a miss.',
+          ),
+        }));
+        return;
+      }
+
+      patch((s) => ({ step: s.step + 1, proposalIndex: 0, lastAction: 'Skipped.' }));
+    },
+    [state, patch, sendDecision, afterDecision],
+  );
+
+  /**
+   * The in-play answer for a proposed water body (R14).
+   *
+   * Both answers confirm the water — it is there either way, and the imagery said
+   * so. Only `true` makes it a hazard. Spectral classification proposes water; it
+   * never decides whether the water counts, and neither does anything else here:
+   * the only two routes into `hazards` are this call and the in-play confirming
+   * button in `accept`, which asks the same question in the same words.
+   */
+  const answerInPlay = useCallback(
+    (inPlay: boolean, forProposal?: unknown) => {
+      if (isBlocked(state)) return;
+      const step = STEPS[state.step];
+      if (!step) return;
+      const stepProposals = proposalsForStep(state, step);
+      const active = stepProposals[state.proposalIndex] ?? null;
+      if (!active) return;
+      if (!answersFor(active, forProposal)) return;
+
+      sendDecision(openHoleNumber(state), active, 'confirmed', inPlay);
+      patch((s) => ({
+        confirmed: s.confirmed.concat([active.id]),
+        hazards: inPlay ? s.hazards.concat([active.id]) : s.hazards,
+        ...afterDecision(
+          s,
+          step,
+          stepProposals.length,
+          inPlay ? 'Marked in play.' : 'Kept as water, not as a hazard.',
+        ),
+      }));
+    },
+    [state, patch, sendDecision, afterDecision],
+  );
 
   const missing = useCallback(() => {
-    setState((s) => (isBlocked(s) ? s : { ...s, addMode: missingNoun(currentStep(s).id) }));
+    setState((s) => (isBlocked(s) ? s : { ...s, addMode: currentStep(s).missNoun }));
   }, []);
 
-  const mapPoint = (e: React.MouseEvent<SVGSVGElement>): Point => {
-    const svg = e.currentTarget;
-    const ctm = svg.getScreenCTM?.();
-    if (ctm) {
-      const pt = svg.createSVGPoint();
-      pt.x = e.clientX;
-      pt.y = e.clientY;
-      const p = pt.matrixTransform(ctm.inverse());
-      return { x: p.x, y: p.y };
-    }
-    const r = svg.getBoundingClientRect();
-    return {
-      x: ((e.clientX - r.left) / r.width) * REVIEW_VIEWBOX.w,
-      y: ((e.clientY - r.top) / r.height) * REVIEW_VIEWBOX.h,
-    };
-  };
-
+  /**
+   * A click on the imagery, already a WGS84 coordinate — `BaseMap` unprojects it,
+   * so nothing here converts from screen space (R7).
+   */
   const onMapClick = useCallback(
-    (e: React.MouseEvent<SVGSVGElement>) => {
-      const p = mapPoint(e);
+    (position: LngLat) => {
       if (state.mode === 'locate') {
         patch((s) => {
-          if (!s.locate.tee) return { locate: { tee: p, green: null }, lastAction: 'Tee marked.' };
-          if (!s.locate.green) {
-            return {
-              locate: { tee: s.locate.tee, green: p },
-              lastAction: 'Green marked — that is the line.',
-            };
-          }
-          return {};
+          if (s.locate.finished) return {};
+          const points = s.locate.points.concat([position]);
+          return {
+            locate: { points, finished: false, source: 'drawn' },
+            lastAction:
+              points.length === 1
+                ? 'Tee marked. Add a point wherever the hole bends.'
+                : `Point ${points.length} added.`,
+          };
         });
         return;
       }
       if (!state.addMode) return;
 
       const noun = state.addMode;
-      const d =
-        noun === 'water'
-          ? ell(p.x, p.y, 46, 30)
-          : noun === 'tee box'
-            ? rr(p.x - 30, p.y - 14, 60, 28, 6)
-            : ell(p.x, p.y, 30, 19);
+      const spec = ADDED_FEATURE[noun] ?? ADDED_FEATURE['fairway edge'];
 
       patch((s) => ({
-        extra: s.extra.concat([{ id: 'extra' + s.extra.length, d, label: noun }]),
+        extra: s.extra.concat([
+          {
+            id: 'extra' + s.extra.length,
+            label: noun,
+            feature: courseFeature(spec.kind, bufferedAround(position, spec.radiusYards), {
+              status: 'confirmed',
+              label: noun,
+            }),
+          },
+        ]),
         addMode: null,
         lastAction: 'Added the ' + noun + ' you spotted.',
       }));
@@ -271,33 +1059,80 @@ export function useMapper() {
     [state.mode, state.addMode, patch, advance],
   );
 
+  /**
+   * The hole is done and off the board.
+   *
+   * `dropDetection()` for the same reason `go` and `openHole` do it: a request
+   * still in flight would land on a hole nobody is reviewing any more and reset
+   * the very lists the summary is counting. The detection state goes with it —
+   * the review screen is unmounted here, and the only way back into a hole is
+   * `openHole`, which asks again from scratch.
+   */
   const upload = useCallback(() => {
+    dropDetection();
     patch((s) => {
       const holeStatus = s.holeStatus.slice();
       holeStatus[s.holeIndex] = 'complete';
-      return { holeStatus, screen: 'complete' };
+      return { holeStatus, screen: 'complete', detect: NO_DETECTION };
     });
-  }, [patch]);
+  }, [patch, dropDetection]);
 
   const openHole = useCallback(
     (i: number) => {
       const status = state.holeStatus[i];
-      setState((s) => ({
-        ...s,
-        holeIndex: i,
-        screen: 'review',
-        mode: status === 'attention' ? 'attention' : status === 'unmapped' ? 'locate' : 'ready',
-        step: 0,
-        confirmed: [],
-        removed: [],
-        extra: [],
-        addMode: null,
-        locate: { tee: null, green: null },
-        lastAction: '',
-        attentionResolved: status === 'attention' ? false : s.attentionResolved,
-      }));
+      dropDetection();
+      setState((s) => {
+        /*
+         * A hole opens on whatever OpenStreetMap already holds for it (R10).
+         *
+         * This used to open every hole on an empty line over the whole course,
+         * on the grounds that a `complete` status only told us the hole number
+         * exists and not its shape. The lookup now brings the shape back — the
+         * `golf=hole` way and the greens, bunkers, fairways and tees filed along
+         * it — so a hole that is already mapped opens showing it, framed on the
+         * line rather than on four hundred acres. Nothing is invented: a hole
+         * OSM does not hold still opens exactly as before, empty, on the course.
+         *
+         * The seeded line is not the contributor's work and is never drawn as
+         * though it were (R8, `LineSource`). Undo or "start over" takes it, and
+         * from that point the line is theirs.
+         */
+        const seed = seedFromOsm(osmHoleFor(s.osm, s.course?.holes[i]?.number ?? i + 1));
+        return {
+          ...s,
+          holeIndex: i,
+          screen: 'review',
+          /*
+           * The playing line either way. It is the frame everything else is
+           * bounded by, and with a line already on it the panel becomes "here is
+           * what is here" rather than a request to click a tee that is drawn on
+           * screen already.
+           */
+          mode: status === 'attention' ? 'attention' : 'locate',
+          step: 0,
+          proposalIndex: 0,
+          confirmed: [],
+          removed: [],
+          hazards: [],
+          /* `rejections` deliberately survives: it is keyed by hole number and is
+           * what the contributor sees when they come back to this one (R10). */
+          extra: [],
+          addMode: null,
+          locate: seed.locate,
+          existing: seed.existing,
+          osmHoleRef: seed.osmHoleRef,
+          detect: NO_DETECTION,
+          lastAction:
+            seed.existing.length > 0
+              ? `OpenStreetMap already holds this hole — its line and ${seed.existing.length} outlined ${seed.existing.length === 1 ? 'feature' : 'features'} are on the map.`
+              : seed.locate.points.length > 0
+                ? 'OpenStreetMap already holds this hole — its playing line is on the map.'
+                : '',
+          attentionResolved: status === 'attention' ? false : s.attentionResolved,
+        };
+      });
     },
-    [state.holeStatus],
+    [state.holeStatus, dropDetection],
   );
 
   const nextHole = useCallback(() => {
@@ -306,22 +1141,145 @@ export function useMapper() {
     openHole(next < 0 ? from : next);
   }, [state.holeIndex, state.holeStatus, openHole]);
 
-  /* A / N / M drive the three review answers without reaching for the mouse. */
+  /**
+   * Ask the detection service what it can see on this hole (R1).
+   *
+   * Only ever from a finished line: the request is bounded by the corridor the
+   * line describes, and there is no corridor until the contributor has said where
+   * the hole plays. Nothing here can leave the hole unmappable — every outcome
+   * the service can produce lands in `detect` as a state the screen states, and
+   * the hand-drawing path stays exactly where it was (R12).
+   */
+  /**
+   * Ask the service what is on a finished line.
+   *
+   * Takes the points rather than reading them off state, because the caller that
+   * matters most — finishing the line — knows them before React has applied the
+   * `finished` flag. Reading state here would see a line that is not finished
+   * yet and refuse the very request that finishing is meant to start.
+   */
+  const runDetection = useCallback(
+    (points: readonly LngLat[]) => {
+      if (points.length < 2) return;
+
+      dropDetection();
+      const controller = new AbortController();
+      detectRun.current = controller;
+      patch({ detect: { status: 'working' }, lastAction: '' });
+
+      const request = detectRequestFor({
+        ...state,
+        locate: { points: [...points], finished: true, source: 'drawn' },
+      });
+      void askTheDetectionService(request, { signal: controller.signal }).then(
+        (result) => {
+          /* Superseded by a later request, or by leaving the hole: not ours to apply. */
+          if (detectRun.current !== controller) return;
+          detectRun.current = null;
+
+          /* A cancellation is what the contributor asked for; `cancelProposals` has
+           * already put the hole back the way they want it. */
+          if (result.status === 'aborted') return;
+
+          if (result.status === 'ok') {
+            patch({
+              detect: {
+                status: 'ready',
+                jobId: result.jobId,
+                proposals: result.proposals,
+                imagery: result.imagery,
+                missingTeeSets: result.missingTeeSets,
+              },
+              /* Into the review sequence, the same transition `confirmLocate` makes. */
+              mode: 'ready',
+              step: 0,
+              proposalIndex: 0,
+              confirmed: [],
+              removed: [],
+              hazards: [],
+              extra: [],
+              /* "To check with you", never "found": nothing here is settled until
+               * the contributor has answered about each one (R7). */
+              lastAction: `We found ${result.proposals.length} thing${
+                result.proposals.length === 1 ? '' : 's'
+              } to check with you, one at a time.`,
+            });
+            return;
+          }
+
+          if (result.status === 'no_coverage') {
+            patch({ detect: { status: 'no_coverage', message: result.message }, lastAction: '' });
+            return;
+          }
+
+          patch({ detect: { status: 'failed', message: result.message }, lastAction: '' });
+        },
+      );
+    },
+    [state, patch, dropDetection],
+  );
+
+  /**
+   * Ask again by hand. Detection runs on its own when the line is finished, so
+   * this is the retry after a failure or an empty answer — not the normal path.
+   */
+  const requestProposals = useCallback(() => {
+    if (!state.locate.finished) return;
+    runDetection(state.locate.points);
+  }, [state.locate.finished, state.locate.points, runDetection]);
+
+  /**
+   * Stop waiting. The first request of a session is the one most likely to be
+   * slow — a cold container — and a contributor who would rather map the hole
+   * than wait it out needs a way out that is not the timeout (R12).
+   */
+  const cancelProposals = useCallback(() => {
+    dropDetection();
+    patch((s) =>
+      s.detect.status === 'working'
+        ? { detect: NO_DETECTION, lastAction: 'Stopped looking. The hole is yours to map by hand.' }
+        : {},
+    );
+  }, [patch, dropDetection]);
+
+  /*
+   * The feature the keys are answering about, read where the listener is bound
+   * rather than inside it: what the contributor saw when they pressed the key is
+   * what their answer is about, and `answersFor` drops the answer if the sequence
+   * has moved on since.
+   */
+  const keyedProposal = activeProposalId(state);
+  /*
+   * A / N / M drive the three review answers without reaching for the mouse — but
+   * only when the map is not waiting for a click. In click-to-place the
+   * contributor's attention is on the imagery, and a stray key that advanced the
+   * review behind them would be the worst kind of surprise.
+   */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (state.screen !== 'review' || state.addMode) return;
+      /*
+       * An OS auto-repeat is one act, not twenty. Holding `a` down fires
+       * `keydown` continuously, and without this every repeat would confirm the
+       * next proposal and post it to the decision store — walking the whole hole
+       * through to confirmed while the contributor's finger rests on a key.
+       * Nothing about a held key is an explicit per-feature decision (KTD1), and
+       * the absence of this line is invisible in a test that presses once.
+       */
+      if (e.repeat) return;
+      if (state.screen !== 'review' || state.addMode || state.mode === 'locate') return;
       const k = e.key.toLowerCase();
-      if (k === 'a') accept();
-      else if (k === 'n') reject();
+      if (k === 'a') accept(keyedProposal);
+      else if (k === 'n') reject(keyedProposal);
       else if (k === 'm') missing();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [state.screen, state.addMode, accept, reject, missing]);
+  }, [state.screen, state.addMode, state.mode, keyedProposal, accept, reject, missing]);
 
   useEffect(() => {
     return () => {
       if (advanceTimer.current) window.clearTimeout(advanceTimer.current);
+      detectRun.current?.abort();
     };
   }, []);
 
@@ -333,30 +1291,99 @@ export function useMapper() {
     actions: {
       patch,
       go,
+      openCourse,
       accept,
       reject,
+      /** R14: the in-play answer, the only thing that makes water a hazard. */
+      answerInPlay,
       missing,
       advance,
       onMapClick,
       upload,
       openHole,
       nextHole,
+      requestProposals,
+      cancelProposals,
       setQuery: (query: string) => patch({ query }),
       setTee: (id: TeeId, value: string) =>
         patch((s) => ({ teeAssign: { ...s.teeAssign, [id]: value } })),
+      /** Which tee set the drawn line is checked against (R15). */
+      setTeeSet: (color: string) => patch({ teeSet: color }),
       cancelAdd: () => patch({ addMode: null }),
-      resetLocate: () => patch({ locate: { tee: null, green: null }, lastAction: '' }),
-      confirmLocate: () =>
+      /**
+       * Start the line again — and with it whatever was proposed about the old
+       * one.
+       *
+       * `existing` deliberately survives: what OpenStreetMap outlines on this
+       * hole is not a draft of the contributor's, and a contributor redrawing a
+       * line has every reason to want the green they are drawing to still be
+       * visible under it.
+       */
+      resetLocate: () => {
+        dropDetection();
+        patch({ locate: EMPTY_LINE, detect: NO_DETECTION, lastAction: '' });
+      },
+      /** Take back the last point placed. Anything finished goes back to being drawn. */
+      undoLastPoint: () =>
+        patch((s) => {
+          if (s.locate.points.length === 0) return {};
+          const points = s.locate.points.slice(0, -1);
+          return {
+            /* Once a point has been taken off OpenStreetMap's line it is not
+             * OpenStreetMap's line any more — it is the contributor's. */
+            locate: { points, finished: false, source: 'drawn' },
+            lastAction: points.length === 0 ? '' : 'Took the last point back.',
+          };
+        }),
+      /** Close the line. Refused below two points — that is not yet a hole (R8). */
+      /**
+       * Close the line and go straight into looking at it.
+       *
+       * Finishing at the green *is* the request — the contributor has said where
+       * the hole runs, and asking them to press a second button before anything
+       * happens makes them state the same intent twice. Detection is started
+       * here rather than from an effect watching `finished`, because cancelling
+       * returns detection to idle and an effect would read that as "not started
+       * yet" and fire again, forever.
+       */
+      finishLine: () => {
+        const points = state.locate.points;
+        if (points.length < 2 || state.locate.finished) return;
+        patch({
+          locate: { points, finished: true, source: 'drawn' },
+          lastAction: 'That is the line — looking for what is on it …',
+        });
+        runDetection(points);
+      },
+      /**
+       * Save the line and carry on by hand, without waiting for detection.
+       *
+       * The drop is the whole point of the call order here. A contributor who
+       * gives up on a slow request and starts mapping the hole themselves would
+       * otherwise have that work deleted the moment the late result landed: the
+       * success handler resets `confirmed`, `removed`, `hazards`, `extra`,
+       * `step` and `proposalIndex`. Worse, the spinner and its cancel button
+       * live in the locate panel this leaves behind, so nothing on screen would
+       * even tell them a request was still out. `go`, `openHole` and
+       * `resetLocate` all drop it; this and `upload` were the two that did not.
+       */
+      confirmLocate: () => {
+        dropDetection();
         patch({
           mode: 'ready',
           step: 0,
+          proposalIndex: 0,
           confirmed: [],
           removed: [],
+          hazards: [],
           extra: [],
-          lastAction:
-            'Inside your line we found a green, 2 bunkers and the fairway. Check them below.',
-        }),
-      flagBoundary: () => patch({ flagged: true }),
+          /* Nothing asked for any more, so nothing stale left to render: this is
+           * only ever reached from the locate panel, and a `ready` answer would
+           * have moved the hole out of it. */
+          detect: NO_DETECTION,
+          lastAction: 'Playing line saved. Check anything else you can see on the hole.',
+        });
+      },
       resolveAttention: (lastAction: string) => patch({ attentionResolved: true, lastAction }),
       nudge: () =>
         patch({

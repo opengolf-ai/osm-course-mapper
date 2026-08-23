@@ -1,69 +1,21 @@
-import { ell, rr } from './geometry';
+import type { ProposalKind } from '../api/detect';
 
-export interface Tee {
-  name: string;
-  yd: number;
-  swatch: string;
-}
-
-/** Pebble Beach hole 1 tee set. Yardages for other holes are scaled from these. */
-export const TEES: Tee[] = [
-  { name: 'Blue', yd: 378, swatch: '#2b7fa8' },
-  { name: 'Gold', yd: 349, swatch: '#c98a15' },
-  { name: 'White', yd: 337, swatch: '#e8ebdf' },
-  { name: 'Green', yd: 328, swatch: '#237a5c' },
-  { name: 'Red', yd: 310, swatch: '#b4462f' },
-];
-
-export const PARS = [4, 5, 4, 4, 3, 5, 3, 4, 4, 4, 4, 3, 4, 5, 4, 4, 3, 5];
-export const YDS = [378, 502, 390, 331, 192, 506, 106, 427, 481, 495, 390, 202, 445, 580, 397, 403, 178, 543];
-export const INDEX = [6, 10, 2, 16, 8, 12, 18, 4, 14, 5, 9, 17, 3, 7, 11, 1, 15, 13];
-
-export type HoleStatus = 'ready' | 'attention' | 'complete' | 'unmapped';
-
-export const INITIAL_STATUS: HoleStatus[] = [
-  'ready', 'complete', 'complete', 'attention', 'ready', 'ready',
-  'ready', 'ready', 'ready', 'unmapped', 'unmapped', 'unmapped',
-  'unmapped', 'unmapped', 'unmapped', 'unmapped', 'unmapped', 'unmapped',
-];
+/**
+ * Where one hole stands.
+ *
+ * `unmapped` and `unknown` are different answers and must stay that way (R16):
+ * `unmapped` is "OpenStreetMap holds nothing for this hole", `unknown` is "the
+ * OpenStreetMap lookup failed, so we cannot say". Collapsing the second into the
+ * first would tell a contributor that a fully-mapped course is empty.
+ */
+export type HoleStatus = 'ready' | 'attention' | 'complete' | 'unmapped' | 'unknown';
 
 export const STATUS_META: Record<HoleStatus, { label: string; tone: string }> = {
   ready: { label: 'Ready to review', tone: 'accent' },
   attention: { label: 'Needs attention', tone: 'warning' },
   complete: { label: 'On the map', tone: 'success' },
   unmapped: { label: 'Nothing yet', tone: 'neutral' },
-};
-
-/** Three fairway silhouettes, cycled across the board tiles. */
-export const MINIS = [
-  'M8 78 C 30 60 50 48 72 34 C 88 24 100 18 116 12 L 120 26 C 104 32 92 38 78 46 C 58 58 38 70 18 88 Z',
-  'M4 20 C 30 26 54 40 76 56 C 92 68 104 76 118 82 L 114 92 C 98 86 84 78 68 66 C 46 50 24 36 0 30 Z',
-  'M14 84 C 24 58 40 40 62 26 C 80 14 98 10 118 8 L 120 22 C 102 24 86 28 70 38 C 50 50 36 64 28 88 Z',
-];
-
-export interface Shape {
-  d: string;
-  label: string;
-  lx: number;
-  ly: number;
-}
-
-/** Proposed features for the hole under review, in the review map's 1000x680 viewBox. */
-export const SHAPES: Record<string, Shape> = {
-  green: { d: ell(838, 150, 66, 50), label: 'green', lx: 758, ly: 206 },
-  greenAlt: { d: ell(524, 330, 30, 20), label: 'green?', lx: 486, ly: 356 },
-  bunkerA: { d: ell(744, 214, 34, 20), label: 'bunker', lx: 628, ly: 244 },
-  bunkerB: { d: ell(906, 208, 27, 17), label: 'bunker', lx: 830, ly: 250 },
-  fairway: {
-    d: 'M180 590 C 268 512 348 458 436 390 C 528 318 648 246 776 200 L 818 272 C 696 316 578 384 494 448 C 410 512 336 566 250 636 Z',
-    label: 'fairway',
-    lx: 366,
-    ly: 486,
-  },
-  tee1: { d: rr(118, 602, 76, 36, 6), label: 'back tee', lx: 208, ly: 618 },
-  tee2: { d: rr(158, 568, 68, 32, 6), label: '', lx: 0, ly: 0 },
-  tee3: { d: rr(196, 538, 64, 30, 6), label: '', lx: 0, ly: 0 },
-  tee4: { d: rr(234, 510, 60, 28, 6), label: 'forward tee', lx: 306, ly: 486 },
+  unknown: { label: 'Unknown', tone: 'info' },
 };
 
 export const TEE_IDS = ['tee1', 'tee2', 'tee3', 'tee4'] as const;
@@ -71,117 +23,214 @@ export type TeeId = (typeof TEE_IDS)[number];
 
 export const TEE_POSITIONS = ['furthest back', 'second back', 'third back', 'furthest up'];
 
-export interface Step {
-  id: string;
-  kicker: string;
-  targets: string[];
-  isTees?: boolean;
+/** What a step says when detection proposed nothing of its kind. */
+export interface EmptyStepCopy {
   title: string;
   note: string;
   accept: string;
+}
+
+/**
+ * One question in the review sequence.
+ *
+ * A step names the **kind** of proposal it walks, never a fixed list of feature
+ * ids. Detection returns a variable number of bunkers, tees and water bodies, and
+ * a fixed `targets: ['bunkerA', 'bunkerB']` could only ever confirm a whole step
+ * in one keystroke — which is precisely the batch confirmation R7 forbids. The
+ * reviewable list is derived from the returned proposals at runtime and walked one
+ * feature at a time.
+ *
+ * `kind: null` is a step with no detection class behind it: it exists so a
+ * contributor can add something we never look for. It is not an unmet detection
+ * requirement, and it is not a placeholder for one.
+ */
+export interface Step {
+  id: string;
+  kicker: string;
+  /** The proposal kind this step reviews, or null for a contributor-add-only step. */
+  kind: ProposalKind | null;
+  /** The tee-naming controls ride on this step. */
+  isTees?: boolean;
+  /**
+   * R14: this step's proposals are not hazards until the contributor says a ball
+   * can find them. Spectral classification proposes water; it never decides
+   * whether the water counts, so the step offers an in-play answer either way.
+   */
+  needsInPlay?: boolean;
+  /** The noun the "we missed one" branch is about on this step. */
+  missNoun: string;
+  /** The question about a single proposal — the shape the step is asked in most often. */
+  title: string;
+  /** The same question when there is more than one. `{i}` is 1-based, `{n}` the count. */
+  titleMany: string;
+  note: string;
+  accept: string;
+  /**
+   * The second confirming answer on an in-play step: yes it is water, no a ball
+   * cannot find it. Present only where `needsInPlay` is.
+   */
+  outOfPlay?: string;
   reject: string;
   miss: string;
+  /**
+   * What the step says when nothing of its kind came back.
+   *
+   * The step is still shown. Skipping it would make detection silence and genuine
+   * absence look identical, and would remove the only route a contributor has to
+   * say "you missed one" — one of the three outcomes the review flow is built
+   * around. The zero-proposal `hazards` step below is the same pattern by design
+   * rather than by accident.
+   */
+  empty: EmptyStepCopy;
   done: string;
 }
 
-/** The review sequence. Each step asks a golf question, never a geometry question. */
+/**
+ * The review sequence. Each step asks a golf question, never a geometry question.
+ *
+ * Detection proposes; the contributor disposes, one feature at a time (KTD1, R7).
+ * Nothing in this sequence confirms a batch, and no step is skipped for being
+ * empty — see `Step.empty` for why.
+ */
 export const STEPS: Step[] = [
   {
     id: 'green',
     kicker: 'The green',
-    targets: ['green'],
+    kind: 'green',
+    missNoun: 'green',
     title: 'Is that the green?',
+    titleMany: 'Green {i} of {n} — is that the one you putt on?',
     note: 'One shape, highlighted on the imagery. You have putted on it a hundred times.',
     accept: 'Yes, that is the green',
     reject: 'That is not the green',
     miss: 'The green is elsewhere',
+    empty: {
+      title: 'We did not find a green here.',
+      note: 'Nothing was proposed for this hole. If you can see the green on the imagery, put it on the map yourself.',
+      accept: 'Nothing to confirm — carry on',
+    },
     done: 'Green confirmed.',
   },
   {
     id: 'bunkers',
     kicker: 'Bunkers',
-    targets: ['bunkerA', 'bunkerB'],
-    title: 'We found 2 bunkers on this hole. Miss any?',
-    note: 'One short right of the green, one long left. Sand only — waste areas come later.',
-    accept: 'That is all 2 of them',
-    reject: 'One of these is not sand',
+    kind: 'bunker',
+    missNoun: 'bunker',
+    title: 'Is that a bunker?',
+    titleMany: 'Bunker {i} of {n} — is that sand?',
+    note: 'Sand only — waste areas come later.',
+    accept: 'Yes, that is sand',
+    reject: 'That is not sand',
     miss: 'There is another bunker',
+    empty: {
+      title: 'No bunkers proposed on this hole.',
+      note: 'Either there are none, or we could not see them. You know which.',
+      accept: 'There are no bunkers here',
+    },
     done: 'Bunkers confirmed.',
   },
   {
     id: 'tees',
     kicker: 'Tee boxes',
-    targets: ['tee1', 'tee2', 'tee3', 'tee4'],
+    kind: 'tee',
     isTees: true,
-    title: 'Which tee is which?',
-    note: 'We guessed by distance from the green. Change any that are wrong.',
-    accept: 'That is right',
-    reject: 'One of these is not a tee',
+    missNoun: 'tee box',
+    title: 'Is that a tee box?',
+    titleMany: 'Tee box {i} of {n} — is that one you play from?',
+    note: 'We guessed the names by distance from the green. Change any that are wrong.',
+    accept: 'Yes, that is a tee',
+    reject: 'That is not a tee',
     miss: 'A tee is missing',
+    empty: {
+      title: 'No tee boxes proposed on this hole.',
+      note: 'Tee boxes are small and often shaded. Add the ones you play from.',
+      accept: 'Leave the tees for now',
+    },
     done: 'Tees named.',
   },
   {
     id: 'fairway',
     kicker: 'Fairway',
-    targets: ['fairway'],
+    kind: 'fairway',
+    missNoun: 'fairway edge',
     title: 'Does the fairway run where you would hit it?',
+    titleMany: 'Fairway {i} of {n} — does it run where you would hit it?',
     note: 'Mown fairway only — the first cut and rough stay out of it.',
     accept: 'Yes, that is the fairway',
     reject: 'That is not the fairway',
     miss: 'It runs further than that',
+    empty: {
+      title: 'No fairway proposed on this hole.',
+      note: 'On a par 3 that is expected. Anywhere else, trace it yourself.',
+      accept: 'No fairway to confirm',
+    },
     done: 'Fairway confirmed.',
   },
   {
-    id: 'extras',
-    kicker: 'Anything else',
-    targets: [],
+    id: 'water',
+    kicker: 'Water',
+    kind: 'water',
+    needsInPlay: true,
+    missNoun: 'water',
+    title: 'Can a ball find that water?',
+    titleMany: 'Water {i} of {n} — can a ball find it?',
+    note: 'We can see water from the imagery. Whether it is in play is a golf question, and that one is yours.',
+    accept: 'Yes — it is in play',
+    outOfPlay: 'It is water, but out of play',
+    reject: 'That is not water',
+    miss: 'There is other water',
+    empty: {
+      title: 'No water proposed on this hole.',
+      note: 'If there is a pond or a creek we did not see, put it on the map.',
+      accept: 'No water on this hole',
+    },
+    done: 'Water settled.',
+  },
+  {
+    id: 'hazards',
+    kicker: 'Other hazards',
+    /* Nothing proposes these — we do not classify them. The step exists so the
+     * contributor can add what we never look for, not because detection owes one. */
+    kind: null,
+    missNoun: 'hazard',
     title: 'Anything else in play out there?',
-    note: 'A pond, a creek, a waste area — only if a ball can find it.',
+    titleMany: 'Anything else in play out there?',
+    note: 'A waste area, a ditch, a stand of trees — only if a ball can find it.',
     accept: 'Nothing else on this hole',
     reject: 'Skip this one',
-    miss: 'Yes, add water',
+    miss: 'Yes, add one',
+    empty: {
+      title: 'Anything else in play out there?',
+      note: 'A waste area, a ditch, a stand of trees. We do not look for these, so this one is entirely on you.',
+      accept: 'Nothing else on this hole',
+    },
     done: 'Hole checked.',
   },
 ];
 
-export interface CourseSummary {
-  name: string;
-  place: string;
-  done: number;
-  state: string;
+/** Fill `{i}` (1-based position) and `{n}` (count) in a step's multi-proposal copy. */
+function fillCount(text: string, position: number, count: number): string {
+  /* split/join rather than `replaceAll`: the lib target here is ES2020. */
+  return text.split('{i}').join(String(position)).split('{n}').join(String(count));
 }
 
-export const COURSES: CourseSummary[] = [
-  { name: 'Pebble Beach Golf Links', place: 'Pebble Beach · California', done: 0, state: 'outline only · 0 of 18 holes' },
-  { name: 'Spyglass Hill Golf Course', place: 'Pebble Beach · California', done: 4, state: '4 of 18 holes done' },
-  { name: 'The Links at Spanish Bay', place: 'Pebble Beach · California', done: 0, state: 'nothing mapped yet' },
-  { name: 'Poppy Hills Golf Course', place: 'Pebble Beach · California', done: 18, state: 'all 18 holes done' },
-];
-
-export interface Landmark {
-  name: string;
-  icon: string;
-  verdict: string;
-  color: string;
-  action: string;
+/**
+ * The question on screen: about the one proposal being reviewed, or about the
+ * absence of any. Three cases rather than a count-stuffed sentence, because
+ * "Bunker 1 of 1" reads like a machine and "We found 2 bunkers" was a lie the
+ * moment detection returned three.
+ */
+export function stepTitle(step: Step, position: number, count: number): string {
+  if (count === 0) return step.empty.title;
+  if (count === 1) return step.title;
+  return fillCount(step.titleMany, position, count);
 }
 
-export const LANDMARKS: Landmark[] = [
-  { name: 'Clubhouse and pro shop', icon: 'circle-check', verdict: 'inside', color: 'var(--mint-400)', action: 'not inside' },
-  { name: 'Practice range and putting green', icon: 'circle-check', verdict: 'inside', color: 'var(--mint-400)', action: 'not inside' },
-  { name: 'The Lodge at Pebble Beach', icon: 'circle-check', verdict: 'inside', color: 'var(--mint-400)', action: 'not inside' },
-  { name: '17-Mile Drive', icon: 'x', verdict: 'outside', color: 'var(--green-200)', action: 'should be in' },
-  { name: 'Carmel Bay shoreline', icon: 'x', verdict: 'outside', color: 'var(--green-200)', action: 'should be in' },
-];
+export function stepNote(step: Step, count: number): string {
+  return count === 0 ? step.empty.note : step.note;
+}
 
-export const COURSE_NAME = 'Pebble Beach Golf Links';
-export const COURSE_META = 'par 72 · 6,802 yd · 18 holes · Jack Neville & Douglas Grant, 1919';
-
-/** Review map viewBox, shared by the imagery and the overlay so clicks land in the same space. */
-export const REVIEW_VIEWBOX = { w: 1000, h: 680 };
-
-/** Diagonal of the review viewBox, used to convert click distance into yards. */
-export const REVIEW_DIAGONAL = 833;
-
-/** How far the measured playing line may drift from the card before it reads as a mismatch. */
-export const YARDAGE_TOLERANCE = 25;
+/** The confirming answer. With nothing proposed there is nothing to confirm — say so. */
+export function stepAccept(step: Step, count: number): string {
+  return count === 0 ? step.empty.accept : step.accept;
+}
