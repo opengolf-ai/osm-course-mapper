@@ -26,7 +26,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Map as MapLibreMap } from 'maplibre-gl';
 import { STEPS, TEE_IDS, TEE_POSITIONS } from '../data/course';
-import type { LngLat } from '../geo/coords';
+import type { CourseFeature, LngLat } from '../geo/coords';
 import { Button, Icon } from '../ds';
 import { HoverButton } from '../components/HoverButton';
 import { BaseMap, type ImageryStatus } from '../map/BaseMap';
@@ -387,11 +387,19 @@ interface PlacedLabel {
 }
 
   /** The review source and its layers. Module scope: it closes over no state. */
-const addFeatureLayers = (instance: MapLibreMap) => {
+const addFeatureLayers = (instance: MapLibreMap, features: CourseFeature[]) => {
   {
+    /*
+     * Seeded with whatever is already drawn, not with an empty collection.
+     * `onMapReady` fires at construction, before the style will take a source,
+     * so the add lands later — by which time the effect that pushes features
+     * has already run and will not run again until they next change. Created
+     * empty, the source stayed empty and the contributor's line was invisible
+     * until they happened to click once more.
+     */
     instance.addSource(FEATURE_SOURCE, {
       type: 'geojson',
-      data: { type: 'FeatureCollection', features: [] },
+      data: { type: 'FeatureCollection', features },
     });
     instance.addLayer({
       id: FILL_LAYER,
@@ -541,13 +549,15 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
    * listener once it sticks.
    */
   const handleMapReady = useCallback((instance: MapLibreMap) => {
+    /* Read through the ref: this callback is created once and the add can land
+       long after, on a style event, with more drawn by then. */
     const draw = () => {
       try {
         if (instance.getSource(FEATURE_SOURCE)) {
           instance.off('styledata', draw);
           return;
         }
-        addFeatureLayers(instance);
+        addFeatureLayers(instance, featuresRef.current);
         instance.off('styledata', draw);
       } catch {
         /* The style will not take layers yet; `styledata` brings us back. */
@@ -559,6 +569,8 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
   }, []);
 
   /* Whatever the contributor has drawn, pushed to the map as it changes. */
+  const featuresRef = useRef(features);
+  featuresRef.current = features;
   const featuresKey = JSON.stringify(features);
   useEffect(() => {
     if (!map) return;

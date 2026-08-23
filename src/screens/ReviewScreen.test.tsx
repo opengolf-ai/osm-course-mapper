@@ -260,6 +260,33 @@ describe('drawing on real imagery', () => {
     expect(collection.features.some((f) => f.geometry.type === 'LineString')).toBe(true);
   });
 
+  it('shows a line drawn while the style was still loading, without another click', async () => {
+    /*
+     * The bug this pins, and the one a contributor actually hit: `onMapReady`
+     * fires at construction, before the style will take a source, so the layers
+     * land later on a style event. The source was created empty, and the effect
+     * that pushes features only re-runs when they change — so everything drawn
+     * during that window stayed invisible until the contributor happened to
+     * click once more. Here nothing is clicked after the style lands.
+     */
+    harness.styleBusy = true;
+    await mount();
+    await clickAt(-121_949, 36_569);
+    await clickAt(-121_946, 36_570);
+    expect(harness.sources.has('review-features')).toBe(false);
+
+    harness.styleBusy = false;
+    await act(async () => {
+      harness.emit('styledata', {});
+    });
+
+    const collection = harness.sources.get('review-features')?.data as {
+      features: Array<{ geometry: { type: string } }>;
+    };
+    expect(collection.features.some((f) => f.geometry.type === 'LineString')).toBe(true);
+    expect(collection.features.filter((f) => f.geometry.type === 'Point')).toHaveLength(2);
+  });
+
   it('sends the finished line to the map as a GeoJSON LineString', async () => {
     await mount();
     await clickAt(-121_949, 36_569);
