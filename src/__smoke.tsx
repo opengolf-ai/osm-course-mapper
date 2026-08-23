@@ -96,6 +96,7 @@ const OSM_COURSE: OsmCourse = {
   acres: 176,
   bbox: [-121.955, 36.563, -121.943, 36.574],
   mappedHoleRefs: [1, 2, 3],
+  holes: [],
   landmarks: [
     {
       id: 'way/700001',
@@ -268,7 +269,7 @@ export function renderAll(): Record<string, string> {
           step: 1,
           proposalIndex: 1,
           confirmed: ['p-green', 'p-bunker-1'],
-          locate: { points: PEBBLE_HOLE_ONE, finished: true },
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
           detect: {
             status: 'ready',
             jobId: 'smoke-job',
@@ -291,7 +292,7 @@ export function renderAll(): Record<string, string> {
           mode: 'ready',
           step: 0,
           confirmed: [],
-          locate: { points: PEBBLE_HOLE_ONE, finished: true },
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
           detect: {
             status: 'ready',
             jobId: 'smoke-job',
@@ -307,7 +308,7 @@ export function renderAll(): Record<string, string> {
         mapper={mapperFor({
           mode: 'ready',
           step: STEPS.length,
-          locate: { points: PEBBLE_HOLE_ONE, finished: true },
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
         })}
       />,
     ),
@@ -322,7 +323,7 @@ export function renderAll(): Record<string, string> {
         mapper={mapperFor({
           mode: 'locate',
           holeIndex: 0,
-          locate: { points: PEBBLE_HOLE_ONE.slice(0, 2), finished: false },
+          locate: { points: PEBBLE_HOLE_ONE.slice(0, 2), finished: false, source: 'drawn' },
         })}
       />,
     ),
@@ -331,7 +332,40 @@ export function renderAll(): Record<string, string> {
         mapper={mapperFor({
           mode: 'locate',
           holeIndex: 0,
-          locate: { points: PEBBLE_HOLE_ONE, finished: true },
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
+        })}
+      />,
+    ),
+    /*
+     * A hole OpenStreetMap already holds: the line and the outlines arrive with
+     * it, so the rail states whose work it is rather than asking for a tee.
+     */
+    reviewOsmHole: renderToString(
+      <ReviewScreen
+        mapper={mapperFor({
+          mode: 'locate',
+          holeIndex: 0,
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'osm' },
+          existing: [
+            {
+              id: 'way/820001',
+              kind: 'green',
+              tag: 'green',
+              name: null,
+              geometry: {
+                type: 'Polygon',
+                coordinates: [
+                  [
+                    [-121.9463, 36.5705],
+                    [-121.946, 36.5705],
+                    [-121.946, 36.5708],
+                    [-121.9463, 36.5708],
+                    [-121.9463, 36.5705],
+                  ],
+                ],
+              },
+            },
+          ],
         })}
       />,
     ),

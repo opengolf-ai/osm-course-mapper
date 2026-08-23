@@ -7,6 +7,7 @@ import {
   polygon,
   polygonAcres,
   yardsBetween,
+  yardsToLine,
   type LngLat,
 } from './coords';
 
@@ -143,5 +144,54 @@ describe('courseFeature', () => {
     expect(feature.properties.kind).toBe('hole');
     expect(feature.properties.ref).toBe('1');
     expect(feature.geometry.coordinates).toEqual(PEBBLE_HOLE_1);
+  });
+});
+
+describe('yardsToLine', () => {
+  /* A due-north line at Pebble Beach's latitude, a tenth of a degree tall. */
+  const NORTH_LINE: LngLat[] = [
+    [-121.95, 36.565],
+    [-121.95, 36.568],
+  ];
+
+  it('measures to the nearest point on a segment, not to the nearest vertex', () => {
+    /* Level with the middle of the line — hundreds of yards from either end of
+     * it, and a few dozen from the line itself. This is the whole reason the
+     * function exists: a bunker halfway down a two-point fairway. */
+    const beside: LngLat = [-121.9495, 36.5665];
+
+    const toLine = yardsToLine(beside, NORTH_LINE);
+    const toNearestVertex = Math.min(
+      yardsBetween(beside, NORTH_LINE[0]),
+      yardsBetween(beside, NORTH_LINE[1]),
+    );
+
+    expect(toLine).toBeLessThan(60);
+    expect(toNearestVertex).toBeGreaterThan(150);
+  });
+
+  it('reads zero on the line itself', () => {
+    expect(yardsToLine([-121.95, 36.5665], NORTH_LINE)).toBeCloseTo(0, 5);
+  });
+
+  it('measures past the ends rather than projecting beyond them', () => {
+    /* Directly north of the top of the line: the answer is the distance to that
+     * end, not to an infinite line through it. */
+    const beyond: LngLat = [-121.95, 36.569];
+
+    expect(yardsToLine(beyond, NORTH_LINE)).toBeCloseTo(yardsBetween(beyond, NORTH_LINE[1]), 0);
+  });
+
+  it('takes a LineString as readily as a list of points', () => {
+    const point: LngLat = [-121.9495, 36.5665];
+
+    expect(yardsToLine(point, playingLine(NORTH_LINE))).toBeCloseTo(
+      yardsToLine(point, NORTH_LINE),
+      6,
+    );
+  });
+
+  it('is infinite against a line with no points at all', () => {
+    expect(yardsToLine([-121.95, 36.5665], [])).toBe(Infinity);
   });
 });

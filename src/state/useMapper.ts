@@ -10,7 +10,7 @@ import {
   type Proposal,
   type TeeSetRef,
 } from '../api/detect';
-import type { OsmLookup } from '../api/overpass';
+import type { OsmHole, OsmHoleFeature, OsmLookup } from '../api/overpass';
 import {
   STEPS,
   TEE_IDS,
@@ -80,13 +80,25 @@ export interface FeatureLabel {
 }
 
 /**
- * The ordered points of the playing line, and whether the contributor has said
- * they are done. Fewer than two points is a line still being drawn, so it can
- * never be finished (R8).
+ * Where the playing line on screen came from.
+ *
+ * The distinction is the whole reason this field exists: a line lifted off
+ * OpenStreetMap is not something the contributor drew, and drawing it in the
+ * colour reserved for what they confirmed would credit them with a shape they
+ * have never looked at (R8). The moment they touch it — undo a point, start
+ * over — it becomes `drawn`, because from then on it is theirs.
+ */
+export type LineSource = 'drawn' | 'osm';
+
+/**
+ * The ordered points of the playing line, whether the contributor has said they
+ * are done, and where the line came from. Fewer than two points is a line still
+ * being drawn, so it can never be finished (R8).
  */
 export interface LocateState {
   points: LngLat[];
   finished: boolean;
+  source: LineSource;
 }
 
 /**
@@ -157,6 +169,27 @@ export interface MapperState {
    */
   rejections: Record<number, Proposal[]>;
   extra: ExtraShape[];
+  /**
+   * What OpenStreetMap already outlines on the open hole — its green, bunkers,
+   * fairway, tees (R10).
+   *
+   * Per hole and never carried across, like `detect`: these are shapes filed
+   * against one hole number, and showing the 3rd's bunkers over the 4th would be
+   * worse than showing none. Read-only here — nothing in the review sequence
+   * confirms or rejects them, because there is nothing to decide: they are
+   * already in the map.
+   */
+  existing: OsmHoleFeature[];
+  /**
+   * What OpenStreetMap calls the open hole — "Lakes #3" — when that is not
+   * simply its number on the card.
+   *
+   * A club with three nines pairs them into three eighteens, so card hole 12 can
+   * be OSM's Valley #3. The contributor is looking at a hole they know by one
+   * name and a map that files it under another; saying which is the difference
+   * between "this looks wrong" and "this is the same hole".
+   */
+  osmHoleRef: string | null;
   addMode: string | null;
   lastAction: string;
   attentionResolved: boolean;
@@ -168,7 +201,44 @@ export interface MapperState {
   holeStatus: HoleStatus[];
 }
 
-const EMPTY_LINE: LocateState = { points: [], finished: false };
+const EMPTY_LINE: LocateState = { points: [], finished: false, source: 'drawn' };
+
+/** The hole OpenStreetMap holds for this number, or null when it holds none. */
+export function osmHoleFor(osm: OsmLookup, holeNumber: number): OsmHole | null {
+  if (osm.status !== 'found') return null;
+  return osm.course.holes.find((hole) => hole.ref === holeNumber) ?? null;
+}
+
+/**
+ * The line and the outlines OSM already holds for a hole, as the state that
+ * opens on it.
+ *
+ * A hole with nothing in OpenStreetMap opens exactly as it always did — an empty
+ * line and no outlines — so this is additive: it can only ever put on screen
+ * something that genuinely exists in the map.
+ */
+export function seedFromOsm(hole: OsmHole | null): {
+  locate: LocateState;
+  existing: OsmHoleFeature[];
+  osmHoleRef: string | null;
+} {
+  if (!hole || hole.line.coordinates.length < 2) {
+    return { locate: EMPTY_LINE, existing: [], osmHoleRef: null };
+  }
+  return {
+    /* Finished, because it is: OSM's line is a whole line, not a half-drawn one.
+     * That is what puts the rail straight into "here is what is here" rather
+     * than asking for a tee click over a hole that already has one. */
+    locate: {
+      points: hole.line.coordinates.map(([lng, lat]) => [lng, lat] as LngLat),
+      finished: true,
+      source: 'osm',
+    },
+    existing: hole.features,
+    /* Only worth saying when it is not just the card number back again. */
+    osmHoleRef: hole.nine ? hole.osmRef : null,
+  };
+}
 
 /** Nothing asked for yet. Every route into a hole starts here. */
 const NO_DETECTION: DetectionState = { status: 'idle' };
@@ -198,6 +268,8 @@ export const INITIAL: MapperState = {
   hazards: [],
   rejections: {},
   extra: [],
+  existing: [],
+  osmHoleRef: null,
   addMode: null,
   lastAction: '',
   attentionResolved: false,
@@ -266,8 +338,16 @@ function coordinatesOf(geometry: Geometry): LngLat[] {
   }
 }
 
-/** The extent of a set of points, opened out so the geometry is not flush to the edge. */
-function boundsOf(points: readonly LngLat[], padFraction = 0.35): MapBounds | null {
+/**
+ * The extent of a set of points, opened out so the geometry is not flush to the
+ * edge.
+ *
+ * The margin is a sixth of the span rather than a third. `BaseMap` already
+ * fits with 56px of screen padding on top of this, and the frame's job is to put
+ * the contributor on the hole — a third of the hole's length of empty grass on
+ * every side is most of the screen spent on the ones either side of it.
+ */
+function boundsOf(points: readonly LngLat[], padFraction = 0.16): MapBounds | null {
   if (points.length === 0) return null;
   let west = points[0][0];
   let east = points[0][0];
@@ -440,24 +520,59 @@ export function computeDerived(s: MapperState) {
    */
   const holeNumber = openHoleNumber(s);
   const holeRef = String(holeNumber);
+  /*
+   * A line lifted off OpenStreetMap is `existing`, not `confirmed`: it is
+   * already in the map and nobody in this session has ruled on it. Drawing it in
+   * the confirmed colour would credit the contributor with a shape they have not
+   * so much as looked at (R8).
+   */
+  const fromOsm = s.locate.source === 'osm';
+  const lineStatus = fromOsm ? 'existing' : locateDone ? 'confirmed' : 'active';
   const features: CourseFeature[] = [];
+
+  /*
+   * What OpenStreetMap outlines on this hole, under everything else (R10).
+   *
+   * First into the collection so the contributor's own work, and anything they
+   * are being asked about, draws over the top of it rather than under it.
+   */
+  for (const feature of s.existing) {
+    features.push(
+      courseFeature(feature.kind, feature.geometry, {
+        ref: holeRef,
+        status: 'existing',
+        label: feature.name ?? feature.tag.replace(/_/g, ' '),
+        osmId: feature.id,
+      }),
+    );
+  }
+
   if (locateLine) {
     features.push(
       courseFeature('hole', locateLine, {
         ref: holeRef,
-        status: locateDone ? 'confirmed' : 'active',
+        status: lineStatus,
         label: 'playing line',
       }),
     );
   }
+  /*
+   * The ends of the line, and every point in between the contributor placed
+   * themselves. An OSM way carries as many vertices as its mapper felt like
+   * drawing — a dozen down one fairway is normal — and a circle on each of them
+   * reads as a dozen decisions somebody made, so only its tee and its green get
+   * one.
+   */
   points.forEach((position, i) => {
+    const isEnd = i === 0 || i === points.length - 1;
+    if (fromOsm && !isEnd) return;
     features.push(
       courseFeature(
         'hole',
         { type: 'Point', coordinates: [...position] },
         {
           ref: holeRef,
-          status: locateDone ? 'confirmed' : 'active',
+          status: lineStatus,
           label: i === 0 ? 'tee' : i === points.length - 1 && locateDone ? 'green' : 'turn',
         },
       ),
@@ -519,13 +634,22 @@ export function computeDerived(s: MapperState) {
         position: labelPoint(added.feature.geometry),
       })),
     );
+  /* What OSM outlines is named by what OSM calls it — no question mark, because
+   * nothing here is being asked about. */
+  labels.unshift(
+    ...s.existing.map((feature) => ({
+      key: feature.id,
+      text: feature.name ?? feature.tag.replace(/_/g, ' '),
+      position: labelPoint(feature.geometry),
+    })),
+  );
   if (points.length > 0) {
-    labels.unshift({ key: 'locate-tee', text: 'your tee', position: points[0] });
+    labels.unshift({ key: 'locate-tee', text: fromOsm ? 'tee' : 'your tee', position: points[0] });
   }
   if (points.length >= 2) {
     labels.push({
       key: 'locate-green',
-      text: locateDone ? 'your green' : 'last point',
+      text: fromOsm ? 'green' : locateDone ? 'your green' : 'last point',
       position: points[points.length - 1],
     });
   }
@@ -556,6 +680,13 @@ export function computeDerived(s: MapperState) {
     locateTolerance,
     locateWithinTolerance,
     locateVerdict,
+    /* Where the line on screen came from, so the rail can say so rather than
+     * calling OpenStreetMap's work "your line" (R8). */
+    lineFromOsm: fromOsm,
+    /* What OpenStreetMap already outlines on this hole, for the rail's list. */
+    existing: s.existing,
+    /* What OSM calls this hole, when its own name for it differs from the card's. */
+    osmHoleRef: s.osmHoleRef,
     /* R1: there is nothing to detect against until the line is finished. */
     canRequestProposals: locateDone && s.detect.status !== 'working',
     detecting: s.detect.status === 'working',
@@ -587,9 +718,15 @@ export function computeDerived(s: MapperState) {
     scorecard: course ? scorecardFor(course, hi) : [],
     /* Only what the contributor actually decided — nothing is claimed on their behalf. */
     summary: [
-      locateDone
-        ? `playing line, ${locateYds} yd over ${points.length} points`
-        : 'no playing line drawn yet',
+      /* Never "you drew" over a line that came out of OpenStreetMap. */
+      fromOsm
+        ? `OpenStreetMap's playing line, ${locateYds} yd over ${points.length} points`
+        : locateDone
+          ? `playing line, ${locateYds} yd over ${points.length} points`
+          : 'no playing line drawn yet',
+      ...(s.existing.length > 0
+        ? [`${s.existing.length} feature${s.existing.length === 1 ? '' : 's'} OpenStreetMap already holds`]
+        : []),
       ...(s.confirmed.length > 0
         ? [`${s.confirmed.length} proposal${s.confirmed.length === 1 ? '' : 's'} you confirmed`]
         : []),
@@ -637,6 +774,8 @@ export function useMapper() {
         /* Not `rejections`: it is course-level on purpose, and clearing it here
          * would leave only the last hole's rejections in front of the store. */
         extra: screen === 'review' ? [] : s.extra,
+        existing: screen === 'review' ? [] : s.existing,
+        osmHoleRef: screen === 'review' ? null : s.osmHoleRef,
         addMode: null,
         locate: screen === 'review' ? EMPTY_LINE : s.locate,
         /* Proposals belong to the line they were asked about, and that line is gone. */
@@ -680,6 +819,8 @@ export function useMapper() {
         /* A different course: its rejections are not this one's. */
         rejections: {},
         extra: [],
+        existing: [],
+        osmHoleRef: null,
         addMode: null,
         locate: EMPTY_LINE,
         detect: NO_DETECTION,
@@ -885,7 +1026,7 @@ export function useMapper() {
           if (s.locate.finished) return {};
           const points = s.locate.points.concat([position]);
           return {
-            locate: { points, finished: false },
+            locate: { points, finished: false, source: 'drawn' },
             lastAction:
               points.length === 1
                 ? 'Tee marked. Add a point wherever the hole bends.'
@@ -940,37 +1081,56 @@ export function useMapper() {
     (i: number) => {
       const status = state.holeStatus[i];
       dropDetection();
-      setState((s) => ({
-        ...s,
-        holeIndex: i,
-        screen: 'review',
+      setState((s) => {
         /*
-         * Opening a hole always starts from the playing line, because opening
-         * one clears whatever was on it — no drawn line, no proposals. The
-         * review sequence is driven by proposals, so entering it with none
-         * walks the contributor through empty questions ("we did not find a
-         * green here") over a hole with nothing drawn on it and no way to draw.
+         * A hole opens on whatever OpenStreetMap already holds for it (R10).
          *
-         * A hole OpenStreetMap already holds is no exception. `complete` means
-         * OSM has the hole, not that this app has its geometry — it carries
-         * which hole numbers exist, not their shape — so there is still nothing
-         * on screen to review. Drawing the line is what produces something.
+         * This used to open every hole on an empty line over the whole course,
+         * on the grounds that a `complete` status only told us the hole number
+         * exists and not its shape. The lookup now brings the shape back — the
+         * `golf=hole` way and the greens, bunkers, fairways and tees filed along
+         * it — so a hole that is already mapped opens showing it, framed on the
+         * line rather than on four hundred acres. Nothing is invented: a hole
+         * OSM does not hold still opens exactly as before, empty, on the course.
+         *
+         * The seeded line is not the contributor's work and is never drawn as
+         * though it were (R8, `LineSource`). Undo or "start over" takes it, and
+         * from that point the line is theirs.
          */
-        mode: status === 'attention' ? 'attention' : 'locate',
-        step: 0,
-        proposalIndex: 0,
-        confirmed: [],
-        removed: [],
-        hazards: [],
-        /* `rejections` deliberately survives: it is keyed by hole number and is
-         * what the contributor sees when they come back to this one (R10). */
-        extra: [],
-        addMode: null,
-        locate: EMPTY_LINE,
-        detect: NO_DETECTION,
-        lastAction: '',
-        attentionResolved: status === 'attention' ? false : s.attentionResolved,
-      }));
+        const seed = seedFromOsm(osmHoleFor(s.osm, s.course?.holes[i]?.number ?? i + 1));
+        return {
+          ...s,
+          holeIndex: i,
+          screen: 'review',
+          /*
+           * The playing line either way. It is the frame everything else is
+           * bounded by, and with a line already on it the panel becomes "here is
+           * what is here" rather than a request to click a tee that is drawn on
+           * screen already.
+           */
+          mode: status === 'attention' ? 'attention' : 'locate',
+          step: 0,
+          proposalIndex: 0,
+          confirmed: [],
+          removed: [],
+          hazards: [],
+          /* `rejections` deliberately survives: it is keyed by hole number and is
+           * what the contributor sees when they come back to this one (R10). */
+          extra: [],
+          addMode: null,
+          locate: seed.locate,
+          existing: seed.existing,
+          osmHoleRef: seed.osmHoleRef,
+          detect: NO_DETECTION,
+          lastAction:
+            seed.existing.length > 0
+              ? `OpenStreetMap already holds this hole — its line and ${seed.existing.length} outlined ${seed.existing.length === 1 ? 'feature' : 'features'} are on the map.`
+              : seed.locate.points.length > 0
+                ? 'OpenStreetMap already holds this hole — its playing line is on the map.'
+                : '',
+          attentionResolved: status === 'attention' ? false : s.attentionResolved,
+        };
+      });
     },
     [state.holeStatus, dropDetection],
   );
@@ -1009,7 +1169,7 @@ export function useMapper() {
 
       const request = detectRequestFor({
         ...state,
-        locate: { points: [...points], finished: true },
+        locate: { points: [...points], finished: true, source: 'drawn' },
       });
       void askTheDetectionService(request, { signal: controller.signal }).then(
         (result) => {
@@ -1150,7 +1310,15 @@ export function useMapper() {
       /** Which tee set the drawn line is checked against (R15). */
       setTeeSet: (color: string) => patch({ teeSet: color }),
       cancelAdd: () => patch({ addMode: null }),
-      /** Start the line again — and with it whatever was proposed about the old one. */
+      /**
+       * Start the line again — and with it whatever was proposed about the old
+       * one.
+       *
+       * `existing` deliberately survives: what OpenStreetMap outlines on this
+       * hole is not a draft of the contributor's, and a contributor redrawing a
+       * line has every reason to want the green they are drawing to still be
+       * visible under it.
+       */
       resetLocate: () => {
         dropDetection();
         patch({ locate: EMPTY_LINE, detect: NO_DETECTION, lastAction: '' });
@@ -1161,7 +1329,9 @@ export function useMapper() {
           if (s.locate.points.length === 0) return {};
           const points = s.locate.points.slice(0, -1);
           return {
-            locate: { points, finished: false },
+            /* Once a point has been taken off OpenStreetMap's line it is not
+             * OpenStreetMap's line any more — it is the contributor's. */
+            locate: { points, finished: false, source: 'drawn' },
             lastAction: points.length === 0 ? '' : 'Took the last point back.',
           };
         }),
@@ -1180,7 +1350,7 @@ export function useMapper() {
         const points = state.locate.points;
         if (points.length < 2 || state.locate.finished) return;
         patch({
-          locate: { points, finished: true },
+          locate: { points, finished: true, source: 'drawn' },
           lastAction: 'That is the line — looking for what is on it …',
         });
         runDetection(points);

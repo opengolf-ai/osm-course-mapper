@@ -72,6 +72,10 @@ export default function App() {
             name: session.name,
             latitude: session.latitude,
             longitude: session.longitude,
+            /* The card goes with the query so the lookup can tell which of a
+             * club's nines this eighteen plays — a composite's front nine is
+             * identified by its pars, not by anything the hole tags say. */
+            holes: session.holes.map((hole) => ({ number: hole.number, par: hole.par })),
           },
           controller.signal,
         );

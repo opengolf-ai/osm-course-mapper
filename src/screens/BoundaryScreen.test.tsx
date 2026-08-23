@@ -88,6 +88,7 @@ function osmCourse(overrides: Partial<OsmCourse> = {}): OsmCourse {
     acres: 176.4,
     bbox: [-121.955, 36.563, -121.943, 36.574],
     mappedHoleRefs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+    holes: [],
     landmarks: [
       { id: 'way/700001', name: 'Pebble Beach Clubhouse', kind: 'Clubhouse', position: [-121.949, 36.5688] },
       { id: 'node/700002', name: 'Peter Hay Practice Range', kind: 'Driving range', position: [-121.95, 36.5701] },

@@ -21,6 +21,8 @@ const harness = vi.hoisted(() => {
     sources,
     layers,
     layout,
+    /** Every extent the map was asked to fit, in the order it was asked. */
+    fits: [] as Array<[[number, number], [number, number]]>,
     constructed: 0,
     removed: 0,
     /*
@@ -32,6 +34,7 @@ const harness = vi.hoisted(() => {
     styleBusy: false,
     reset() {
       this.styleBusy = false;
+      this.fits.length = 0;
       listeners.clear();
       sources.clear();
       layers.length = 0;
@@ -68,7 +71,9 @@ vi.mock('maplibre-gl', () => {
     remove() {
       harness.removed += 1;
     }
-    fitBounds() {}
+    fitBounds(bounds: [[number, number], [number, number]]) {
+      harness.fits.push(bounds);
+    }
     isStyleLoaded() {
       return !harness.styleBusy;
     }
@@ -145,7 +150,15 @@ import { IMAGERY_UNAVAILABLE_MESSAGE } from '../map/BaseMap';
 import { buildCourseSession } from '../state/courseSession';
 import { useMapper } from '../state/useMapper';
 import type { CourseDetail } from '../api/types';
-import { CONFIRMED_COLOR, PROPOSED_COLOR, STATUS_COLOR, ReviewScreen } from './ReviewScreen';
+import type { OsmHoleFeature, OsmLookup } from '../api/overpass';
+import {
+  CONFIRMED_COLOR,
+  EXISTING_COLOR,
+  PROPOSED_COLOR,
+  STATUS_COLOR,
+  ReviewScreen,
+  summariseExisting,
+} from './ReviewScreen';
 
 const DETAIL: CourseDetail = {
   id: 'pebble',
@@ -829,5 +842,180 @@ describe('provenance and the imagery the model read', () => {
     expect(screen.getByText('bunker 1 — asking now')).toBeDefined();
     expect(screen.getByText('bunker 2')).toBeDefined();
     expect(screen.getByText('42%')).toBeDefined();
+  });
+});
+
+/* --- A hole OpenStreetMap already holds ----------------------------------- */
+
+/** The line OSM holds for hole 1: Pebble Beach way 671717506, tee to green. */
+const OSM_LINE: [number, number][] = [
+  [-121.9495343, 36.5693904],
+  [-121.9477382, 36.5705598],
+  [-121.9461359, 36.5706059],
+];
+
+/** A small square outline, as a `golf=*` way comes back. */
+function outline(id: string, tag: string, kind: OsmHoleFeature['kind'], at: [number, number]): OsmHoleFeature {
+  const d = 0.00015;
+  return {
+    id,
+    kind,
+    tag,
+    name: null,
+    geometry: {
+      type: 'Polygon',
+      coordinates: [
+        [
+          [at[0] - d, at[1] - d],
+          [at[0] + d, at[1] - d],
+          [at[0] + d, at[1] + d],
+          [at[0] - d, at[1] + d],
+          [at[0] - d, at[1] - d],
+        ],
+      ],
+    },
+  };
+}
+
+const MAPPED: OsmLookup = {
+  status: 'found',
+  course: {
+    osmId: 'relation/3741806',
+    name: 'Pebble Beach Golf Links',
+    boundary: {
+      type: 'Polygon',
+      coordinates: [[[-121.955, 36.563], [-121.943, 36.563], [-121.943, 36.574], [-121.955, 36.563]]],
+    },
+    acres: 176,
+    bbox: [-121.955, 36.563, -121.943, 36.574],
+    mappedHoleRefs: [1],
+    holes: [
+      {
+        osmId: 'way/671717506',
+        ref: 1,
+        nine: null,
+        osmRef: '1',
+        par: 4,
+        line: { type: 'LineString', coordinates: OSM_LINE },
+        features: [
+          outline('way/820001', 'green', 'green', [-121.9461359, 36.5706059]),
+          outline('way/820002', 'bunker', 'bunker', [-121.9466, 36.5703]),
+          outline('way/820003', 'bunker', 'bunker', [-121.9464, 36.5709]),
+        ],
+      },
+    ],
+    landmarks: [],
+    matchedBy: 'name',
+  },
+};
+
+/** The screen, opened on a hole the map already holds — the way a click does it. */
+function MappedHarness() {
+  const mapper = useMapper();
+  const opened = useRef(false);
+
+  useEffect(() => {
+    if (opened.current) return;
+    opened.current = true;
+    mapper.actions.openCourse(SESSION, MAPPED);
+  }, [mapper.actions]);
+
+  useEffect(() => {
+    if (mapper.state.course && mapper.state.screen === 'boundary') mapper.actions.openHole(0);
+  }, [mapper.state.course, mapper.state.screen, mapper.actions]);
+
+  if (!mapper.state.course || mapper.state.screen !== 'review') return null;
+  return <ReviewScreen mapper={mapper} />;
+}
+
+async function mountMapped() {
+  const result = render(<MappedHarness />);
+  for (let tick = 0; tick < 20 && harness.sources.size === 0; tick += 1) {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+  return result;
+}
+
+describe('a hole OpenStreetMap already holds', () => {
+  /** Everything on the review source, as the map has it. */
+  function drawnFeatures() {
+    const source = harness.sources.get('review-features');
+    const data = source?.data as
+      | {
+          features?: Array<{
+            properties: { status: string; kind: string; label: string };
+            geometry: { type: string; coordinates: unknown };
+          }>;
+        }
+      | undefined;
+    return data?.features ?? [];
+  }
+
+  it('draws the playing line and the outlines OSM holds, without a click', async () => {
+    await mountMapped();
+
+    const features = drawnFeatures();
+    const line = features.find((f) => f.geometry.type === 'LineString');
+    expect(line?.geometry.coordinates).toEqual(OSM_LINE);
+    expect(features.filter((f) => f.properties.kind === 'bunker')).toHaveLength(2);
+    expect(features.some((f) => f.properties.kind === 'green')).toBe(true);
+  });
+
+  it('zooms to the hole rather than opening on the whole course', async () => {
+    await mountMapped();
+
+    const fitted = harness.fits[harness.fits.length - 1];
+    expect(fitted).toBeDefined();
+    const [[west, south], [east, north]] = fitted;
+    /* The course is 0.012 by 0.011 degrees; the hole and its margin are a
+     * fraction of that, and hold every point of the line. */
+    expect(east - west).toBeLessThan(0.006);
+    expect(north - south).toBeLessThan(0.006);
+    for (const [lng, lat] of OSM_LINE) {
+      expect(lng).toBeGreaterThan(west);
+      expect(lng).toBeLessThan(east);
+      expect(lat).toBeGreaterThan(south);
+      expect(lat).toBeLessThan(north);
+    }
+  });
+
+  it('draws none of it as the contributor’s own confirmed work (R8)', async () => {
+    await mountMapped();
+
+    const statuses = drawnFeatures().map((f) => f.properties.status);
+    expect(statuses.length).toBeGreaterThan(0);
+    expect(statuses).not.toContain('confirmed');
+    expect(new Set(statuses)).toEqual(new Set(['existing']));
+    /* And that status has a colour of its own, not the confirmed one. */
+    expect(STATUS_COLOR).toContain('existing');
+    expect(EXISTING_COLOR).not.toBe(CONFIRMED_COLOR);
+    expect(EXISTING_COLOR).not.toBe(PROPOSED_COLOR);
+  });
+
+  it('says the line is the map’s, names what is outlined, and offers detection', async () => {
+    await mountMapped();
+
+    expect(screen.getByText('Already in OpenStreetMap')).toBeDefined();
+    expect(screen.getByText('a green and 2 bunkers')).toBeDefined();
+    /* Never "your line" over a line nobody in this session drew. */
+    expect(screen.queryByText('yd along your line')).toBeNull();
+    expect(screen.getByText("yd along OpenStreetMap's line")).toBeDefined();
+    /* A finished line is a line detection can be asked about (R1). */
+    expect(screen.getByText(ASK)).toBeDefined();
+    /* And the redraw is offered rather than a checklist telling them to click a
+     * tee that is already on screen. */
+    expect(screen.getByText('Draw my own line instead')).toBeDefined();
+    expect(screen.queryByText('The furthest back tee')).toBeNull();
+  });
+
+  it('counts what it names off the real features', () => {
+    expect(summariseExisting([])).toBe('');
+    expect(summariseExisting([{ tag: 'green' }])).toBe('a green');
+    expect(summariseExisting([{ tag: 'bunker' }, { tag: 'bunker' }])).toBe('2 bunkers');
+    expect(summariseExisting([{ tag: 'green' }, { tag: 'water_hazard' }])).toBe(
+      'a green and a water hazard',
+    );
   });
 });

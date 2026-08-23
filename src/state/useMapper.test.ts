@@ -14,6 +14,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Polygon } from 'geojson';
 import { labelPoint, lineYards, yardsBetween, type LngLat } from '../geo/coords';
 import type { CourseDetail } from '../api/types';
+import type { OsmHoleFeature, OsmLookup } from '../api/overpass';
 import type { DetectResult, Proposal, ProposalKind } from '../api/detect';
 
 /**
@@ -101,7 +102,7 @@ function stateWith(overrides: Partial<MapperState>): MapperState {
 }
 
 function drawn(points: LngLat[], overrides: Partial<MapperState> = {}) {
-  return computeDerived(stateWith({ locate: { points, finished: true }, ...overrides }));
+  return computeDerived(stateWith({ locate: { points, finished: true, source: 'drawn' as const }, ...overrides }));
 }
 
 /**
@@ -184,38 +185,184 @@ describe('drawing, undoing and finishing', () => {
     return hook;
   }
 
-  it('starts on the line even for a hole OpenStreetMap already holds', () => {
+  /** A lookup that holds hole 1 — its line, and whatever is outlined on it. */
+  function osmHolding(features: OsmHoleFeature[] = []): OsmLookup {
+    return {
+      status: 'found',
+      course: {
+        osmId: 'relation/3741806',
+        name: 'Pebble Beach Golf Links',
+        boundary: { type: 'Polygon', coordinates: [[[-121.95, 36.56], [-121.94, 36.56], [-121.94, 36.57], [-121.95, 36.56]]] },
+        acres: 176,
+        bbox: [-121.95, 36.56, -121.94, 36.57],
+        /* Hole 1 is already on the map, so its status is `complete`. */
+        mappedHoleRefs: [1],
+        holes: [
+          {
+            osmId: 'way/671717506',
+            ref: 1,
+            nine: null,
+            osmRef: '1',
+            par: 4,
+            line: { type: 'LineString', coordinates: [PEBBLE_TEE, PEBBLE_TURN, PEBBLE_GREEN] },
+            features,
+          },
+        ],
+        landmarks: [],
+        matchedBy: 'name',
+      },
+    };
+  }
+
+  /** A green, as OSM holds it: a small square by the end of hole 1's line. */
+  function osmGreen(): OsmHoleFeature {
+    const [lng, lat] = PEBBLE_GREEN;
+    const d = 0.00015;
+    return {
+      id: 'way/820001',
+      kind: 'green',
+      tag: 'green',
+      name: null,
+      geometry: {
+        type: 'Polygon',
+        coordinates: [
+          [
+            [lng - d, lat - d],
+            [lng + d, lat - d],
+            [lng + d, lat + d],
+            [lng - d, lat + d],
+            [lng - d, lat - d],
+          ],
+        ],
+      },
+    };
+  }
+
+  it('opens a hole OpenStreetMap already holds on the line and outlines it holds', () => {
     /*
-     * `complete` means OSM has the hole, not that this app has its geometry —
-     * the lookup carries which hole numbers exist, not their shape. Opening one
-     * into the review sequence walked the contributor through empty questions
-     * ("we did not find a green here") over a hole with nothing drawn on it and
-     * no way to draw one.
+     * The lookup now carries geometry, not only hole numbers, so a mapped hole
+     * opens showing what is there rather than an empty frame over the course.
      */
     const hook = renderHook(() => useMapper());
-    act(() =>
-      hook.result.current.actions.openCourse(SESSION, {
-        status: 'found',
-        course: {
-          osmId: 'relation/3741806',
-          name: 'Pebble Beach Golf Links',
-          boundary: { type: 'Polygon', coordinates: [[[-121.95, 36.56], [-121.94, 36.56], [-121.94, 36.57], [-121.95, 36.56]]] },
-          acres: 176,
-          bbox: [-121.95, 36.56, -121.94, 36.57],
-          /* Hole 1 is already on the map, so its status is `complete`. */
-          mappedHoleRefs: [1],
-          landmarks: [],
-          matchedBy: 'name',
-        },
-      }),
-    );
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding([osmGreen()])));
     expect(hook.result.current.state.holeStatus[0]).toBe('complete');
 
     act(() => hook.result.current.actions.openHole(0));
 
     expect(hook.result.current.state.mode).toBe('locate');
+    expect(hook.result.current.state.locate.points).toEqual([PEBBLE_TEE, PEBBLE_TURN, PEBBLE_GREEN]);
+    /* Finished, so the rail is "here is what is here" and detection is offered. */
+    expect(hook.result.current.state.locate.finished).toBe(true);
+    expect(hook.result.current.derived.canRequestProposals).toBe(true);
+    expect(hook.result.current.state.existing.map((f) => f.id)).toEqual(['way/820001']);
     /* And nothing is being reviewed, so no empty question is asked. */
     expect(hook.result.current.derived.proposals).toEqual([]);
+  });
+
+  it('carries what OpenStreetMap calls the hole when that is not the card number', () => {
+    /*
+     * A club that plays three nines as three eighteens files the contributor's
+     * hole 10 as somebody's 1st. The screen quotes the OSM name so the two read
+     * as the same hole rather than as a mistake.
+     */
+    const lookup = osmHolding();
+    if (lookup.status !== 'found') throw new Error('expected a lookup');
+    lookup.course.holes[0] = { ...lookup.course.holes[0], nine: 'Lakes', osmRef: 'Lakes #1' };
+
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, lookup));
+    act(() => hook.result.current.actions.openHole(0));
+
+    expect(hook.result.current.derived.osmHoleRef).toBe('Lakes #1');
+
+    /* A plain eighteen says nothing: "hole 1, which OSM calls 1" is noise. */
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding()));
+    act(() => hook.result.current.actions.openHole(0));
+    expect(hook.result.current.derived.osmHoleRef).toBeNull();
+  });
+
+  it('never draws what OpenStreetMap holds as though the contributor confirmed it', () => {
+    /* R8: `confirmed` is reserved for what a human said yes to, and nobody has
+     * been asked about a shape that was already in the map. */
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding([osmGreen()])));
+    act(() => hook.result.current.actions.openHole(0));
+
+    const statuses = hook.result.current.derived.features.map((f) => f.properties.status);
+    expect(statuses).not.toContain('confirmed');
+    expect(new Set(statuses)).toEqual(new Set(['existing']));
+    expect(hook.result.current.derived.lineFromOsm).toBe(true);
+  });
+
+  it('frames a mapped hole on its own line rather than on the whole course', () => {
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding([osmGreen()])));
+    act(() => hook.result.current.actions.openHole(0));
+
+    const bounds = hook.result.current.derived.mapBounds;
+    if (!bounds) throw new Error('expected an extent');
+    const [west, south, east, north] = bounds;
+    /* A frame on the hole, not on the course: the line spans 0.0034 degrees of
+     * longitude, and the course bbox this would otherwise have used spans 0.01
+     * by 0.01. */
+    expect(east - west).toBeLessThan(0.006);
+    expect(north - south).toBeLessThan(0.006);
+    /* And it holds every point of the line it is framing. */
+    for (const [lng, lat] of [PEBBLE_TEE, PEBBLE_TURN, PEBBLE_GREEN]) {
+      expect(lng).toBeGreaterThan(west);
+      expect(lng).toBeLessThan(east);
+      expect(lat).toBeGreaterThan(south);
+      expect(lat).toBeLessThan(north);
+    }
+  });
+
+  it('opens a hole OpenStreetMap does not hold exactly as before: empty, on the course', () => {
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding()));
+
+    /* Hole 2 is not one of the holes the lookup carried. */
+    act(() => hook.result.current.actions.openHole(1));
+
+    expect(hook.result.current.state.locate.points).toEqual([]);
+    expect(hook.result.current.state.locate.source).toBe('drawn');
+    expect(hook.result.current.state.existing).toEqual([]);
+    expect(hook.result.current.derived.mapBounds).toEqual([-121.95, 36.56, -121.94, 36.57]);
+  });
+
+  it('hands the line to the contributor the moment they touch it', () => {
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding([osmGreen()])));
+    act(() => hook.result.current.actions.openHole(0));
+
+    act(() => hook.result.current.actions.undoLastPoint());
+
+    expect(hook.result.current.state.locate.source).toBe('drawn');
+    expect(hook.result.current.state.locate.finished).toBe(false);
+    expect(hook.result.current.state.locate.points).toEqual([PEBBLE_TEE, PEBBLE_TURN]);
+  });
+
+  it('keeps what OpenStreetMap outlines when the contributor starts the line again', () => {
+    /* The green is not a draft of theirs to throw away — and they are about to
+     * draw a line past it. */
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding([osmGreen()])));
+    act(() => hook.result.current.actions.openHole(0));
+
+    act(() => hook.result.current.actions.resetLocate());
+
+    expect(hook.result.current.state.locate).toEqual({ points: [], finished: false, source: 'drawn' });
+    expect(hook.result.current.state.existing.map((f) => f.id)).toEqual(['way/820001']);
+  });
+
+  it('leaves one hole’s outlines behind when another is opened', () => {
+    const hook = renderHook(() => useMapper());
+    act(() => hook.result.current.actions.openCourse(SESSION, osmHolding([osmGreen()])));
+    act(() => hook.result.current.actions.openHole(0));
+    expect(hook.result.current.state.existing).toHaveLength(1);
+
+    act(() => hook.result.current.actions.openHole(1));
+
+    expect(hook.result.current.state.existing).toEqual([]);
   });
 
   it('places tee, turn points and green in the order they are clicked', () => {
@@ -420,7 +567,7 @@ describe('reviewing proposals one at a time', () => {
     act(() =>
       hook.result.current.actions.patch({
         mode: 'ready',
-        locate: { points: [PEBBLE_TEE, PEBBLE_TURN, PEBBLE_GREEN], finished: true },
+        locate: { points: [PEBBLE_TEE, PEBBLE_TURN, PEBBLE_GREEN], finished: true, source: 'drawn' },
         detect: {
           status: 'ready',
           jobId: 'job-1',

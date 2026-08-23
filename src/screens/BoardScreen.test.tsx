@@ -83,6 +83,7 @@ describe('the board and what OpenStreetMap holds', () => {
         acres: 176,
         bbox: [-121.955, 36.563, -121.943, 36.574],
         mappedHoleRefs: [1, 2, 3],
+        holes: [],
         landmarks: [],
         matchedBy: 'name',
       },

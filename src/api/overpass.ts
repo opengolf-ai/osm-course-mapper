@@ -19,8 +19,16 @@
  *
  * No React here — the module stays a pure unit.
  */
-import type { MultiPolygon, Polygon, Position } from 'geojson';
-import { labelPoint, polygon, polygonAcres, yardsBetween, type LngLat } from '../geo/coords';
+import type { LineString, MultiPolygon, Polygon, Position } from 'geojson';
+import {
+  labelPoint,
+  polygon,
+  polygonAcres,
+  yardsBetween,
+  yardsToLine,
+  type FeatureKind,
+  type LngLat,
+} from '../geo/coords';
 
 /** The public instance. Sends `access-control-allow-origin: *` and needs no key. */
 export const OVERPASS_ENDPOINT = 'https://overpass-api.de/api/interpreter';
@@ -49,6 +57,19 @@ export const NAME_MATCH_THRESHOLD = 0.6;
  */
 export const CENTROID_CEILING_METRES = 600;
 
+/**
+ * How far a tagged golf feature may sit from a playing line before it stops
+ * counting as part of that hole.
+ *
+ * Features are attached to the nearest hole line, which needs a ceiling or a
+ * practice green on the far side of the clubhouse joins whichever hole happens
+ * to be least distant. A hundred yards clears the widest fairway and the deepest
+ * greenside bunker while stopping short of the next hole over on all but the
+ * tightest routings — and OSM's own `ref` tag, when a mapper set one, is
+ * believed ahead of any distance.
+ */
+export const HOLE_FEATURE_CEILING_YARDS = 100;
+
 const METRES_PER_YARD = 0.9144;
 const METRES_PER_DEGREE_LATITUDE = 111_320;
 
@@ -70,6 +91,56 @@ export interface OsmLandmark {
   position: LngLat;
 }
 
+/**
+ * One thing OSM already outlines on a hole: its green, a bunker, the fairway,
+ * a tee box, a pond, a cart path.
+ *
+ * Geometry, not a description (KTD6): what comes back here is drawn on the map
+ * as an outline, so it has to be the shape OSM holds and not a summary of it.
+ * Multipolygons are split into their parts on the way in — a fairway mapped as a
+ * relation with two lobes becomes two outlines, which is what the fill layer's
+ * `Polygon` filter can draw.
+ */
+export interface OsmHoleFeature {
+  /** OSM element identity, e.g. "way/500123". */
+  id: string;
+  /** The kind the app draws it as, mapped from the `golf` tag. */
+  kind: FeatureKind;
+  /** The `golf` tag value itself, so a caption can say what OSM actually calls it. */
+  tag: string;
+  /** The `name` tag, when the element carries one. */
+  name: string | null;
+  geometry: Polygon | LineString;
+}
+
+/**
+ * One hole OpenStreetMap already holds: the playing line, and what is outlined
+ * along it.
+ *
+ * `line` is the `golf=hole` way as OSM stores it. By convention it runs tee
+ * first, green last, which is why the review screen can label its ends without
+ * asking anyone.
+ */
+export interface OsmHole {
+  /** OSM element identity, e.g. "way/800001". */
+  osmId: string;
+  /**
+   * The hole's number **on the card the contributor opened**, which is not
+   * always the number in its `ref` tag. A composite eighteen plays two of a
+   * club's nines, so card hole 12 can be OSM's `Valley #3`.
+   */
+  ref: number;
+  /** The nine this hole belongs to, when OSM names one: "Lakes", "Mountain". */
+  nine: string | null;
+  /** What the tag actually said — "Lakes #3", "7" — so a screen can quote it. */
+  osmRef: string;
+  /** The `par` tag, when the way carries one. Never guessed from length. */
+  par: number | null;
+  line: LineString;
+  /** Everything tagged `golf=*` that belongs to this hole, nearest-line first. */
+  features: OsmHoleFeature[];
+}
+
 /** The course OpenStreetMap already holds, as the screens read it. */
 export interface OsmCourse {
   /** OSM element identity, e.g. "relation/3741806". */
@@ -80,8 +151,10 @@ export interface OsmCourse {
   acres: number;
   /** Map framing extent, in `[west, south, east, north]` — the order `BaseMap` takes. */
   bbox: [number, number, number, number];
-  /** `golf=hole` refs found inside the boundary, ascending. */
+  /** `golf=hole` refs found inside the boundary, ascending. The refs of `holes`. */
   mappedHoleRefs: number[];
+  /** The playing lines inside the boundary and what OSM outlines along them, by ref. */
+  holes: OsmHole[];
   landmarks: OsmLandmark[];
   /** Which of the two rules adopted this course, so the screen can say. */
   matchedBy: 'name' | 'proximity';
@@ -108,6 +181,15 @@ export interface OsmCourseQuery {
   name: string;
   latitude: number;
   longitude: number;
+  /**
+   * The card, hole by hole, when the record carried one.
+   *
+   * Only the par sequence is used, and only for one thing: working out which of
+   * a club's nines a composite eighteen actually plays. Hidden Valley Country
+   * Club in Sandy is three nines paired three ways, and its card is the only
+   * thing that says whether "hole 1" is the Lakes 1st or the Mountain 1st.
+   */
+  holes?: ReadonlyArray<{ number: number; par: number | null }>;
 }
 
 /* --- The query ------------------------------------------------------------ */
@@ -133,6 +215,12 @@ export function overpassBbox(latitude: number, longitude: number): OverpassBbox 
  * `nwr` rather than `way`: Pebble Beach and Poppy Hills are both mapped as
  * relations, so a way-only query misses them entirely. `out geom` returns member
  * geometry on relations, which is what makes the multipolygon assemblable.
+ *
+ * `nwr["golf"]` rather than a list of the golf values we care about. It is one
+ * selector instead of four, and it is what makes a hole that is already mapped
+ * openable: the greens, bunkers, fairways and tees come back in the same answer
+ * as the playing lines they belong to, so opening a mapped hole draws what OSM
+ * holds rather than an empty frame over the right acre of grass.
  */
 export function overpassQuery(box: OverpassBbox): string {
   const bbox = `(${box.south},${box.west},${box.north},${box.east})`;
@@ -140,8 +228,7 @@ export function overpassQuery(box: OverpassBbox): string {
     `[out:json][timeout:${Math.round(OVERPASS_TIMEOUT_MS / 1000)}];`,
     '(',
     `  nwr["leisure"="golf_course"]${bbox};`,
-    `  nwr["golf"="hole"]${bbox};`,
-    `  nwr["golf"~"^(clubhouse|driving_range|practice|academy)$"]${bbox};`,
+    `  nwr["golf"]${bbox};`,
     `  nwr["building"="clubhouse"]${bbox};`,
     `  nwr["leisure"="miniature_golf"]${bbox};`,
     `  nwr["shop"="golf"]${bbox};`,
@@ -482,6 +569,312 @@ function landmarkKind(tags: Record<string, string>): string | null {
   return null;
 }
 
+/* --- Which hole is which ---------------------------------------------------*/
+
+/**
+ * A hole's tag, split into the nine it belongs to and its number.
+ *
+ * `ref=7` is the easy case. The one this exists for is a club with more than one
+ * nine, where the tag carries both: Hidden Valley Country Club in Sandy tags its
+ * three nines `ref=1`…`9` with `name=Mountain #1`, `ref=Lakes #1`, and
+ * `ref=Valley #1`. Reading those with `parseInt` yields `NaN` for two nines out
+ * of three, which silently drops eighteen of the club's twenty-seven holes and
+ * leaves the third nine answering to every card number.
+ *
+ * The number is the digits at the end; anything before them, less separators, is
+ * the nine's name.
+ */
+export function parseHoleRef(tag: string | undefined | null): { nine: string | null; number: number } | null {
+  if (!tag) return null;
+  const match = /^(.*?)(\d+)\s*$/.exec(tag.trim());
+  if (!match) return null;
+  const number = Number.parseInt(match[2], 10);
+  if (!Number.isFinite(number) || number < 1) return null;
+  const nine = match[1].replace(/[#\s\-–—:.]+$/u, '').trim();
+  return { nine: nine.length > 0 ? nine : null, number };
+}
+
+/** How many holes a nine holds. Blocks of a composite card are counted in these. */
+const HOLES_PER_NINE = 9;
+
+/** One of a club's nines, as OSM holds it. */
+interface Nine {
+  /** The name on the tags, or null for a nine whose holes carry bare numbers. */
+  label: string | null;
+  holes: RawHole[];
+}
+
+/** A `golf=hole` way, read but not yet matched to a hole on the card. */
+interface RawHole {
+  osmId: string;
+  osmRef: string;
+  nine: string | null;
+  number: number;
+  par: number | null;
+  line: LineString;
+}
+
+/** The nine's pars in hole order, or null when OSM does not carry all of them. */
+function ninePars(nine: Nine): number[] | null {
+  const pars = nine.holes.map((hole) => hole.par);
+  return pars.every((par): par is number => par !== null) ? pars : null;
+}
+
+/**
+ * Which nine each block of the card plays, by matching pars hole for hole.
+ *
+ * The strongest evidence there is, and it comes from the holes themselves rather
+ * than from anybody's naming: Hidden Valley's Lakes nine plays 5-3-4-4-4-4-3-4-5
+ * and its card's front nine reads the same, while the Mountain nine
+ * (5-4-4-3-4-4-4-5-3) matches neither half. A block that matches two nines
+ * equally well — a club with two identical nines — is no evidence at all and
+ * resolves to null, leaving the naming below to answer.
+ */
+function ninesByPar(nines: Nine[], card: ReadonlyArray<{ number: number; par: number | null }>, blocks: number): (Nine | null)[] {
+  const byNumber = [...card].sort((a, b) => a.number - b.number);
+  return Array.from({ length: blocks }, (_, block) => {
+    const wanted = byNumber
+      .slice(block * HOLES_PER_NINE, (block + 1) * HOLES_PER_NINE)
+      .map((hole) => hole.par);
+    if (wanted.length < HOLES_PER_NINE || wanted.some((par) => par === null)) return null;
+    const matched = nines.filter((nine) => {
+      const pars = ninePars(nine);
+      return pars !== null && pars.length === wanted.length && pars.every((par, i) => par === wanted[i]);
+    });
+    return matched.length === 1 ? matched[0] : null;
+  });
+}
+
+/**
+ * Which nine each block of the card plays, by reading the course's own name.
+ *
+ * OpenGolfAPI files a composite as "Hidden Valley Country Club Lakes Valley",
+ * which names the nines in the order they are played. The club's own name is cut
+ * off the front first, and that is not fussiness: "Valley" appears in "Hidden
+ * Valley" as well, so searching the whole string finds the Valley nine before
+ * the Lakes nine and pairs the card backwards.
+ */
+function ninesByName(nines: Nine[], courseName: string, osmName: string | null, blocks: number): (Nine | null)[] {
+  const tokens = (value: string) =>
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter((token) => token.length > 0);
+
+  const card = tokens(courseName);
+  const club = osmName ? tokens(osmName) : [];
+  /* Only a leading club name is cut: a name that does not start with it is not
+   * one this can safely trim. */
+  const startsWithClub = club.length > 0 && club.every((token, i) => card[i] === token);
+  const remainder = startsWithClub ? card.slice(club.length) : card;
+
+  const placed: Array<{ at: number; nine: Nine }> = [];
+  for (const nine of nines) {
+    if (!nine.label) continue;
+    const label = tokens(nine.label);
+    if (label.length === 0) continue;
+    /* The last occurrence, so a label that also appears in the club name is
+     * read where it is being used as a nine. */
+    let at = -1;
+    for (let i = 0; i + label.length <= remainder.length; i += 1) {
+      if (label.every((token, k) => remainder[i + k] === token)) at = i;
+    }
+    if (at >= 0) placed.push({ at, nine });
+  }
+  placed.sort((a, b) => a.at - b.at);
+  return Array.from({ length: blocks }, (_, block) => placed[block]?.nine ?? null);
+}
+
+/**
+ * Give every OSM hole the number it carries on the card the contributor opened.
+ *
+ * One nine, or a course whose holes are numbered straight through, needs none of
+ * this — the tag number is the card number. A club with several nines does: the
+ * card is a pairing of two of them, and which two is not something the hole tags
+ * say. Pars answer it first, the course name second, and nothing answers it
+ * third — an unresolved block contributes no holes at all, because drawing the
+ * Mountain 1st over a contributor reviewing the Lakes 1st is worse in every way
+ * than drawing nothing.
+ */
+function numberAgainstCard(raw: RawHole[], query: OsmCourseQuery, osmName: string | null): OsmHole[] {
+  const byLabel = new Map<string | null, Nine>();
+  for (const hole of raw) {
+    const existing = byLabel.get(hole.nine);
+    if (existing) existing.holes.push(hole);
+    else byLabel.set(hole.nine, { label: hole.nine, holes: [hole] });
+  }
+  const nines = [...byLabel.values()];
+  for (const nine of nines) nine.holes.sort((a, b) => a.number - b.number);
+
+  const build = (hole: RawHole, cardNumber: number): OsmHole => ({
+    osmId: hole.osmId,
+    ref: cardNumber,
+    nine: hole.nine,
+    osmRef: hole.osmRef,
+    par: hole.par,
+    line: hole.line,
+    features: [],
+  });
+
+  /* The ordinary course: one set of numbers, used as they are. */
+  if (nines.length <= 1) return raw.map((hole) => build(hole, hole.number));
+
+  const card = query.holes ?? [];
+  const blocks = Math.max(1, Math.ceil((card.length || HOLES_PER_NINE * 2) / HOLES_PER_NINE));
+  const byPar = ninesByPar(nines, card, blocks);
+  const byName = ninesByName(nines, query.name, osmName, blocks);
+
+  const holes: OsmHole[] = [];
+  const used = new Set<Nine>();
+  for (let block = 0; block < blocks; block += 1) {
+    const nine = byPar[block] ?? byName[block] ?? null;
+    /* A nine cannot be played twice in one round; a resolution that says so is
+     * a resolution that is wrong. */
+    if (!nine || used.has(nine)) continue;
+    used.add(nine);
+    for (const hole of nine.holes) {
+      holes.push(build(hole, block * HOLES_PER_NINE + hole.number));
+    }
+  }
+  return holes;
+}
+
+/* --- What OSM outlines on a hole ------------------------------------------ */
+
+/**
+ * The `golf` tag values this app can draw, and what it draws them as.
+ *
+ * Only the outlines a contributor is asked about elsewhere in the app appear
+ * here. `golf=hole` is deliberately absent — it is the playing line, handled as
+ * the hole itself — and so are clubhouses and driving ranges, which are course
+ * furniture rather than anything on a hole and are already read as landmarks.
+ */
+const GOLF_TAG_KIND: Record<string, FeatureKind> = {
+  green: 'green',
+  bunker: 'bunker',
+  fairway: 'fairway',
+  tee: 'tee',
+  rough: 'rough',
+  water_hazard: 'water',
+  lateral_water_hazard: 'water',
+  path: 'path',
+  cartpath: 'path',
+};
+
+/** Every polygon an element outlines, multipolygons split into their parts. */
+function elementPolygons(element: OverpassElement): Polygon[] {
+  const boundary = elementBoundary(element);
+  if (!boundary) return [];
+  if (boundary.type === 'Polygon') return [boundary];
+  return boundary.coordinates.map((coordinates) => ({ type: 'Polygon', coordinates }));
+}
+
+/**
+ * The shapes one `golf=*` element contributes.
+ *
+ * A path is a line and everything else is an area, which is not a stylistic
+ * choice — a cart path mapped as an open way has no interior to fill, and
+ * forcing one closed would draw a shape OSM does not hold (KTD13).
+ */
+function golfGeometries(element: OverpassElement, kind: FeatureKind): (Polygon | LineString)[] {
+  if (kind === 'path') {
+    const points = toPositions(element.geometry);
+    if (points.length >= 2 && !isClosed(points)) {
+      return [{ type: 'LineString', coordinates: points.map((point) => [...point]) }];
+    }
+  }
+  return elementPolygons(element);
+}
+
+/**
+ * How far a green or a tee may sit from the end of a playing line it belongs to.
+ *
+ * Looser than the ceiling for everything else because the measurement is to a
+ * single point rather than to a whole line: a `golf=hole` way commonly stops at
+ * the front of the green or at the middle of one tee box, so the centroid of the
+ * thing it stops at is legitimately tens of yards further on.
+ */
+export const HOLE_END_CEILING_YARDS = 120;
+
+/**
+ * How far a feature is from the hole it might belong to.
+ *
+ * A green is measured to where the line *ends* and a tee to where it *starts*,
+ * not to the nearest point on the line — which sounds like a refinement and is
+ * really a correctness fix. Holes run alongside each other, so on the ground at
+ * Hidden Valley a green can be 60 yards from its own hole's line and 63 from the
+ * neighbouring one, and nearest-line put it on the wrong hole. Measured to the
+ * ends, which is what a green and a tee actually are, the same 27 holes each
+ * come out with their own green.
+ */
+function yardsToHole(kind: FeatureKind, centre: LngLat, line: LineString): number {
+  const coordinates = line.coordinates as LngLat[];
+  if (kind === 'green') return yardsBetween(centre, coordinates[coordinates.length - 1]);
+  if (kind === 'tee') return yardsBetween(centre, coordinates[0]);
+  return yardsToLine(centre, line);
+}
+
+/** The ceiling that applies to one kind of feature. */
+function ceilingFor(kind: FeatureKind): number {
+  return kind === 'green' || kind === 'tee' ? HOLE_END_CEILING_YARDS : HOLE_FEATURE_CEILING_YARDS;
+}
+
+/**
+ * Attach each outlined feature to the hole it belongs to.
+ *
+ * OSM's own `ref` is believed first: a mapper who wrote `ref=7` on a green has
+ * said which hole it is, and no distance measurement outranks that — though on a
+ * club with several nines it is read the same way a hole's own ref is, since
+ * `ref=Lakes #7` names a nine as well as a number. Everything else goes to the
+ * nearest hole and only inside the ceiling for its kind: a practice green by the
+ * clubhouse is nearest to *something*, and putting it on that hole would draw a
+ * shape the contributor is being asked to trust on a hole it has nothing to do
+ * with.
+ */
+function attachFeatures(
+  holes: OsmHole[],
+  candidates: {
+    feature: OsmHoleFeature;
+    ref: { nine: string | null; number: number } | null;
+    centre: LngLat;
+  }[],
+): void {
+  if (holes.length === 0) return;
+  /* Keyed on the nine and the number the tag actually carries, which is what a
+   * feature's ref is written in — not on the card number the hole ended up with. */
+  const byTag = new Map<string, OsmHole>(
+    holes.map((hole) => [`${hole.nine ?? ''}#${parseHoleRef(hole.osmRef)?.number ?? hole.ref}`, hole]),
+  );
+
+  for (const candidate of candidates) {
+    const tagged = candidate.ref
+      ? (byTag.get(`${candidate.ref.nine ?? ''}#${candidate.ref.number}`) ??
+        /* A bare `ref=7` on a course with one nine still names hole 7. */
+        (candidate.ref.nine === null && byTag.size === holes.length
+          ? holes.find((hole) => parseHoleRef(hole.osmRef)?.number === candidate.ref?.number && hole.nine === null)
+          : undefined))
+      : undefined;
+    if (tagged) {
+      tagged.features.push(candidate.feature);
+      continue;
+    }
+    let nearest: OsmHole | null = null;
+    let nearestYards = Infinity;
+    for (const hole of holes) {
+      const yards = yardsToHole(candidate.feature.kind, candidate.centre, hole.line);
+      if (yards < nearestYards) {
+        nearest = hole;
+        nearestYards = yards;
+      }
+    }
+    if (nearest && nearestYards <= ceilingFor(candidate.feature.kind)) {
+      nearest.features.push(candidate.feature);
+    }
+  }
+}
+
 /* --- Reading the answer --------------------------------------------------- */
 
 function elementId(element: OverpassElement): string {
@@ -511,15 +904,94 @@ function interpret(body: unknown, query: OsmCourseQuery): OsmLookup | null {
   if (!selected) return { status: 'absent' };
   const { boundary } = selected.candidate;
 
-  const refs = new Set<number>();
+  /*
+   * The playing lines, with their geometry.
+   *
+   * A hole is read as the nine it belongs to plus its number within that nine,
+   * because on a club with more than one nine those are two different facts and
+   * the tag carries both. The nine's name comes off `ref` where the mapper put
+   * it there ("Lakes #4") and off `name` where they put it there instead
+   * ("Mountain #1", `ref=1`) — Hidden Valley in Sandy does both, on the same
+   * course, and reading only `ref` leaves its Mountain nine answering to every
+   * card number while eighteen other holes go missing.
+   */
+  const drawnHoles = new Map<string, RawHole>();
   for (const element of elements) {
     if (element.tags?.golf !== 'hole') continue;
-    const ref = Number.parseInt(element.tags.ref ?? '', 10);
-    if (!Number.isFinite(ref)) continue;
+    const tagged = parseHoleRef(element.tags.ref);
+    const named = parseHoleRef(element.tags.name);
+    const number = tagged?.number ?? named?.number ?? null;
+    if (number === null) continue;
     /* A neighbour's holes sit in the same bbox; only what the adopted line
      * touches is this course's. */
-    if (withinBoundary(element, boundary)) refs.add(ref);
+    if (!withinBoundary(element, boundary)) continue;
+    const points = toPositions(element.geometry);
+    if (points.length < 2) continue;
+    /* The name only names the nine when it agrees about which hole it is. */
+    const nine = tagged?.nine ?? (named?.number === number ? named.nine : null) ?? null;
+    const par = Number.parseInt(element.tags.par ?? '', 10);
+    const hole: RawHole = {
+      osmId: elementId(element),
+      /* Whichever tag names the nine is the one worth quoting back: the
+       * Mountain holes are `ref=1` with `name=Mountain #1`, and "1" on its own
+       * is exactly the ambiguity the contributor is trying to resolve. */
+      osmRef: (tagged?.nine
+        ? element.tags.ref
+        : named?.nine && named.number === number
+          ? element.tags.name
+          : (element.tags.ref ?? element.tags.name)
+      )?.trim() ?? String(number),
+      nine,
+      number,
+      par: Number.isFinite(par) ? par : null,
+      line: { type: 'LineString', coordinates: points.map((point) => [...point]) },
+    };
+    /*
+     * Two ways for one hole happens; the fuller line is the one worth showing.
+     * Keyed on the nine as well as the number, so the Lakes 1st and the Mountain
+     * 1st are never mistaken for two drawings of the same hole.
+     */
+    const key = `${nine ?? ''}#${number}`;
+    const held = drawnHoles.get(key);
+    if (!held || held.line.coordinates.length < hole.line.coordinates.length) {
+      drawnHoles.set(key, hole);
+    }
   }
+  const holes = numberAgainstCard([...drawnHoles.values()], query, selected.candidate.name).sort(
+    (a, b) => a.ref - b.ref,
+  );
+
+  /* What OSM outlines along those lines, attached to whichever hole owns it. */
+  const outlined: {
+    feature: OsmHoleFeature;
+    ref: { nine: string | null; number: number } | null;
+    centre: LngLat;
+  }[] = [];
+  for (const element of elements) {
+    const tag = element.tags?.golf;
+    if (!tag) continue;
+    const kind = GOLF_TAG_KIND[tag];
+    if (!kind) continue;
+    if (!withinBoundary(element, boundary)) continue;
+    const id = elementId(element);
+    const parts = golfGeometries(element, kind);
+    parts.forEach((geometry, index) => {
+      outlined.push({
+        feature: {
+          /* A split multipolygon is several drawn shapes off one element, so the
+           * part index keeps their ids distinct. */
+          id: parts.length > 1 ? `${id}#${index}` : id,
+          kind,
+          tag,
+          name: element.tags?.name?.trim() || null,
+          geometry,
+        },
+        ref: parseHoleRef(element.tags?.ref) ?? null,
+        centre: labelPoint(geometry),
+      });
+    });
+  }
+  attachFeatures(holes, outlined);
 
   const landmarks: OsmLandmark[] = [];
   const seen = new Set<string>();
@@ -547,7 +1019,8 @@ function interpret(body: unknown, query: OsmCourseQuery): OsmLookup | null {
       boundary,
       acres: boundaryAcres(boundary),
       bbox: boundaryBbox(boundary),
-      mappedHoleRefs: [...refs].sort((a, b) => a - b),
+      mappedHoleRefs: holes.map((hole) => hole.ref),
+      holes,
       landmarks,
       matchedBy: selected.matchedBy,
     },

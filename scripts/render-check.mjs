@@ -88,6 +88,13 @@ const CHECKS = [
   ['reviewLocateDone',  'Save this line and carry on'],
   ['reviewLocateDone',  '382 yd along your line · Blue says 378'],
   ['reviewLocateDone',  'the Blue tees say 378 — close enough'],
+  // R8/R10: a hole already in OpenStreetMap opens showing it, and says whose it is.
+  ['reviewOsmHole',     'Already in OpenStreetMap'],
+  ['reviewOsmHole',     'Here is this hole, as the map has it.'],
+  ['reviewOsmHole',     'a green'],
+  // The apostrophe renders escaped, so the needle stops short of it.
+  ['reviewOsmHole',     '382 yd along OpenStreetMap'],
+  ['reviewOsmHole',     'Draw my own line instead'],
   ['reviewAddMode',     'Click the map where the bunker is.'],
   ['complete',          'Hole 1 is on the map.'],
   ['complete',          'Anyone pulling Pebble Beach Golf Links'],

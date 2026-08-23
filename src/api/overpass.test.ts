@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CENTROID_CEILING_METRES,
+  parseHoleRef,
   NAME_MATCH_THRESHOLD,
   OVERPASS_ENDPOINT,
   OVERPASS_RETRY_BACKOFF_MS,
@@ -134,6 +135,45 @@ function landmarks() {
   ];
 }
 
+
+/* --- A hole with its geometry, and what OSM outlines along it ------------- */
+
+/** A `golf=hole` way running due north, long enough to be a real hole. */
+function holeLine(id: number, ref: number, lon: number) {
+  return {
+    type: 'way',
+    id,
+    tags: { golf: 'hole', ref: String(ref), par: '4' },
+    geometry: [
+      { lat: 36.565, lon },
+      { lat: 36.568, lon },
+    ],
+  };
+}
+
+/** A small closed way tagged `golf=<value>`, centred on a point. */
+function golfArea(
+  id: number,
+  value: string,
+  lat: number,
+  lon: number,
+  tags: Record<string, string> = {},
+) {
+  const d = 0.00015;
+  return {
+    type: 'way',
+    id,
+    tags: { golf: value, ...tags },
+    geometry: [
+      { lat: lat - d, lon: lon - d },
+      { lat: lat - d, lon: lon + d },
+      { lat: lat + d, lon: lon + d },
+      { lat: lat + d, lon: lon - d },
+      { lat: lat - d, lon: lon - d },
+    ],
+  };
+}
+
 function overpassBody(elements: unknown[]) {
   return { version: 0.6, generator: 'Overpass API', elements };
 }
@@ -164,11 +204,12 @@ afterEach(() => {
 });
 
 describe('the Overpass request', () => {
-  it('asks for courses and holes as nodes, ways and relations, with geometry', () => {
+  it('asks for courses and everything tagged golf, with geometry', () => {
     const query = overpassQuery(overpassBbox(PEBBLE.latitude, PEBBLE.longitude));
 
     expect(query).toContain('nwr["leisure"="golf_course"]');
-    expect(query).toContain('nwr["golf"="hole"]');
+    /* Any `golf` value, so a mapped hole's green and bunkers come back with it. */
+    expect(query).toContain('nwr["golf"]');
     /* Ways alone miss Pebble Beach, whose boundary is a relation. */
     expect(query).toContain('out geom');
   });
@@ -193,6 +234,283 @@ describe('the Overpass request', () => {
     expect(url).toBe(OVERPASS_ENDPOINT);
     expect(init.method).toBe('POST');
     expect(String(init.body)).toContain('data=');
+  });
+});
+
+/**
+ * Hidden Valley Country Club, Sandy: twenty-seven holes as three nines, paired
+ * into three eighteens, and tagged three different ways on the same course. The
+ * Mountain nine carries `ref=1`…`9` with `name=Mountain #1`; the Lakes and
+ * Valley nines carry `ref=Lakes #1` and `ref=Valley #1` and no name at all.
+ * Every number and par below is what OpenStreetMap held on 2026-08-23.
+ */
+describe('a club that plays more than one nine', () => {
+  const PARS = {
+    Mountain: [5, 4, 4, 3, 4, 4, 4, 5, 3],
+    Lakes: [5, 3, 4, 4, 4, 4, 3, 4, 5],
+    Valley: [4, 4, 4, 3, 5, 4, 4, 3, 5],
+  };
+
+  /** Nine holes in a row, each a short line, spaced so none is near another. */
+  function nine(kind: keyof typeof PARS, baseId: number, lonBase: number, tagAs: 'ref' | 'name') {
+    return PARS[kind].map((par, i) => {
+      const lon = lonBase + i * 0.0003;
+      return {
+        type: 'way',
+        id: baseId + i,
+        tags:
+          tagAs === 'ref'
+            ? { golf: 'hole', ref: `${kind} #${i + 1}`, par: String(par) }
+            : { golf: 'hole', ref: String(i + 1), name: `${kind} #${i + 1}`, par: String(par) },
+        geometry: [
+          { lat: 36.5645, lon },
+          { lat: 36.5675, lon },
+        ],
+      };
+    });
+  }
+
+  const ALL_TWENTY_SEVEN = () => [
+    ...nine('Mountain', 830000, -121.9540, 'name'),
+    ...nine('Lakes', 831000, -121.9500, 'ref'),
+    ...nine('Valley', 832000, -121.9460, 'ref'),
+  ];
+
+  /** An eighteen-hole card: two nines' pars, numbered 1 through 18. */
+  function card(front: keyof typeof PARS, back: keyof typeof PARS) {
+    return [...PARS[front], ...PARS[back]].map((par, i) => ({ number: i + 1, par }));
+  }
+
+  it('reads the nine and the number out of a decorated ref', () => {
+    expect(parseHoleRef('Lakes #4')).toEqual({ nine: 'Lakes', number: 4 });
+    expect(parseHoleRef('7')).toEqual({ nine: null, number: 7 });
+    expect(parseHoleRef('Mountain #1')).toEqual({ nine: 'Mountain', number: 1 });
+    expect(parseHoleRef('Back 9 - 3')).toEqual({ nine: 'Back 9', number: 3 });
+    /* Nothing to read is not hole zero. */
+    expect(parseHoleRef('')).toBeNull();
+    expect(parseHoleRef(undefined)).toBeNull();
+    expect(parseHoleRef('practice')).toBeNull();
+  });
+
+  it('pairs the card to the right two nines by their pars', async () => {
+    /*
+     * The bug this pins. `parseInt` read `Lakes #1` as NaN, so two nines out of
+     * three were dropped and the third — the only one with bare numbers —
+     * answered to every card number: opening the Lakes/Valley 1st drew the
+     * Mountain 1st, a couple of hundred yards away across the property.
+     */
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), ...ALL_TWENTY_SEVEN()]));
+
+    const lookup = await lookupOsmCourse({ ...PEBBLE, name: 'Pebble Beach Lakes Valley', holes: card('Lakes', 'Valley') });
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.mappedHoleRefs).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    ]);
+    expect(lookup.course.holes.map((hole) => hole.osmRef)).toEqual([
+      'Lakes #1', 'Lakes #2', 'Lakes #3', 'Lakes #4', 'Lakes #5', 'Lakes #6', 'Lakes #7', 'Lakes #8', 'Lakes #9',
+      'Valley #1', 'Valley #2', 'Valley #3', 'Valley #4', 'Valley #5', 'Valley #6', 'Valley #7', 'Valley #8', 'Valley #9',
+    ]);
+    /* And the Mountain nine, which this eighteen does not play, is not on it. */
+    expect(lookup.course.holes.some((hole) => hole.nine === 'Mountain')).toBe(false);
+  });
+
+  it('finds the nine whose holes are numbered plainly, named only on the way', async () => {
+    /* The Mountain nine's refs are bare numbers; only its `name` says which
+     * nine it is, and without reading that it is invisible to any pairing. */
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), ...ALL_TWENTY_SEVEN()]));
+
+    const lookup = await lookupOsmCourse({
+      ...PEBBLE,
+      id: 'mountain-valley',
+      name: 'Pebble Beach Mountain Valley',
+      holes: card('Mountain', 'Valley'),
+    });
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.holes[0].osmRef).toBe('Mountain #1');
+    expect(lookup.course.holes[0].nine).toBe('Mountain');
+    expect(lookup.course.holes[9].osmRef).toBe('Valley #1');
+    /* Card numbering, not tag numbering: the Valley 1st is played as the 10th. */
+    expect(lookup.course.holes[9].ref).toBe(10);
+  });
+
+  it('falls back to the order the course name gives when there is no card', async () => {
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), ...ALL_TWENTY_SEVEN()]));
+
+    const lookup = await lookupOsmCourse({
+      ...PEBBLE,
+      id: 'no-card',
+      name: 'Pebble Beach Lakes Mountain',
+    });
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.holes[0].osmRef).toBe('Lakes #1');
+    expect(lookup.course.holes[9].osmRef).toBe('Mountain #1');
+  });
+
+  it('holds nothing rather than guess when neither the card nor the name says', async () => {
+    /*
+     * KTD12's rule, applied a level down: a course that cannot be identified is
+     * absent rather than wearing a neighbour's boundary, and a hole that cannot
+     * be identified is missing rather than wearing another nine's geometry.
+     */
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), ...ALL_TWENTY_SEVEN()]));
+
+    const lookup = await lookupOsmCourse({
+      ...PEBBLE,
+      id: 'anonymous',
+      name: 'Pebble Beach Golf Links',
+      /* A card whose pars match none of the three nines. */
+      holes: Array.from({ length: 18 }, (_, i) => ({ number: i + 1, par: 4 })),
+    });
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.holes).toEqual([]);
+    expect(lookup.course.mappedHoleRefs).toEqual([]);
+  });
+
+  it('never plays one nine twice', async () => {
+    /* A card of two identical nines matches the same OSM nine for both blocks;
+     * the second block has to come out empty rather than duplicated. */
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), ...ALL_TWENTY_SEVEN()]));
+
+    const lookup = await lookupOsmCourse({
+      ...PEBBLE,
+      id: 'doubled',
+      name: 'Pebble Beach Lakes Lakes',
+      holes: card('Lakes', 'Lakes'),
+    });
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    const refs = lookup.course.holes.map((hole) => hole.osmRef);
+    expect(new Set(refs).size).toBe(refs.length);
+    expect(refs).toEqual(['Lakes #1', 'Lakes #2', 'Lakes #3', 'Lakes #4', 'Lakes #5', 'Lakes #6', 'Lakes #7', 'Lakes #8', 'Lakes #9']);
+  });
+
+  it('leaves an ordinary eighteen numbered exactly as OSM numbers it', async () => {
+    /* One nine's worth of tags, all bare numbers: none of the above applies. */
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), ...holes()]));
+
+    const lookup = await lookupOsmCourse({ ...PEBBLE, id: 'plain' });
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.mappedHoleRefs).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    ]);
+    expect(lookup.course.holes[0].nine).toBeNull();
+  });
+});
+
+describe('the holes OpenStreetMap already holds', () => {
+  /* Two holes six hundred metres apart, so nothing is ambiguous about which
+   * line an outline belongs to. */
+  const HOLE_ONE = () => holeLine(810001, 1, -121.954);
+  const HOLE_TWO = () => holeLine(810002, 2, -121.948);
+
+  it('carries each hole’s playing line, not only its number', async () => {
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), HOLE_ONE(), HOLE_TWO()]));
+
+    const lookup = await lookupOsmCourse(PEBBLE);
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.mappedHoleRefs).toEqual([1, 2]);
+    const first = lookup.course.holes[0];
+    expect(first.osmId).toBe('way/810001');
+    expect(first.par).toBe(4);
+    expect(first.line.coordinates).toEqual([
+      [-121.954, 36.565],
+      [-121.954, 36.568],
+    ]);
+  });
+
+  it('attaches the green and the bunkers that sit on a hole to that hole', async () => {
+    vi.stubGlobal(
+      'fetch',
+      respondWith([
+        pebbleRelation(),
+        HOLE_ONE(),
+        HOLE_TWO(),
+        golfArea(820001, 'green', 36.568, -121.954, { name: 'First green' }),
+        golfArea(820002, 'bunker', 36.5672, -121.9543),
+        golfArea(820003, 'bunker', 36.5668, -121.9537),
+        golfArea(820004, 'green', 36.568, -121.948),
+      ]),
+    );
+
+    const lookup = await lookupOsmCourse(PEBBLE);
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    const [one, two] = lookup.course.holes;
+    expect(one.features.map((f) => f.kind).sort()).toEqual(['bunker', 'bunker', 'green']);
+    expect(one.features.find((f) => f.kind === 'green')?.name).toBe('First green');
+    expect(one.features[0].geometry.type).toBe('Polygon');
+    /* Hole 2's own green is not hole 1's, six hundred metres away. */
+    expect(two.features.map((f) => f.id)).toEqual(['way/820004']);
+  });
+
+  it('believes a ref tag over distance', async () => {
+    /* Sitting on hole 1's line, but its mapper says it belongs to hole 2. */
+    vi.stubGlobal(
+      'fetch',
+      respondWith([
+        pebbleRelation(),
+        HOLE_ONE(),
+        HOLE_TWO(),
+        golfArea(820005, 'tee', 36.5655, -121.954, { ref: '2' }),
+      ]),
+    );
+
+    const lookup = await lookupOsmCourse(PEBBLE);
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.holes[0].features).toEqual([]);
+    expect(lookup.course.holes[1].features.map((f) => f.kind)).toEqual(['tee']);
+  });
+
+  it('leaves an outline that is on no hole off every hole', async () => {
+    /* A practice green by the clubhouse, well past the ceiling from both lines.
+     * Attaching it to whichever hole is least distant would draw a shape on a
+     * hole it has nothing to do with. */
+    vi.stubGlobal(
+      'fetch',
+      respondWith([pebbleRelation(), HOLE_ONE(), HOLE_TWO(), golfArea(820006, 'green', 36.5725, -121.9455)]),
+    );
+
+    const lookup = await lookupOsmCourse(PEBBLE);
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.holes.every((hole) => hole.features.length === 0)).toBe(true);
+  });
+
+  it('reads a cart path as a line rather than closing it into a shape', async () => {
+    const path = {
+      type: 'way',
+      id: 820007,
+      tags: { golf: 'path' },
+      geometry: [
+        { lat: 36.5655, lon: -121.9542 },
+        { lat: 36.5665, lon: -121.9542 },
+      ],
+    };
+    vi.stubGlobal('fetch', respondWith([pebbleRelation(), HOLE_ONE(), path]));
+
+    const lookup = await lookupOsmCourse(PEBBLE);
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    const feature = lookup.course.holes[0].features[0];
+    expect(feature.kind).toBe('path');
+    expect(feature.geometry.type).toBe('LineString');
+  });
+
+  it('holds no hole geometry for a course whose holes OSM has not drawn', async () => {
+    vi.stubGlobal('fetch', respondWith([pebbleRelation()]));
+
+    const lookup = await lookupOsmCourse(PEBBLE);
+
+    if (lookup.status !== 'found') throw new Error('expected a boundary');
+    expect(lookup.course.holes).toEqual([]);
+    expect(lookup.course.mappedHoleRefs).toEqual([]);
   });
 });
 

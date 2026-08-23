@@ -56,6 +56,18 @@ export const PENDING_COLOR = 'rgba(255,255,255,.42)';
 export const PROPOSED_COLOR = '#f0c26a';
 
 /**
+ * What OpenStreetMap already holds — the playing line and the outlines filed
+ * against this hole (R10).
+ *
+ * A fourth hue for a fourth thing, and not one of the three above. It is not the
+ * contributor's confirmed work, it is not a machine suggestion waiting on them,
+ * and it is not something nobody has been asked about yet: it is already in the
+ * map. Cool blue keeps it clearly outside the mint family this screen uses for
+ * everything the contributor settles.
+ */
+export const EXISTING_COLOR = '#8fc4e0';
+
+/**
  * One expression, read by every layer: the feature says what it is and the paint
  * follows.
  *
@@ -75,6 +87,8 @@ export const STATUS_COLOR = [
   ACTIVE_COLOR,
   'proposed',
   PROPOSED_COLOR,
+  'existing',
+  EXISTING_COLOR,
   'pending',
   PENDING_COLOR,
   PENDING_COLOR,
@@ -86,6 +100,9 @@ export const STATUS_WIDTH = [
   'active',
   4,
   'proposed',
+  2,
+  /* Lighter than the contributor's own line: it is context, not the subject. */
+  'existing',
   2,
   2.5,
 ];
@@ -378,6 +395,28 @@ function ProvenancePanel({
   );
 }
 
+/**
+ * What OpenStreetMap outlines on this hole, in one line: "a green, 3 bunkers and
+ * a fairway".
+ *
+ * Counted off the real features rather than templated off a fixed list, for the
+ * same reason the step copy is (R5): a hole with two bunkers must not be
+ * described as having three, and a kind OSM holds nothing of must not be named
+ * at all.
+ */
+export function summariseExisting(features: readonly { tag: string }[]): string {
+  const counts = new Map<string, number>();
+  for (const feature of features) {
+    const noun = feature.tag.replace(/_/g, ' ');
+    counts.set(noun, (counts.get(noun) ?? 0) + 1);
+  }
+  const parts = [...counts].map(([noun, count]) =>
+    count === 1 ? `a ${noun}` : `${count} ${noun}${noun.endsWith('s') ? '' : 's'}`,
+  );
+  if (parts.length <= 1) return parts.join('');
+  return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
 /** Where a caption sits on screen once its coordinate has been projected. */
 interface PlacedLabel {
   key: string;
@@ -408,8 +447,17 @@ const addFeatureLayers = (instance: MapLibreMap, features: CourseFeature[]) => {
       filter: ['==', ['geometry-type'], 'Polygon'],
       paint: {
         'fill-color': STATUS_COLOR,
-        /* A suggestion sits lighter on the imagery than something confirmed. */
-        'fill-opacity': ['case', ['==', ['get', 'status'], 'proposed'], 0.1, 0.16],
+        /* A suggestion sits lighter on the imagery than something confirmed, and
+         * what OSM already holds is lighter again — it is the ground the
+         * contributor is working over, not the thing they are working on. */
+        'fill-opacity': [
+          'case',
+          ['==', ['get', 'status'], 'proposed'],
+          0.1,
+          ['==', ['get', 'status'], 'existing'],
+          0.12,
+          0.16,
+        ],
       },
     } as never);
     instance.addLayer({
@@ -466,6 +514,10 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
     detecting,
     locateYds,
     locateVerdict,
+    /* R10: the line and outlines OpenStreetMap already holds for this hole. */
+    lineFromOsm,
+    existing,
+    osmHoleRef,
     features,
     labels,
     mapBounds,
@@ -521,7 +573,7 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
     state.mode === 'attention'
       ? `${state.attentionResolved ? 374 : 250} yd tee to green`
       : locatePoints.length >= 2
-        ? `${locateYds} yd along your line`
+        ? `${locateYds} yd along ${lineFromOsm ? "OpenStreetMap's line" : 'your line'}`
         : 'no line drawn yet';
 
   /*
@@ -632,7 +684,7 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
         <BaseMap
           bounds={frame.current.bounds}
           center={course ? [course.longitude, course.latitude] : undefined}
-          label={`Hole ${holeNum}`}
+          label={osmHoleRef ? `Hole ${holeNum} · ${osmHoleRef}` : `Hole ${holeNum}`}
           note={`${measurement} · ${teeSetName} says ${cardText}`}
           onMapReady={handleMapReady}
           onMapClick={handleMapClick}
@@ -799,6 +851,15 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
               />
               not asked yet
             </span>
+            {/* R10: what was on the map before this session started. */}
+            {(lineFromOsm || existing.length > 0) && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                <span
+                  style={{ width: 18, height: 0, borderTop: `2px solid ${EXISTING_COLOR}`, display: 'block' }}
+                />
+                already in OpenStreetMap
+              </span>
+            )}
           </div>
         </BaseMap>
       </div>
@@ -1035,7 +1096,9 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
 
         {isLocate && (
           <div style={RAIL_CARD}>
-            <div style={{ ...EYEBROW, color: 'var(--mint-400)', marginBottom: 10 }}>Nothing here yet</div>
+            <div style={{ ...EYEBROW, color: lineFromOsm ? EXISTING_COLOR : 'var(--mint-400)', marginBottom: 10 }}>
+              {lineFromOsm ? 'Already in OpenStreetMap' : 'Nothing here yet'}
+            </div>
             <h3
               style={{
                 fontFamily: 'var(--font-display)',
@@ -1047,13 +1110,55 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                 textWrap: 'pretty',
               }}
             >
-              Show us where this hole plays.
+              {lineFromOsm ? 'Here is this hole, as the map has it.' : 'Show us where this hole plays.'}
             </h3>
             <p style={{ margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' }}>
-              Click the furthest back tee, follow the fairway wherever the hole bends, then finish
-              on the green you putt on. We measure along the line you drew — the same way your card
-              counts a dogleg — and go looking for the hole's features as soon as you finish.
+              {lineFromOsm ? (
+                <>
+                  Nobody drew this for you to judge — the line and the outlines in blue are what
+                  OpenStreetMap already holds for{' '}
+                  {/* A club that plays three nines as three eighteens files hole 12
+                    * as somebody's 3rd. Saying so is the difference between "this
+                    * looks wrong" and "this is the same hole". */}
+                  {osmHoleRef ? (
+                    <>
+                      your hole {holeNum}, which it files as <strong>{osmHoleRef}</strong>
+                    </>
+                  ) : (
+                    <>hole {holeNum}</>
+                  )}
+                  . Look at them against the imagery. If they are right, go looking for what is
+                  missing; if the line is wrong, draw your own over it.
+                </>
+              ) : (
+                <>
+                  Click the furthest back tee, follow the fairway wherever the hole bends, then
+                  finish on the green you putt on. We measure along the line you drew — the same way
+                  your card counts a dogleg — and go looking for the hole's features as soon as you
+                  finish.
+                </>
+              )}
             </p>
+
+            {/* What OSM outlines along the line, named rather than only drawn. */}
+            {existing.length > 0 && (
+              <div
+                style={{
+                  ...STEP_ROW,
+                  alignItems: 'flex-start',
+                  flexDirection: 'column',
+                  gap: 6,
+                  marginBottom: 10,
+                }}
+              >
+                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
+                  outlined on this hole already
+                </span>
+                <span style={{ fontSize: 13, color: '#fff', textWrap: 'pretty' }}>
+                  {summariseExisting(existing)}
+                </span>
+              </div>
+            )}
 
             {/* R15: the card the line is checked against is the set you played. */}
             <div style={{ ...STEP_ROW, marginBottom: 10 }}>
@@ -1084,82 +1189,92 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
               </select>
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 16 }}>
-              {[
-                {
-                  num: '1',
-                  label: 'The furthest back tee',
-                  done: locatePoints.length >= 1,
-                  state: locatePoints.length >= 1 ? 'marked' : 'click the map',
-                },
-                {
-                  num: '2',
-                  label: 'Follow the fairway',
-                  done: turnPoints > 0,
-                  state:
-                    turnPoints > 0
-                      ? `${turnPoints} point${turnPoints === 1 ? '' : 's'}`
-                      : locatePoints.length >= 1
-                        ? 'optional'
-                        : 'next',
-                },
-                {
-                  num: '3',
-                  label: 'The green you putt on',
-                  done: locateDone,
-                  state: locateDone ? 'marked' : locatePoints.length >= 1 ? 'click it, then finish' : 'next',
-                },
-              ].map((p) => {
-                const ring = p.done ? 'var(--mint-400)' : locatePoints.length >= 1 ? '#fff' : 'var(--green-200)';
-                return (
-                  <div key={p.num} style={STEP_ROW}>
-                    <span
-                      style={{
-                        width: 24,
-                        height: 24,
-                        borderRadius: 999,
-                        border: `1.5px solid ${ring}`,
-                        color: ring,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: 12,
-                      }}
-                    >
-                      {p.num}
-                    </span>
-                    <span style={{ flex: 1, fontSize: 14, color: '#fff' }}>{p.label}</span>
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: ring }}>{p.state}</span>
-                  </div>
-                );
-              })}
-            </div>
+            {/* The three drawing steps, which a hole that arrived with a line has
+              * already been through — asking for a tee click over a tee that is
+              * drawn on screen is an instruction to do work twice. */}
+            {!lineFromOsm && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 16 }}>
+                {[
+                  {
+                    num: '1',
+                    label: 'The furthest back tee',
+                    done: locatePoints.length >= 1,
+                    state: locatePoints.length >= 1 ? 'marked' : 'click the map',
+                  },
+                  {
+                    num: '2',
+                    label: 'Follow the fairway',
+                    done: turnPoints > 0,
+                    state:
+                      turnPoints > 0
+                        ? `${turnPoints} point${turnPoints === 1 ? '' : 's'}`
+                        : locatePoints.length >= 1
+                          ? 'optional'
+                          : 'next',
+                  },
+                  {
+                    num: '3',
+                    label: 'The green you putt on',
+                    done: locateDone,
+                    state: locateDone ? 'marked' : locatePoints.length >= 1 ? 'click it, then finish' : 'next',
+                  },
+                ].map((p) => {
+                  const ring = p.done ? 'var(--mint-400)' : locatePoints.length >= 1 ? '#fff' : 'var(--green-200)';
+                  return (
+                    <div key={p.num} style={STEP_ROW}>
+                      <span
+                        style={{
+                          width: 24,
+                          height: 24,
+                          borderRadius: 999,
+                          border: `1.5px solid ${ring}`,
+                          color: ring,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: 12,
+                        }}
+                      >
+                        {p.num}
+                      </span>
+                      <span style={{ flex: 1, fontSize: 14, color: '#fff' }}>{p.label}</span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: ring }}>{p.state}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
 
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9, marginBottom: 14 }}>
-              <HoverButton
-                onClick={actions.undoLastPoint}
-                disabled={locatePoints.length === 0}
-                style={{ ...GHOST_BUTTON, opacity: locatePoints.length === 0 ? 0.45 : 1 }}
-                hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
-              >
-                Undo last point
-              </HoverButton>
-              <HoverButton
-                onClick={actions.finishLine}
-                disabled={!canFinish}
-                style={{
-                  ...GHOST_BUTTON,
-                  background: canFinish ? 'var(--mint-400)' : 'var(--green-900)',
-                  color: canFinish ? 'var(--green-950)' : '#fff',
-                  borderColor: canFinish ? 'var(--mint-400)' : 'rgba(255,255,255,.2)',
-                  opacity: canFinish ? 1 : 0.45,
-                }}
-                hoverStyle={canFinish ? {} : { background: 'var(--green-900)' }}
-              >
-                Finish the line
-              </HoverButton>
-            </div>
+            {/* Point-by-point editing belongs to a line being drawn. A line that
+              * came out of OpenStreetMap is kept or redrawn whole — taking its
+              * green off one vertex at a time is not a review of it. */}
+            {!lineFromOsm && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9, marginBottom: 14 }}>
+                <HoverButton
+                  onClick={actions.undoLastPoint}
+                  disabled={locatePoints.length === 0}
+                  style={{ ...GHOST_BUTTON, opacity: locatePoints.length === 0 ? 0.45 : 1 }}
+                  hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
+                >
+                  Undo last point
+                </HoverButton>
+                <HoverButton
+                  onClick={actions.finishLine}
+                  disabled={!canFinish}
+                  style={{
+                    ...GHOST_BUTTON,
+                    background: canFinish ? 'var(--mint-400)' : 'var(--green-900)',
+                    color: canFinish ? 'var(--green-950)' : '#fff',
+                    borderColor: canFinish ? 'var(--mint-400)' : 'rgba(255,255,255,.2)',
+                    opacity: canFinish ? 1 : 0.45,
+                  }}
+                  hoverStyle={canFinish ? {} : { background: 'var(--green-900)' }}
+                >
+                  Finish the line
+                </HoverButton>
+              </div>
+            )}
 
             {locateDone && (
               <div style={{ animation: 'ogRise 190ms var(--ease-out)' }}>
@@ -1180,7 +1295,7 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                   }}
                 >
                   <span style={{ color: '#fff', fontSize: 20 }}>{locateYds}</span>
-                  <span>yd along your line</span>
+                  <span>yd along {lineFromOsm ? "OpenStreetMap's line" : 'your line'}</span>
                   <span
                     style={{
                       marginLeft: 'auto',
@@ -1268,7 +1383,8 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 14 }}>
               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
-                {locatePoints.length} point{locatePoints.length === 1 ? '' : 's'} marked
+                {locatePoints.length} point{locatePoints.length === 1 ? '' : 's'}{' '}
+                {lineFromOsm ? 'on the map' : 'marked'}
               </span>
               <button
                 onClick={actions.resetLocate}
@@ -1283,7 +1399,7 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                   padding: 0,
                 }}
               >
-                Start over
+                {lineFromOsm ? 'Draw my own line instead' : 'Start over'}
               </button>
             </div>
           </div>

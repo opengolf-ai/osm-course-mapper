@@ -21,6 +21,12 @@ export type LngLat = [number, number];
 /** Definition of the international acre, used to report polygon areas. */
 export const SQUARE_METRES_PER_ACRE = 4046.8564224;
 
+/** Definition of the international yard, for the flat-earth measurement below. */
+const METRES_PER_YARD = 0.9144;
+
+/** One degree of latitude, near enough anywhere on the ellipsoid for a golf hole. */
+const METRES_PER_DEGREE_LATITUDE = 111_320;
+
 /**
  * What a drawn feature represents. `hole` is the playing line itself — the
  * geometry OpenStreetMap holds for `golf=hole` — and the rest are the areas a
@@ -115,4 +121,49 @@ export function polygonAcres(area: Polygon): number {
 export function labelPoint(geometry: Geometry): LngLat {
   const [lng, lat] = turfCentroid(geometry).geometry.coordinates;
   return [lng, lat];
+}
+
+/**
+ * How far a coordinate sits from a polyline, in yards, measured to the nearest
+ * point on the nearest segment.
+ *
+ * Distance to the nearest *vertex* is not the same measurement and is wrong for
+ * exactly the case this exists for: a `golf=hole` way is often two or three
+ * points across four hundred yards, so a bunker halfway down the fairway is
+ * metres from the line and hundreds of yards from either end of it.
+ *
+ * The segment maths is done on a local equirectangular projection — longitude
+ * shortened by the cosine of the latitude — because a point-to-segment
+ * projection has no closed form on a sphere, and over the few hundred yards a
+ * hole spans the flat-earth error is well under a yard.
+ */
+export function yardsToLine(point: LngLat, line: readonly LngLat[] | LineString): number {
+  const coordinates: readonly number[][] = 'type' in line ? line.coordinates : line;
+  if (coordinates.length === 0) return Infinity;
+  if (coordinates.length === 1) return yardsBetween(point, coordinates[0] as LngLat);
+
+  /* Metres per degree, at this point's latitude. */
+  const perLat = METRES_PER_DEGREE_LATITUDE;
+  const perLng = METRES_PER_DEGREE_LATITUDE * Math.cos((point[1] * Math.PI) / 180);
+  const x = (position: readonly number[]) => position[0] * perLng;
+  const y = (position: readonly number[]) => position[1] * perLat;
+
+  const px = x(point);
+  const py = y(point);
+  let best = Infinity;
+  for (let i = 1; i < coordinates.length; i += 1) {
+    const ax = x(coordinates[i - 1]);
+    const ay = y(coordinates[i - 1]);
+    const bx = x(coordinates[i]);
+    const by = y(coordinates[i]);
+    const dx = bx - ax;
+    const dy = by - ay;
+    const span = dx * dx + dy * dy;
+    /* A zero-length segment — duplicated vertices happen — is just its endpoint. */
+    const t = span === 0 ? 0 : Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / span));
+    const cx = ax + t * dx;
+    const cy = ay + t * dy;
+    best = Math.min(best, Math.hypot(px - cx, py - cy));
+  }
+  return best / METRES_PER_YARD;
 }
