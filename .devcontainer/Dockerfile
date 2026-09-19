@@ -19,7 +19,15 @@ RUN su vscode -c ". /usr/local/share/nvm/nvm.sh \
 # libpq backs psycopg for the decision store (U9). The GDAL runtime is not
 # required by rasterio — its wheels bundle their own — but having `gdalinfo`
 # available makes a misbehaving corridor read inspectable by hand.
-RUN apt-get update \
+#
+# The base image ships Yarn's apt repository pinned to a keyring that predates
+# Yarn's signing-key rotation, so `apt-get update` fails on it with
+# NO_PUBKEY 62D54FD4003F6525 before reaching anything this image installs.
+# Nothing here installs from that repository — the project uses npm, and the
+# image's `yarn` binary stays where it is — so the source is dropped rather than
+# re-keyed, which would only break again at the next rotation.
+RUN rm -f /etc/apt/sources.list.d/yarn.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         libpq-dev \
         gdal-bin \
