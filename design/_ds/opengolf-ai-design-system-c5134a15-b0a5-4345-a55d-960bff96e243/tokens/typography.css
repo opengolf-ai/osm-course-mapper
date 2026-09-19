@@ -1,0 +1,16 @@
+:root{
+--font-sans:"Figtree","Helvetica Neue",Helvetica,sans-serif;
+--font-display:"Figtree","Helvetica Neue",Helvetica,sans-serif;
+--font-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+
+--text-display-1:clamp(44px,5.2vw,72px);
+--text-display-2:clamp(34px,3.8vw,52px);
+--text-h1:38px;--text-h2:28px;--text-h3:21px;--text-h4:17px;
+--text-body-lg:18px;--text-body:15px;--text-body-sm:13px;--text-caption:12px;--text-micro:11px;
+
+--leading-tight:1.05;--leading-snug:1.2;--leading-normal:1.5;--leading-relaxed:1.65;
+
+--weight-light:300;--weight-regular:400;--weight-medium:500;--weight-semibold:600;--weight-bold:700;--weight-black:800;
+
+--tracking-display:-0.03em;--tracking-heading:-0.015em;--tracking-normal:0em;--tracking-label:0.06em;--tracking-eyebrow:0.14em;
+}

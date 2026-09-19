@@ -1,0 +1,6 @@
+/* opengolf.ai webfonts.
+   SUBSTITUTION NOTE: no font binaries were supplied with the brand. The wordmark is a
+   geometric humanist sans with a double-storey "a" and single-storey "g"; Figtree is the
+   closest Google Fonts match and is used system-wide. IBM Plex Mono carries data, code
+   and API surfaces (open-source register). Swap these for real files when available. */
+@import url("https://fonts.googleapis.com/css2?family=Figtree:ital,wght@0,300..900;1,300..900&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
