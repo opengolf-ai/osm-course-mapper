@@ -1,6 +1,6 @@
 import type { OsmLookup } from '../api/overpass';
 import type { CourseDetail } from '../api/types';
-import { TEE_IDS, type HoleStatus, type TeeId } from '../data/course';
+import type { HoleStatus } from '../data/course';
 
 /**
  * The loaded course, in the shape the screens read.
@@ -239,18 +239,30 @@ export function scorecardFor(session: CourseSession, holeIndex: number): Scoreca
     .map((tee) => ({ name: tee.name, yd: hole.yardages[tee.color], swatch: tee.swatch }));
 }
 
+/** One tee set as a hole's card lists it: the set, and what it plays on this hole. */
+export interface HoleTeeSet {
+  /** The `yardages` key, e.g. "blue". What the detection service echoes on a matched tee. */
+  key: string;
+  name: string;
+  swatch: string;
+  yards: number;
+}
+
 /**
- * Names for the review screen's four tee slots, back to front. Courses carrying
- * fewer than four sets repeat the shortest rather than leaving a slot blank.
+ * The tee sets that play this hole, longest first — the order the tee step
+ * walks them, and the order a golfer reads a card.
+ *
+ * Only sets with a yardage on this hole: a set the card lists no number for is
+ * not a set anyone plays from here, and asking where it tees off would be asking
+ * about nothing.
  */
-export function defaultTeeAssign(session: CourseSession): Record<TeeId, string> {
-  const last = session.tees.length - 1;
-  const nameAt = (i: number) => (last < 0 ? 'Tee' : session.tees[Math.min(i, last)].name);
-  const assign = {} as Record<TeeId, string>;
-  TEE_IDS.forEach((id, i) => {
-    assign[id] = i === TEE_IDS.length - 1 ? nameAt(last) : nameAt(i);
-  });
-  return assign;
+export function teeSetsFor(session: CourseSession, holeIndex: number): HoleTeeSet[] {
+  const hole = session.holes[holeIndex];
+  if (!hole) return [];
+  return session.tees
+    .filter((tee) => hole.yardages[tee.color] !== undefined)
+    .map((tee) => ({ key: tee.color, name: tee.name, swatch: tee.swatch, yards: hole.yardages[tee.color] }))
+    .sort((a, b) => b.yards - a.yards);
 }
 
 /**

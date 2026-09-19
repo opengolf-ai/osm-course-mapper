@@ -1,0 +1,7 @@
+body{background:var(--surface-page);color:var(--text-body);font-family:var(--font-sans);font-size:var(--text-body);line-height:var(--leading-normal);-webkit-font-smoothing:antialiased}
+a{color:var(--text-link);text-decoration:none;transition:color var(--duration-fast) var(--ease-out)}
+a:hover{color:var(--text-link-hover);text-decoration:underline;text-underline-offset:3px}
+h1,h2,h3,h4{font-family:var(--font-display);color:var(--text-heading);letter-spacing:var(--tracking-heading);line-height:var(--leading-snug);font-weight:var(--weight-semibold);margin:0}
+code,kbd,pre{font-family:var(--font-mono)}
+::selection{background:var(--mint-200);color:var(--green-950)}
+:focus-visible{outline:none;box-shadow:var(--shadow-focus)}

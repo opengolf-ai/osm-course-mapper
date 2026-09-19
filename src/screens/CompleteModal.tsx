@@ -3,6 +3,9 @@ import { Button, Icon } from '../ds';
 interface CompleteModalProps {
   courseName: string;
   holeNum: number;
+  /** What was saved for this hole, one phrase per kind: "1 green", "3 bunkers". */
+  saved: string[];
+  /** Holes finished on this course: saved here, or already in OpenStreetMap. */
   doneCount: number;
   holeCount: number;
   onNextHole: () => void;
@@ -12,6 +15,7 @@ interface CompleteModalProps {
 export function CompleteModal({
   courseName,
   holeNum,
+  saved,
   doneCount,
   holeCount,
   onNextHole,
@@ -56,7 +60,7 @@ export function CompleteModal({
           }}
         >
           <Icon name="circle-check" size={15} />
-          uploaded
+          saved
         </div>
 
         <h2
@@ -69,10 +73,12 @@ export function CompleteModal({
             margin: '0 0 8px',
           }}
         >
-          Hole {holeNum} is on the map.
+          Hole {holeNum} is saved.
         </h2>
         <p style={{ margin: '0 0 18px', color: 'var(--ink-600)', fontSize: 14, textWrap: 'pretty' }}>
-          Anyone pulling {courseName} now gets your green, your bunkers and your tees.
+          Everything you confirmed on hole {holeNum} of {courseName} is stored with enough detail to
+          go to OpenStreetMap once uploading is switched on. Nothing has been sent to OpenStreetMap
+          yet.
         </p>
 
         <div
@@ -88,7 +94,7 @@ export function CompleteModal({
             fontVariantNumeric: 'tabular-nums',
           }}
         >
-          1 green · 2 bunkers · 4 tee boxes · 1 fairway
+          {saved.length > 0 ? saved.join(' · ') : 'the playing line only'}
         </div>
         <div
           style={{
@@ -98,7 +104,7 @@ export function CompleteModal({
             marginBottom: 22,
           }}
         >
-          signed as your OpenStreetMap account · {doneCount} of {holeCount} holes done
+          not uploaded · {doneCount} of {holeCount} holes done
         </div>
 
         <div style={{ display: 'flex', gap: 10 }}>

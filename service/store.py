@@ -215,11 +215,11 @@ def _from_row(row: FeatureDecision) -> RecordedDecision:
             item_id=row.imagery_item_id,
         ),
         in_play=row.in_play,
-        recorded_at=_as_utc(row.recorded_at),
+        recorded_at=as_utc(row.recorded_at),
     )
 
 
-def _as_utc(moment: dt.datetime) -> dt.datetime:
+def as_utc(moment: dt.datetime) -> dt.datetime:
     """Guarantee an aware UTC timestamp on the way out.
 
     SQLite has no timestamp type and hands back whatever it stored, so a row

@@ -4,8 +4,15 @@ import { BoardScreen } from './screens/BoardScreen';
 import { BoundaryScreen } from './screens/BoundaryScreen';
 import { CompleteModal } from './screens/CompleteModal';
 import { ReviewScreen } from './screens/ReviewScreen';
-import { INITIAL, computeDerived, type MapperState, type Mapper } from './state/useMapper';
-import { buildCourseSession, defaultTeeAssign, holeStatusesFrom } from './state/courseSession';
+import {
+  INITIAL,
+  computeDerived,
+  guessTeeBoxes,
+  shapesFromProposals,
+  type MapperState,
+  type Mapper,
+} from './state/useMapper';
+import { buildCourseSession, holeStatusesFrom, teeSetsFor } from './state/courseSession';
 import type { CourseDetail } from './api/types';
 import type { OsmCourse, OsmLookup } from './api/overpass';
 import type { DetectionImagery, Proposal } from './api/detect';
@@ -159,10 +166,25 @@ function proposalSquare(id: string, kind: Proposal['kind'], lng: number): Propos
 }
 
 const PROPOSALS: Proposal[] = [
+  { ...proposalSquare('p-tee', 'tee', -121.9497), teeSet: { key: 'blue', name: 'Blue', yards: 378 } },
   proposalSquare('p-green', 'green', -121.9464),
   proposalSquare('p-bunker-1', 'bunker', -121.947),
   proposalSquare('p-bunker-2', 'bunker', -121.9476),
+  proposalSquare('p-water', 'water', -121.9484),
 ];
+
+/** The hole with detection's answer landed on it, at whichever step a render needs. */
+function reviewing(overrides: Partial<MapperState> = {}): Partial<MapperState> {
+  const shapes = shapesFromProposals(PROPOSALS);
+  return {
+    mode: 'ready',
+    locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn', edited: false },
+    detect: { status: 'ready', jobId: 'smoke-job', proposals: PROPOSALS, imagery: CORRIDOR_COG, missingTeeSets: [] },
+    shapes,
+    teeBoxes: guessTeeBoxes(teeSetsFor(COURSE, 0), shapes, PEBBLE_HOLE_ONE),
+    ...overrides,
+  };
+}
 
 /*
  * The corridor raster the answer names (R9). Two versions, because the two paths
@@ -193,7 +215,6 @@ function mapperFor(overrides: Partial<MapperState>): Mapper {
     ...INITIAL,
     screen: 'review',
     course: COURSE,
-    teeAssign: defaultTeeAssign(COURSE),
     teeSet: COURSE.tees[0]?.color ?? null,
     osm: FOUND,
     holeStatus: holeStatusesFrom(COURSE, FOUND),
@@ -213,7 +234,13 @@ export function renderAll(): Record<string, string> {
     boundary: renderToString(
       <BoundaryScreen
         course={OSM_COURSE}
+        geometry={OSM_COURSE.boundary}
+        edited={false}
+        save={{ status: 'idle' }}
         courseName={COURSE.name}
+        onChange={noop}
+        onReset={noop}
+        onSave={noop}
         onContinue={noop}
         onBack={noop}
       />,
@@ -221,7 +248,27 @@ export function renderAll(): Record<string, string> {
     boundaryBare: renderToString(
       <BoundaryScreen
         course={{ ...OSM_COURSE, landmarks: [], mappedHoleRefs: [] }}
+        geometry={OSM_COURSE.boundary}
+        edited={false}
+        save={{ status: 'idle' }}
         courseName={COURSE.name}
+        onChange={noop}
+        onReset={noop}
+        onSave={noop}
+        onContinue={noop}
+        onBack={noop}
+      />,
+    ),
+    boundarySaveFailed: renderToString(
+      <BoundaryScreen
+        course={OSM_COURSE}
+        geometry={OSM_COURSE.boundary}
+        edited
+        save={{ status: 'failed', message: 'the service did not answer.' }}
+        courseName={COURSE.name}
+        onChange={noop}
+        onReset={noop}
+        onSave={noop}
         onContinue={noop}
         onBack={noop}
       />,
@@ -231,6 +278,16 @@ export function renderAll(): Record<string, string> {
       <BoardScreen
         course={COURSE}
         holeStatus={holeStatusesFrom(COURSE, FOUND)}
+        doneCount={OSM_COURSE.mappedHoleRefs.length}
+        osm={FOUND}
+        onOpenHole={noop}
+        onBack={noop}
+      />,
+    ),
+    boardSaved: renderToString(
+      <BoardScreen
+        course={COURSE}
+        holeStatus={holeStatusesFrom(COURSE, FOUND).map((status, i) => (i === 0 ? 'saved' : status))}
         doneCount={OSM_COURSE.mappedHoleRefs.length}
         osm={FOUND}
         onOpenHole={noop}
@@ -258,58 +315,97 @@ export function renderAll(): Record<string, string> {
       />,
     ),
 
-    /* Nothing proposed: every step still stands, and says so rather than vanishing. */
-    reviewReady: renderToString(<ReviewScreen mapper={mapperFor({ mode: 'ready' })} />),
-    reviewTees: renderToString(<ReviewScreen mapper={mapperFor({ mode: 'ready', step: 2 })} />),
-    /* Proposals landed: the second of two bunkers is the one being asked about. */
-    reviewProposals: renderToString(
+    /* Mapped by hand, nothing proposed: every step still stands and asks. */
+    reviewByHand: renderToString(
       <ReviewScreen
         mapper={mapperFor({
           mode: 'ready',
-          step: 1,
-          proposalIndex: 1,
-          confirmed: ['p-green', 'p-bunker-1'],
-          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
-          detect: {
-            status: 'ready',
-            jobId: 'smoke-job',
-            proposals: PROPOSALS,
-            imagery: CORRIDOR_COG,
-            missingTeeSets: [],
-          },
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn', edited: false },
         })}
       />,
     ),
-    /*
-     * R5/R9 on the server: confidence, the acquisition year and the age warning
-     * are chrome, not effects, so they must render without a browser. `now` is
-     * pinned so the warning is a fixture rather than a function of the clock.
-     */
+    /* Detection landed: the blue tee's matched box is the one asked about first. */
+    reviewTees: renderToString(<ReviewScreen now={new Date('2026-08-12T00:00:00Z')} mapper={mapperFor(reviewing())} />),
+    /* R9: with a renderable rendition of the same window, the overlay is offered. */
     reviewCorridor: renderToString(
       <ReviewScreen
-        now={new Date('2026-08-12T00:00:00Z')}
-        mapper={mapperFor({
-          mode: 'ready',
-          step: 0,
-          confirmed: [],
-          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
-          detect: {
-            status: 'ready',
-            jobId: 'smoke-job',
-            proposals: PROPOSALS,
-            imagery: CORRIDOR_RENDITION,
-            missingTeeSets: [],
-          },
-        })}
+        mapper={mapperFor(
+          reviewing({
+            detect: { status: 'ready', jobId: 'smoke-job', proposals: PROPOSALS, imagery: CORRIDOR_RENDITION, missingTeeSets: [] },
+          }),
+        )}
+      />,
+    ),
+    reviewTeePick: renderToString(
+      <ReviewScreen mapper={mapperFor(reviewing({ interaction: { kind: 'pick', purpose: 'tee' } }))} />,
+    ),
+    reviewGreen: renderToString(<ReviewScreen mapper={mapperFor(reviewing({ step: 1 }))} />),
+    reviewGreenPlace: renderToString(
+      <ReviewScreen
+        mapper={mapperFor(reviewing({ step: 1, interaction: { kind: 'place', shape: 'green', forTee: null, replacing: true } }))}
+      />,
+    ),
+    reviewFairwayEmpty: renderToString(<ReviewScreen mapper={mapperFor(reviewing({ step: 2 }))} />),
+    reviewBunkers: renderToString(<ReviewScreen mapper={mapperFor(reviewing({ step: 3 }))} />),
+    reviewBunkerPick: renderToString(
+      <ReviewScreen mapper={mapperFor(reviewing({ step: 3, interaction: { kind: 'pick', purpose: 'remove' } }))} />,
+    ),
+    reviewBunkerEdit: renderToString(
+      <ReviewScreen
+        mapper={mapperFor(reviewing({ step: 3, interaction: { kind: 'edit', shapeIds: ['p-bunker-1', 'p-bunker-2'] } }))}
+      />,
+    ),
+    reviewBunkerPlace: renderToString(
+      <ReviewScreen
+        mapper={mapperFor(reviewing({ step: 3, interaction: { kind: 'place', shape: 'bunker', forTee: null, replacing: false } }))}
+      />,
+    ),
+    reviewHazards: renderToString(<ReviewScreen mapper={mapperFor(reviewing({ step: 4 }))} />),
+    reviewNewHazard: renderToString(
+      <ReviewScreen
+        mapper={mapperFor(
+          reviewing({
+            step: 4,
+            shapes: [
+              ...shapesFromProposals(PROPOSALS),
+              {
+                id: 'drawn-1',
+                kind: 'hazard',
+                ring: [
+                  [-121.948, 36.5698],
+                  [-121.9478, 36.5698],
+                  [-121.9478, 36.57],
+                ],
+                inner: [],
+                original: [],
+                origin: 'drawn',
+                proposal: null,
+                edited: false,
+                confirmed: false,
+                removed: false,
+                hazardType: null,
+              },
+            ],
+            interaction: { kind: 'new', shapeId: 'drawn-1' },
+          }),
+        )}
       />,
     ),
     reviewDone: renderToString(
       <ReviewScreen
-        mapper={mapperFor({
-          mode: 'ready',
-          step: STEPS.length,
-          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
-        })}
+        mapper={mapperFor(
+          reviewing({
+            step: STEPS.length,
+            shapes: shapesFromProposals(PROPOSALS).map((shape) => ({ ...shape, confirmed: true })),
+          }),
+        )}
+      />,
+    ),
+    reviewSaveFailed: renderToString(
+      <ReviewScreen
+        mapper={mapperFor(
+          reviewing({ step: STEPS.length, save: { status: 'failed', message: 'the store is not configured.' } }),
+        )}
       />,
     ),
     reviewAttention: renderToString(
@@ -323,29 +419,40 @@ export function renderAll(): Record<string, string> {
         mapper={mapperFor({
           mode: 'locate',
           holeIndex: 0,
-          locate: { points: PEBBLE_HOLE_ONE.slice(0, 2), finished: false, source: 'drawn' },
+          locate: { points: PEBBLE_HOLE_ONE, finished: false, source: 'drawn', edited: false },
         })}
       />,
     ),
-    reviewLocateDone: renderToString(
+    reviewDetecting: renderToString(
       <ReviewScreen
         mapper={mapperFor({
           mode: 'locate',
           holeIndex: 0,
-          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn' },
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn', edited: false },
+          detect: { status: 'working' },
+        })}
+      />,
+    ),
+    reviewDetectFailed: renderToString(
+      <ReviewScreen
+        mapper={mapperFor({
+          mode: 'locate',
+          holeIndex: 0,
+          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'drawn', edited: false },
+          detect: { status: 'failed', message: 'the service did not answer.' },
         })}
       />,
     ),
     /*
      * A hole OpenStreetMap already holds: the line and the outlines arrive with
-     * it, so the rail states whose work it is rather than asking for a tee.
+     * it, and the rail asks whether it runs that way rather than asking for a tee.
      */
     reviewOsmHole: renderToString(
       <ReviewScreen
         mapper={mapperFor({
           mode: 'locate',
           holeIndex: 0,
-          locate: { points: PEBBLE_HOLE_ONE, finished: true, source: 'osm' },
+          locate: { points: PEBBLE_HOLE_ONE, finished: false, source: 'osm', edited: false },
           existing: [
             {
               id: 'way/820001',
@@ -369,14 +476,12 @@ export function renderAll(): Record<string, string> {
         })}
       />,
     ),
-    reviewAddMode: renderToString(
-      <ReviewScreen mapper={mapperFor({ mode: 'ready', step: 1, addMode: 'bunker' })} />,
-    ),
 
     complete: renderToString(
       <CompleteModal
         courseName={COURSE.name}
         holeNum={1}
+        saved={['1 tee box', '1 green', '2 bunkers', 'water']}
         doneCount={3}
         holeCount={COURSE.holes.length}
         onNextHole={noop}

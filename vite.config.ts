@@ -3,7 +3,25 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  server: { port: 5173 },
+  /*
+   * IPv4 loopback, not "localhost": Node resolves that to `::1` first, and a
+   * dev server listening only there is unreachable through the devcontainer's
+   * port forward, which connects to 127.0.0.1 — the browser just spins.
+   */
+  server: {
+    port: 5173,
+    host: '127.0.0.1',
+    /*
+     * The detection service and store (`uvicorn service.local:app`, port 8000),
+     * reached through this server so the browser needs one forwarded port, not
+     * two. Setting `VITE_DETECT_API_BASE` bypasses this and talks to a service
+     * directly.
+     */
+    proxy: {
+      '/v1': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+      '/healthz': { target: 'http://127.0.0.1:8000', changeOrigin: true },
+    },
+  },
   /*
    * MapLibre parses GeoJSON and builds its tiles in a web worker, shipped as a
    * separate `maplibre-gl-worker.mjs`. Vite's dependency optimizer rewrites the

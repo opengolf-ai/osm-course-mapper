@@ -1,36 +1,30 @@
 /**
- * One hole, on real aerial imagery.
+ * One hole, on real aerial imagery, walked in the order a golfer plays it.
  *
- * The screen opens in the playing-line flow, because the line is what everything
- * else is bounded by: the contributor clicks the tee, any points where the hole
- * bends, then the green; the line is measured along its path and checked against
- * the tee set they started from. Only once it is finished can detection be asked
- * for the hole's features, and a detection that fails, times out or finds nothing
- * leaves the hand-mapping path exactly where it was (R12).
+ * First the line: the contributor draws the hole tee to green — or checks the
+ * line OpenStreetMap already holds — and drags any point that misses a bend.
+ * Confirming it is the request for features. Then five questions, each about
+ * shapes highlighted on the imagery: which box each tee on the card plays from,
+ * the green, the fairway, the sand, and anything else in play. Every one of
+ * them can be answered "yes", fixed by dragging its edges, removed, or added to
+ * by clicking the map — and a detection that fails or finds nothing leaves every
+ * one of those routes exactly where it was (R12).
  *
- * Everything drawn is WGS84 GeoJSON on one MapLibre source. Pending, active,
- * proposed and confirmed styling comes from each feature's own `status` property
- * through a `match` expression, rather than from parallel arrays of path strings.
- *
- * What detection proposes is drawn as a suggestion — its own hue, dashed, lighter
- * fill — and stays that way until the contributor has answered about that one
- * feature (R8, KTD8). The review sequence walks them one at a time; nothing here
- * can confirm a batch, and no answer is inferred from moving on.
- *
- * Every suggestion arrives with where it came from, and the rail says so before
- * it is answered (R5, R9): the model's confidence, the year of the NAIP frame it
- * was read out of, and — on demand — that frame itself, laid over the display
- * basemap so the contributor judges the shape against the pixels the model read
- * rather than against a different picture of the same place.
+ * Everything drawn is WGS84 GeoJSON on one MapLibre source, styled off each
+ * feature's own `status`. What the model proposed draws as a suggestion — its
+ * own hue, dashed — until the contributor has answered about it (R8), and every
+ * suggestion carries where it came from: the model's confidence and the NAIP
+ * frame it read (R5, R9).
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { Map as MapLibreMap } from 'maplibre-gl';
-import { STEPS, TEE_IDS, TEE_POSITIONS } from '../data/course';
+import { HAZARD_TYPES, SHAPE_NOUN, STEPS, plural } from '../data/course';
 import type { CourseFeature, LngLat } from '../geo/coords';
 import { Button, Icon } from '../ds';
 import { HoverButton } from '../components/HoverButton';
 import { BaseMap, type ImageryStatus } from '../map/BaseMap';
 import { corridorOverlay, type CorridorOverlay } from '../map/imagerySources';
+import { useShapeEditor } from '../map/useShapeEditor';
 import type { DetectionImagery, Proposal } from '../api/detect';
 import { LOCATE_CLOSE_ENOUGH, type MapBounds, type Mapper } from '../state/useMapper';
 
@@ -68,6 +62,12 @@ export const PROPOSED_COLOR = '#f0c26a';
 export const EXISTING_COLOR = '#8fc4e0';
 
 /**
+ * What the contributor saved for this hole in an earlier session: theirs, but
+ * not what they are working on now. The confirmed hue, drawn lighter.
+ */
+export const SAVED_COLOR = 'rgba(163,220,199,.55)';
+
+/**
  * One expression, read by every layer: the feature says what it is and the paint
  * follows.
  *
@@ -89,6 +89,8 @@ export const STATUS_COLOR = [
   PROPOSED_COLOR,
   'existing',
   EXISTING_COLOR,
+  'saved',
+  SAVED_COLOR,
   'pending',
   PENDING_COLOR,
   PENDING_COLOR,
@@ -423,6 +425,7 @@ interface PlacedLabel {
   text: string;
   x: number;
   y: number;
+  active?: boolean;
 }
 
   /** The review source and its layers. Module scope: it closes over no state. */
@@ -456,6 +459,10 @@ const addFeatureLayers = (instance: MapLibreMap, features: CourseFeature[]) => {
           0.1,
           ['==', ['get', 'status'], 'existing'],
           0.12,
+          ['==', ['get', 'status'], 'saved'],
+          0.06,
+          ['==', ['get', 'status'], 'active'],
+          0.2,
           0.16,
         ],
       },
@@ -497,25 +504,153 @@ const addFeatureLayers = (instance: MapLibreMap, features: CourseFeature[]) => {
   }
 };
 
+const H3 = {
+  fontFamily: 'var(--font-display)',
+  fontSize: 22,
+  fontWeight: 700,
+  letterSpacing: '-.015em',
+  color: '#fff',
+  margin: '0 0 8px',
+  textWrap: 'pretty',
+} as const;
+
+const NOTE = { margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' } as const;
+
+const GHOST_HOVER = { background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' };
+
+/** The mint plate across the top of the map: what the next click will do. */
+function MapPrompt({
+  children,
+  onCancel,
+  cancelLabel = 'Never mind',
+  tone = 'mint',
+}: {
+  children: ReactNode;
+  onCancel?: () => void;
+  cancelLabel?: string;
+  tone?: 'mint' | 'amber';
+}) {
+  return (
+    <div
+      role="status"
+      style={{
+        position: 'absolute',
+        top: 78,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        maxWidth: 'calc(100% - 40px)',
+        display: 'flex',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: 12,
+        background: tone === 'amber' ? '#e9b45a' : 'var(--mint-400)',
+        color: 'var(--green-950)',
+        borderRadius: 'var(--radius-md)',
+        padding: '11px 14px',
+        fontSize: 14,
+        fontWeight: 600,
+        boxShadow: 'var(--shadow-lg)',
+        animation: 'ogRise 190ms var(--ease-out)',
+        zIndex: 4,
+      }}
+    >
+      <span>{children}</span>
+      {onCancel && (
+        <button
+          onClick={onCancel}
+          style={{
+            background: 'rgba(6,43,38,.14)',
+            border: 'none',
+            borderRadius: 'var(--radius-sm)',
+            height: 26,
+            padding: '0 10px',
+            color: 'var(--green-950)',
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: 'pointer',
+          }}
+        >
+          {cancelLabel}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function LegendSwatch({ color, dashed, children }: { color: string; dashed?: boolean; children: ReactNode }) {
+  return (
+    <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+      <span style={{ width: 18, height: 0, borderTop: `2px ${dashed ? 'dashed' : 'solid'} ${color}`, display: 'block' }} />
+      {children}
+    </span>
+  );
+}
+
+/** Yards along the line against the card, with the verdict. */
+function YardageCheck({
+  yards,
+  lineFromOsm,
+  teeSetName,
+  cardText,
+  verdict,
+}: {
+  yards: number;
+  lineFromOsm: boolean;
+  teeSetName: string;
+  cardText: string | number;
+  verdict: string | null;
+}) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'baseline',
+        flexWrap: 'wrap',
+        gap: 10,
+        background: 'var(--green-900)',
+        border: '1px solid rgba(255,255,255,.12)',
+        borderRadius: 'var(--radius-md)',
+        padding: '12px 14px',
+        marginBottom: 14,
+        fontFamily: 'var(--font-mono)',
+        fontSize: 13,
+        color: 'var(--green-100)',
+        fontVariantNumeric: 'tabular-nums',
+      }}
+    >
+      <span style={{ color: '#fff', fontSize: 20 }}>{yards}</span>
+      <span>yd along {lineFromOsm ? "OpenStreetMap's line" : 'this line'}</span>
+      <span
+        style={{
+          marginLeft: 'auto',
+          color: verdict === LOCATE_CLOSE_ENOUGH ? 'var(--mint-400)' : 'var(--amber-500)',
+        }}
+      >
+        the {teeSetName} tees say {cardText} — {verdict ?? 'no card to check'}
+      </span>
+    </div>
+  );
+}
+
 export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
   const { state, derived, actions } = mapper;
   const {
     hi,
+    holeNumber: holeNum,
     cardYds,
     holePar,
     holeHandicapIndex,
-    q,
+    step,
     allDone,
     isLocate,
     locatePoints,
     locateDone,
-    canFinish,
-    canRequestProposals,
+    canConfirmLine,
     detecting,
     locateYds,
     locateVerdict,
-    /* R10: the line and outlines OpenStreetMap already holds for this hole. */
     lineFromOsm,
+    lineSource,
     existing,
     osmHoleRef,
     features,
@@ -523,17 +658,13 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
     mapBounds,
     scorecard,
     summary,
-    /* The per-feature review (R7): one proposal on screen, and the copy for it. */
-    stepTitle,
-    stepNote,
-    stepAccept,
-    stepProposals,
-    stepProposalCount,
+    question,
+    teeSets,
+    hazards,
     activeProposal,
-    activePosition,
-    stepNeedsInPlay,
+    editablePaths,
     rejectedHere,
-    /* R9: the corridor raster inference read, for the overlay and its provenance. */
+    canSave,
     detectionImagery,
   } = derived;
 
@@ -542,67 +673,47 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
   const [placed, setPlaced] = useState<PlacedLabel[]>([]);
   const [corridorAsked, setCorridorAsked] = useState(false);
 
-  /*
-   * The corridor overlay, on demand (R9).
-   *
-   * `corridorOverlay` decides whether the frame can honestly be drawn; when it
-   * cannot, the toggle is not offered and the rail says why instead of showing
-   * imagery from somewhere else. Asking for it can therefore never be true while
-   * there is nothing to show.
-   */
+  /* The corridor overlay, on demand (R9) — only when it can honestly be drawn. */
   const corridor = corridorOverlay(detectionImagery);
   const corridorSpec = corridor?.status === 'ready' ? corridor.spec : null;
   const showingCorridor = corridorAsked && corridorSpec !== null;
 
   const course = state.course;
-  const holeNum = course?.holes[hi]?.number ?? hi + 1;
-  /* The card is a real record now, so every number on it can be absent. */
   const cardText = cardYds ?? '—';
   const imageryFailed = imagery === 'error';
-  const placing = (state.addMode !== null || (isLocate && !locateDone)) && !imageryFailed;
+  const interaction = state.interaction;
+  const drawingLine = isLocate && !locateDone && lineSource === 'drawn' && !detecting;
+  const placing =
+    !imageryFailed && (interaction.kind === 'place' || interaction.kind === 'pick' || drawingLine);
 
   const teeSetName =
     course?.tees.find((tee) => tee.color === state.teeSet)?.name ?? course?.tees[0]?.name ?? 'the card';
 
-  /*
-   * The caption reports a measurement or says there is not one — it never echoes
-   * the card back as though the line had been drawn. The attention branch keeps
-   * its own two numbers, which are copy in that panel, not a measurement.
-   */
   const measurement =
     state.mode === 'attention'
       ? `${state.attentionResolved ? 374 : 250} yd tee to green`
       : locatePoints.length >= 2
-        ? `${locateYds} yd along ${lineFromOsm ? "OpenStreetMap's line" : 'your line'}`
+        ? `${locateYds} yd along ${lineFromOsm ? "OpenStreetMap's line" : 'the line'}`
         : 'no line drawn yet';
 
   /*
-   * The camera is set once per hole: to the hole when it already has geometry,
-   * to the course when it does not. Re-fitting as the contributor draws would
-   * move the imagery out from under the point they were about to click.
+   * The camera is set when a hole opens — on the hole when it already has
+   * geometry, on the course when it does not — and once more when the line is
+   * confirmed, so a hole drawn from a course-wide view is then worked on up
+   * close. Never while the contributor is drawing: re-fitting then would move
+   * the imagery out from under the point they were about to click.
    */
-  const frame = useRef<{ hole: number; bounds: MapBounds | undefined } | null>(null);
-  if (!frame.current || frame.current.hole !== hi) {
-    frame.current = { hole: hi, bounds: mapBounds ?? undefined };
+  const frame = useRef<{ hole: number; locked: boolean; bounds: MapBounds | undefined } | null>(null);
+  if (!frame.current || frame.current.hole !== hi || frame.current.locked !== locateDone) {
+    frame.current = { hole: hi, locked: locateDone, bounds: mapBounds ?? undefined };
   }
 
   /*
    * One source and four layers, added as soon as the style will take them.
-   *
-   * `isStyleLoaded()` is not "has the style loaded" — it returns false whenever
-   * any tile or image is still loading, which is routinely long after `load`
-   * has already fired. Waiting on `once('load')` in that window waits for an
-   * event that will never come again, and the source is never added: `setData`
-   * then finds nothing, and the drawn line, the points and every proposal are
-   * silently absent while the HTML captions above them still render.
-   *
-   * So this attempts the add immediately and retries on `styledata`, which
-   * fires on every style event. The add is idempotent and removes its own
-   * listener once it sticks.
+   * `isStyleLoaded()` is false whenever any tile is still loading, so this
+   * attempts the add immediately and retries on `styledata`.
    */
   const handleMapReady = useCallback((instance: MapLibreMap) => {
-    /* Read through the ref: this callback is created once and the add can land
-       long after, on a style event, with more drawn by then. */
     const draw = () => {
       try {
         if (instance.getSource(FEATURE_SOURCE)) {
@@ -620,23 +731,17 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
     setMap(instance);
   }, []);
 
-  /* Whatever the contributor has drawn, pushed to the map as it changes. */
   const featuresRef = useRef(features);
   featuresRef.current = features;
   const featuresKey = JSON.stringify(features);
   useEffect(() => {
     if (!map) return;
-    const source = map.getSource(FEATURE_SOURCE) as
-      | { setData?: (data: unknown) => void }
-      | undefined;
+    const source = map.getSource(FEATURE_SOURCE) as { setData?: (data: unknown) => void } | undefined;
     source?.setData?.({ type: 'FeatureCollection', features });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- featuresKey stands in for features
   }, [map, featuresKey]);
 
-  /*
-   * Captions are anchored to coordinates, not to the container, so they are
-   * projected here and re-projected whenever the camera moves.
-   */
+  /* Captions are anchored to coordinates and re-projected as the camera moves. */
   const labelsKey = JSON.stringify(labels);
   useEffect(() => {
     if (!map) return;
@@ -644,7 +749,7 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
       setPlaced(
         labels.map((label) => {
           const point = map.project(label.position as [number, number]);
-          return { key: label.key, text: label.text, x: point.x, y: point.y };
+          return { key: label.key, text: label.text, x: point.x, y: point.y, active: label.active };
         }),
       );
     };
@@ -658,24 +763,155 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- labelsKey stands in for labels
   }, [map, labelsKey]);
 
-  /* R19: with no imagery under the cursor there is nothing to place a point on. */
+  /* Drag handles on the line while it is being checked, and on outlines being fixed. */
+  const editor = useShapeEditor(map, editablePaths, (id, coords) => {
+    if (id === 'line') actions.moveLine(coords);
+    else actions.moveShape(id, coords);
+  });
+
+  /*
+   * Each new question flies the camera to what it is about: onto the green for
+   * "Is that the green?", across every bunker for the sand, onto each box in
+   * turn for the tees. Keyed on the question, not on the shapes, so dragging an
+   * edge or picking a different box never yanks the map away mid-thought — it
+   * moves only when the rail moves on. Animated so the contributor sees where
+   * they went; instant for anyone who has asked for reduced motion.
+   */
+  const questionKey =
+    !isLocate && !allDone && step && interaction.kind === 'none' ? `${hi}:${state.step}:${state.teeIndex}` : '';
+  const framedQuestion = useRef('');
+  useEffect(() => {
+    if (!map || !questionKey || framedQuestion.current === questionKey) return;
+    const ids = new Set(derived.activeShapeIds);
+    const coords = state.shapes.filter((shape) => ids.has(shape.id)).flatMap((shape) => shape.ring);
+    if (coords.length === 0) return;
+    framedQuestion.current = questionKey;
+    const lngs = coords.map((c) => c[0]);
+    const lats = coords.map((c) => c[1]);
+    const reduced =
+      typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+    try {
+      map.fitBounds(
+        [
+          [Math.min(...lngs), Math.min(...lats)],
+          [Math.max(...lngs), Math.max(...lats)],
+        ],
+        /* Close enough to judge an edge, not so close the green fills the screen
+         * with no surround to judge it against. The right padding clears the
+         * credits panel; the top clears the prompts. */
+        { padding: { top: 130, bottom: 110, left: 90, right: 90 }, maxZoom: 18.5, duration: reduced ? 0 : 900, essential: true },
+      );
+    } catch {
+      /* A map that cannot fit yet has nothing on screen to move. */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when the question changes
+  }, [map, questionKey]);
+
+  /*
+   * An outline opened for editing is brought close enough to grab. A bunker
+   * dropped at hole-wide zoom is twenty pixels across, and ten handles on it
+   * are one blob; past a couple of hundred pixels it is already workable and
+   * the camera is left where the contributor put it.
+   */
+  const editingKey =
+    interaction.kind === 'edit' ? interaction.shapeIds.join(',') : interaction.kind === 'new' ? interaction.shapeId : '';
+  useEffect(() => {
+    if (!map || !editingKey) return;
+    const coords = editablePaths.flatMap((path) => path.coords);
+    if (coords.length === 0) return;
+    try {
+      const points = coords.map((c) => map.project(c as [number, number]));
+      const span = Math.max(
+        Math.max(...points.map((p) => p.x)) - Math.min(...points.map((p) => p.x)),
+        Math.max(...points.map((p) => p.y)) - Math.min(...points.map((p) => p.y)),
+      );
+      if (span >= 180) return;
+      const lngs = coords.map((c) => c[0]);
+      const lats = coords.map((c) => c[1]);
+      map.fitBounds(
+        [
+          [Math.min(...lngs), Math.min(...lats)],
+          [Math.max(...lngs), Math.max(...lats)],
+        ],
+        { padding: 140, maxZoom: 19.5, duration: 350 },
+      );
+    } catch {
+      /* A map that cannot project yet has nothing on screen to be too small. */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when a different outline is opened
+  }, [map, editingKey]);
+
+  /* R19: with no imagery under the cursor there is nothing to place a point on.
+   * And letting go of a drag handle is not a click on the map. */
   const handleMapClick = useCallback(
     (position: LngLat) => {
-      if (imageryFailed) return;
+      if (imageryFailed || editor.hitsHandle(position)) return;
       actions.onMapClick(position);
     },
-    [imageryFailed, actions],
+    [imageryFailed, editor, actions],
   );
 
+  const currentTee = teeSets[state.teeIndex] ?? null;
+  const stepKind = step?.kind ?? null;
+  const editingShapes =
+    interaction.kind === 'edit'
+      ? state.shapes.filter((shape) => interaction.shapeIds.includes(shape.id))
+      : [];
+  const editNoun =
+    editingShapes.length === 0
+      ? 'shape'
+      : editingShapes.length > 1
+        ? plural(SHAPE_NOUN[editingShapes[0].kind])
+        : SHAPE_NOUN[editingShapes[0].kind];
+  const newShape =
+    interaction.kind === 'new' ? state.shapes.find((shape) => shape.id === interaction.shapeId) ?? null : null;
+
   const stepCounter = isLocate
-    ? locateDone
-      ? 'the line you drew'
-      : 'draw the line the hole plays'
+    ? 'first, the line of the hole'
     : allDone
       ? 'all checks done'
       : `check ${state.step + 1} of ${STEPS.length}`;
 
-  const turnPoints = Math.max(locatePoints.length - 2, 0);
+  /* --- What the map is waiting for, said across its top ------------------- */
+  let prompt: ReactNode = null;
+  if (!imageryFailed) {
+    if (interaction.kind === 'place') {
+      prompt = (
+        <MapPrompt onCancel={actions.cancelInteraction}>
+          {interaction.replacing && interaction.shape === 'green'
+            ? 'Click the green you putt on.'
+            : `Click the map where the ${SHAPE_NOUN[interaction.shape]} is.`}
+        </MapPrompt>
+      );
+    } else if (interaction.kind === 'pick') {
+      prompt =
+        interaction.purpose === 'tee' ? (
+          <MapPrompt onCancel={actions.cancelInteraction}>
+            Click the box you play the {currentTee?.name.toLowerCase() ?? ''} tee from — open ground draws a new
+            one.
+          </MapPrompt>
+        ) : (
+          <MapPrompt onCancel={actions.cancelInteraction} tone="amber">
+            Click the one that is not {stepKind === 'bunker' ? 'sand' : `a ${stepKind ? SHAPE_NOUN[stepKind] : 'match'}`}.
+          </MapPrompt>
+        );
+    } else if (interaction.kind === 'edit' || interaction.kind === 'new') {
+      prompt = <MapPrompt>Drag the white dots. Drag a small dot to add a corner; right-click a dot to remove it.</MapPrompt>;
+    } else if (isLocate && !locateDone && !detecting) {
+      prompt =
+        lineSource === 'osm' ? (
+          <MapPrompt>Drag any dot that misses a bend.</MapPrompt>
+        ) : locatePoints.length === 0 ? (
+          <MapPrompt>Click the tee you play from.</MapPrompt>
+        ) : locatePoints.length === 1 ? (
+          <MapPrompt>Click the turn in the fairway, or the green.</MapPrompt>
+        ) : (
+          <MapPrompt>Click another turn, or drag a dot to fix the line.</MapPrompt>
+        );
+    }
+  }
+
+  const showLegend = interaction.kind === 'none' && !(isLocate && !locateDone);
 
   return (
     <section style={{ display: 'grid', gridTemplateColumns: '1fr 428px', height: 'calc(100vh - 56px)' }}>
@@ -689,18 +925,12 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
           onMapReady={handleMapReady}
           onMapClick={handleMapClick}
           onImageryStatusChange={setImagery}
-          /* Beneath the suggestion layers: the contributor judges a shape
-           * against the imagery, so the shape stays on top of it. */
           overlay={corridorSpec}
           overlayVisible={showingCorridor}
           overlayBeneathLayerId={FILL_LAYER}
         >
-          {/* The click target sits above the canvas only to carry the cursor. */}
           {placing && (
-            <div
-              style={{ position: 'absolute', inset: 0, cursor: 'crosshair', pointerEvents: 'none' }}
-              aria-hidden="true"
-            />
+            <div style={{ position: 'absolute', inset: 0, cursor: 'crosshair', pointerEvents: 'none' }} aria-hidden="true" />
           )}
 
           <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', overflow: 'hidden' }}>
@@ -717,8 +947,8 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                   height: 24,
                   padding: '0 9px',
                   borderRadius: 6,
-                  background: 'rgba(6,43,38,.86)',
-                  color: '#d3efe4',
+                  background: label.active ? 'var(--mint-400)' : 'rgba(6,43,38,.86)',
+                  color: label.active ? '#062b26' : '#d3efe4',
                   fontFamily: 'var(--font-mono)',
                   fontSize: 12,
                   letterSpacing: '.02em',
@@ -731,136 +961,40 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
             ))}
           </div>
 
-          {state.addMode && !imageryFailed && (
+          {prompt}
+
+          {showLegend && (
             <div
               style={{
                 position: 'absolute',
-                top: 20,
-                left: '50%',
-                transform: 'translateX(-50%)',
+                bottom: 20,
+                left: 20,
                 display: 'flex',
-                alignItems: 'center',
-                gap: 14,
-                background: 'var(--mint-400)',
-                color: 'var(--green-950)',
+                flexWrap: 'wrap',
+                maxWidth: 'calc(100% - 520px)',
+                minWidth: 220,
+                gap: '8px 18px',
+                background: 'rgba(6,43,38,.78)',
+                border: '1px solid rgba(255,255,255,.12)',
                 borderRadius: 'var(--radius-md)',
-                padding: '12px 16px',
-                fontSize: 14,
-                fontWeight: 600,
-                boxShadow: 'var(--shadow-lg)',
-                animation: 'ogRise 190ms var(--ease-out)',
+                padding: '9px 14px',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 11,
+                color: 'var(--green-200)',
               }}
             >
-              Click the map where the {state.addMode} is.
-              <button
-                onClick={actions.cancelAdd}
-                style={{
-                  background: 'rgba(6,43,38,.14)',
-                  border: 'none',
-                  borderRadius: 'var(--radius-sm)',
-                  height: 26,
-                  padding: '0 10px',
-                  color: 'var(--green-950)',
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 11,
-                  cursor: 'pointer',
-                }}
-              >
-                cancel
-              </button>
+              <LegendSwatch color={ACTIVE_COLOR}>asking you now</LegendSwatch>
+              {/* R8: the suggestion layer says what it is, in its own hue and dashed. */}
+              <LegendSwatch color={PROPOSED_COLOR} dashed>
+                we suggest — not yours yet
+              </LegendSwatch>
+              <LegendSwatch color={CONFIRMED_COLOR}>you confirmed</LegendSwatch>
+              {(lineFromOsm || existing.length > 0) && (
+                <LegendSwatch color={EXISTING_COLOR}>already in OpenStreetMap</LegendSwatch>
+              )}
+              {state.previous.length > 0 && <LegendSwatch color={SAVED_COLOR}>you saved earlier</LegendSwatch>}
             </div>
           )}
-
-          {isLocate && !locateDone && !imageryFailed && (
-            <div
-              style={{
-                position: 'absolute',
-                top: 20,
-                left: '50%',
-                transform: 'translateX(-50%)',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 12,
-                background: 'var(--mint-400)',
-                color: 'var(--green-950)',
-                borderRadius: 'var(--radius-md)',
-                padding: '12px 16px',
-                fontSize: 14,
-                fontWeight: 600,
-                boxShadow: 'var(--shadow-lg)',
-                animation: 'ogRise 190ms var(--ease-out)',
-              }}
-            >
-              <span
-                style={{
-                  width: 22,
-                  height: 22,
-                  borderRadius: 999,
-                  background: 'rgba(6,43,38,.16)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 12,
-                }}
-              >
-                {locatePoints.length + 1}
-              </span>
-              {locatePoints.length === 0
-                ? 'Click where you tee off.'
-                : 'Click where the hole bends, then the green you putt on.'}
-            </div>
-          )}
-
-          <div
-            style={{
-              position: 'absolute',
-              bottom: 20,
-              left: 20,
-              display: 'flex',
-              gap: 18,
-              background: 'rgba(6,43,38,.78)',
-              border: '1px solid rgba(255,255,255,.12)',
-              borderRadius: 'var(--radius-md)',
-              padding: '9px 14px',
-              fontFamily: 'var(--font-mono)',
-              fontSize: 11,
-              color: 'var(--green-200)',
-            }}
-          >
-            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span style={{ width: 18, height: 0, borderTop: '2px solid var(--mint-400)', display: 'block' }} />
-              asking you now
-            </span>
-            {/* R8: the suggestion layer says what it is, in its own hue and dashed. */}
-            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span
-                style={{ width: 18, height: 0, borderTop: `2px dashed ${PROPOSED_COLOR}`, display: 'block' }}
-              />
-              we suggest — not yours yet
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span
-                style={{ width: 18, height: 0, borderTop: `2px solid ${CONFIRMED_COLOR}`, display: 'block' }}
-              />
-              you confirmed
-            </span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-              <span
-                style={{ width: 18, height: 0, borderTop: `2px dashed ${PENDING_COLOR}`, display: 'block' }}
-              />
-              not asked yet
-            </span>
-            {/* R10: what was on the map before this session started. */}
-            {(lineFromOsm || existing.length > 0) && (
-              <span style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                <span
-                  style={{ width: 18, height: 0, borderTop: `2px solid ${EXISTING_COLOR}`, display: 'block' }}
-                />
-                already in OpenStreetMap
-              </span>
-            )}
-          </div>
         </BaseMap>
       </div>
 
@@ -888,9 +1022,7 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
             <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 8, color: '#eec98a' }}>
               <Icon name="circle-alert" size={18} />
               <span style={{ fontSize: 15, fontWeight: 700, color: '#f6e3bd' }}>
-                {state.attentionResolved
-                  ? 'Sorted — 374 yards, that matches.'
-                  : 'This one does not add up.'}
+                {state.attentionResolved ? 'Sorted — 374 yards, that matches.' : 'This one does not add up.'}
               </span>
             </div>
             <p style={{ margin: '0 0 12px', fontSize: 14, color: '#f2e0c4', textWrap: 'pretty' }}>
@@ -898,26 +1030,11 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                 ? 'We swapped in the green further up the hole. Everything below is back to a normal check.'
                 : `Tee to green measures 250 yards. Your card says hole ${holeNum} plays ${cardText} from the ${teeSetName.toLowerCase()} tee. Usually that means we grabbed the wrong green — pick the one you putt on.`}
             </p>
-
             {!state.attentionResolved && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {[
-                  {
-                    key: 'A',
-                    label: 'The nearer green, short right',
-                    yds: 250,
-                    verdict: '128 yd short',
-                    verdictColor: '#eec98a',
-                    note: 'Kept the near green — we will re-measure.',
-                  },
-                  {
-                    key: 'B',
-                    label: 'The green up by the cypress',
-                    yds: 374,
-                    verdict: 'matches the card',
-                    verdictColor: 'var(--mint-400)',
-                    note: 'Right green. Back on track.',
-                  },
+                  { key: 'A', label: 'The nearer green, short right', yds: 250, verdict: '128 yd short', verdictColor: '#eec98a', note: 'Kept the near green — we will re-measure.' },
+                  { key: 'B', label: 'The green up by the cypress', yds: 374, verdict: 'matches the card', verdictColor: 'var(--mint-400)', note: 'Right green. Back on track.' },
                 ].map((g) => (
                   <HoverButton
                     key={g.key}
@@ -952,30 +1069,16 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                       {g.key}
                     </span>
                     <span style={{ flex: 1 }}>
-                      <span style={{ display: 'block', fontSize: 14, color: '#fff', fontWeight: 600 }}>
-                        {g.label}
-                      </span>
-                      <span
-                        style={{
-                          display: 'block',
-                          fontFamily: 'var(--font-mono)',
-                          fontSize: 12,
-                          color: 'var(--green-200)',
-                          marginTop: 2,
-                        }}
-                      >
+                      <span style={{ display: 'block', fontSize: 14, color: '#fff', fontWeight: 600 }}>{g.label}</span>
+                      <span style={{ display: 'block', fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green-200)', marginTop: 2 }}>
                         plays {g.yds} yd from the back tee
                       </span>
                     </span>
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: g.verdictColor }}>
-                      {g.verdict}
-                    </span>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: g.verdictColor }}>{g.verdict}</span>
                   </HoverButton>
                 ))}
                 <button
-                  onClick={() =>
-                    actions.resolveAttention('Noted — we will trust what you see over the card.')
-                  }
+                  onClick={() => actions.resolveAttention('Noted — we will trust what you see over the card.')}
                   style={{
                     background: 'transparent',
                     border: 'none',
@@ -994,38 +1097,16 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
           </div>
         )}
 
-        <div
-          style={{
-            background: 'var(--green-800)',
-            border: '1px solid rgba(255,255,255,.12)',
-            borderRadius: 'var(--radius-lg)',
-            padding: 16,
-          }}
-        >
-          {/*
-            * The card names the hole it belongs to. The map carries a "Hole N"
-            * chip, but the rail is where a contributor reads numbers, and a
-            * scorecard with no subject is one more thing to hold in your head
-            * while deciding whether 412 yards looks right.
-            */}
+        {/* The card, named for the hole it belongs to. */}
+        <div style={{ background: 'var(--green-800)', border: '1px solid rgba(255,255,255,.12)', borderRadius: 'var(--radius-lg)', padding: 16 }}>
           <div style={{ marginBottom: 12 }}>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
               <span style={{ ...EYEBROW, color: 'var(--green-200)' }}>Hole {holeNum}</span>
-              <span
-                style={{
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 11,
-                  color: 'var(--mint-400)',
-                  marginLeft: 'auto',
-                }}
-              >
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--mint-400)', marginLeft: 'auto' }}>
                 par {holePar ?? '—'} · index {holeHandicapIndex ?? '—'}
               </span>
             </div>
             {course?.name && (
-              /* Truncated rather than wrapped: club names run long, and a
-                 two-line title would push the yardages the contributor is
-                 actually reading further down the rail. */
               <div
                 title={course.name}
                 style={{
@@ -1074,374 +1155,347 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
           <span style={{ ...EYEBROW, color: 'var(--green-200)' }}>{stepCounter}</span>
           <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
             {!isLocate &&
-              STEPS.map((_, i) => (
+              STEPS.map((entry, i) => (
                 <span
-                  key={i}
+                  key={entry.id}
+                  title={entry.kicker}
                   style={{
                     width: 22,
                     height: 5,
                     borderRadius: 3,
                     display: 'block',
                     background:
-                      i < state.step
-                        ? 'var(--mint-400)'
-                        : i === state.step && !allDone
-                          ? 'rgba(62,207,180,.55)'
-                          : 'rgba(255,255,255,.14)',
+                      i < state.step ? 'var(--mint-400)' : i === state.step && !allDone ? 'rgba(62,207,180,.55)' : 'rgba(255,255,255,.14)',
                   }}
                 />
               ))}
           </div>
         </div>
 
+        {/* ---------- 1. The line of the hole ---------- */}
         {isLocate && (
           <div style={RAIL_CARD}>
-            <div style={{ ...EYEBROW, color: lineFromOsm ? EXISTING_COLOR : 'var(--mint-400)', marginBottom: 10 }}>
-              {lineFromOsm ? 'Already in OpenStreetMap' : 'Nothing here yet'}
-            </div>
-            <h3
-              style={{
-                fontFamily: 'var(--font-display)',
-                fontSize: 22,
-                fontWeight: 700,
-                letterSpacing: '-.015em',
-                color: '#fff',
-                margin: '0 0 8px',
-                textWrap: 'pretty',
-              }}
-            >
-              {lineFromOsm ? 'Here is this hole, as the map has it.' : 'Show us where this hole plays.'}
-            </h3>
-            <p style={{ margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' }}>
-              {lineFromOsm ? (
-                <>
-                  Nobody drew this for you to judge — the line and the outlines in blue are what
-                  OpenStreetMap already holds for{' '}
-                  {/* A club that plays three nines as three eighteens files hole 12
-                    * as somebody's 3rd. Saying so is the difference between "this
-                    * looks wrong" and "this is the same hole". */}
-                  {osmHoleRef ? (
+            {detecting ? (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
+                  <span
+                    style={{
+                      width: 9,
+                      height: 9,
+                      borderRadius: 999,
+                      background: 'var(--mint-400)',
+                      display: 'block',
+                      animation: 'ogPulse 1.2s var(--ease-out) infinite',
+                    }}
+                  />
+                  <span style={{ ...EYEBROW, color: 'var(--mint-400)' }}>Reading the imagery</span>
+                </div>
+                <h3 style={{ ...H3, fontSize: 20 }}>Your line is locked in.</h3>
+                <p style={NOTE}>Looking along it for the tees, the green, the fairway and the sand. A few seconds — longer the first time.</p>
+                <HoverButton onClick={actions.cancelProposals} style={{ ...GHOST_BUTTON, width: '100%' }} hoverStyle={GHOST_HOVER}>
+                  Stop looking — I will map it myself
+                </HoverButton>
+              </>
+            ) : (
+              <>
+                <div style={{ ...EYEBROW, color: lineFromOsm ? EXISTING_COLOR : 'var(--mint-400)', marginBottom: 10 }}>
+                  {lineFromOsm ? 'Already in OpenStreetMap' : locatePoints.length >= 2 ? 'First, the hole itself' : 'Nothing here yet'}
+                </div>
+                <h3 style={H3}>{locatePoints.length >= 2 ? 'Does the hole run this way?' : 'Walk us down the hole.'}</h3>
+                <p style={NOTE}>
+                  {locatePoints.length >= 2 ? (
                     <>
-                      your hole {holeNum}, which it files as <strong>{osmHoleRef}</strong>
+                      Tee at the first dot, green at the last. Drag any dot if the line misses a bend — drag a small dot
+                      to add one, right-click a dot to take it out. Everything we look for hangs off this line.
+                      {lineFromOsm && osmHoleRef && (
+                        <>
+                          {' '}
+                          OpenStreetMap files this hole as <strong>{osmHoleRef}</strong>.
+                        </>
+                      )}
                     </>
                   ) : (
-                    <>hole {holeNum}</>
+                    'Click the furthest-back tee, click each turn in the fairway, then click the green you putt on. Most holes take two or three clicks.'
                   )}
-                  . Look at them against the imagery. If they are right, go looking for what is
-                  missing; if the line is wrong, draw your own over it.
-                </>
-              ) : (
-                <>
-                  Click the furthest back tee, follow the fairway wherever the hole bends, then
-                  finish on the green you putt on. We measure along the line you drew — the same way
-                  your card counts a dogleg — and go looking for the hole's features as soon as you
-                  finish.
-                </>
-              )}
-            </p>
+                </p>
 
-            {/* What OSM outlines along the line, named rather than only drawn. */}
-            {existing.length > 0 && (
-              <div
-                style={{
-                  ...STEP_ROW,
-                  alignItems: 'flex-start',
-                  flexDirection: 'column',
-                  gap: 6,
-                  marginBottom: 10,
-                }}
-              >
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
-                  outlined on this hole already
-                </span>
-                <span style={{ fontSize: 13, color: '#fff', textWrap: 'pretty' }}>
-                  {summariseExisting(existing)}
-                </span>
-              </div>
+                {existing.length > 0 && (
+                  <div style={{ ...STEP_ROW, alignItems: 'flex-start', flexDirection: 'column', gap: 6, marginBottom: 10 }}>
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
+                      outlined on this hole already
+                    </span>
+                    <span style={{ fontSize: 13, color: '#fff', textWrap: 'pretty' }}>{summariseExisting(existing)}</span>
+                  </div>
+                )}
+
+                {/* R15: the card the line is checked against is the set you played. */}
+                <div style={{ ...STEP_ROW, marginBottom: 10 }}>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)', width: 74 }}>measuring</span>
+                  <select
+                    value={state.teeSet ?? ''}
+                    onChange={(e) => actions.setTeeSet(e.target.value)}
+                    aria-label="Tee set to measure against"
+                    style={{
+                      flex: 1,
+                      height: 32,
+                      background: 'var(--green-800)',
+                      color: '#fff',
+                      border: '1px solid rgba(255,255,255,.18)',
+                      borderRadius: 'var(--radius-sm)',
+                      padding: '0 8px',
+                      fontSize: 13,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {(course?.tees ?? []).map((tee) => (
+                      <option key={tee.color} value={tee.color}>
+                        from the {tee.name} tees
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {locatePoints.length >= 2 && (
+                  <YardageCheck
+                    yards={locateYds}
+                    lineFromOsm={lineFromOsm}
+                    teeSetName={teeSetName}
+                    cardText={cardText}
+                    verdict={locateVerdict}
+                  />
+                )}
+
+                {/* Detection answered, or was stopped: say so, and keep both ways on. */}
+                {locateDone ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+                    {state.detect.status === 'no_coverage' && (
+                      <RailNotice>
+                        Nothing to propose on this hole — {state.detect.message} Nothing went wrong; every step is yours to
+                        draw.
+                      </RailNotice>
+                    )}
+                    {state.detect.status === 'failed' && (
+                      <RailNotice tone="danger">
+                        Detection did not finish — {state.detect.message} The hole is still yours to map by hand.
+                      </RailNotice>
+                    )}
+                    <Button size="lg" variant="accent" fullWidth onClick={actions.confirmLocate}>
+                      Carry on and map it by hand
+                    </Button>
+                    <HoverButton onClick={actions.requestProposals} style={{ ...GHOST_BUTTON, height: 42 }} hoverStyle={GHOST_HOVER}>
+                      Look in the imagery again
+                    </HoverButton>
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+                    <Button size="lg" variant="accent" fullWidth onClick={actions.confirmLine} disabled={!canConfirmLine}>
+                      {locatePoints.length >= 2 ? 'Yes, that is the hole' : 'Click the tee and the green first'}
+                    </Button>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
+                      {lineSource === 'drawn' ? (
+                        <HoverButton
+                          onClick={actions.undoLastPoint}
+                          disabled={locatePoints.length === 0}
+                          style={{ ...GHOST_BUTTON, opacity: locatePoints.length === 0 ? 0.45 : 1 }}
+                          hoverStyle={GHOST_HOVER}
+                        >
+                          Undo last point
+                        </HoverButton>
+                      ) : (
+                        <span />
+                      )}
+                      <HoverButton onClick={actions.resetLocate} style={GHOST_BUTTON} hoverStyle={GHOST_HOVER}>
+                        {lineSource === 'osm' ? 'Draw it myself' : 'Start over'}
+                      </HoverButton>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
+          </div>
+        )}
 
-            {/* R15: the card the line is checked against is the set you played. */}
-            <div style={{ ...STEP_ROW, marginBottom: 10 }}>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)', width: 74 }}>
-                measuring
-              </span>
-              <select
-                value={state.teeSet ?? ''}
-                onChange={(e) => actions.setTeeSet(e.target.value)}
-                aria-label="Tee set to measure against"
-                style={{
-                  flex: 1,
-                  height: 32,
-                  background: 'var(--green-800)',
-                  color: '#fff',
-                  border: '1px solid rgba(255,255,255,.18)',
-                  borderRadius: 'var(--radius-sm)',
-                  padding: '0 8px',
-                  fontSize: 13,
-                  cursor: 'pointer',
-                }}
-              >
-                {(course?.tees ?? []).map((tee) => (
-                  <option key={tee.color} value={tee.color}>
-                    from the {tee.name} tees
-                  </option>
-                ))}
-              </select>
+        {/* ---------- 2. Reshaping an outline ---------- */}
+        {!isLocate && interaction.kind === 'edit' && (
+          <div style={{ ...RAIL_CARD, border: '1px solid var(--mint-400)', animation: 'ogRise 190ms var(--ease-out)' }}>
+            <div style={{ ...EYEBROW, color: 'var(--mint-400)', marginBottom: 10 }}>Editing the {editNoun} outline</div>
+            <h3 style={{ ...H3, fontSize: 20 }}>Pull the dots until it fits.</h3>
+            <p style={NOTE}>
+              Every corner of the {editNoun} is draggable on the map. Drag the small dots between them to add a corner,
+              right-click one to take it out. Nothing else changes while you do this.
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+              <Button size="lg" variant="accent" fullWidth onClick={actions.finishEdit}>
+                Save this shape
+              </Button>
+              <HoverButton onClick={actions.resetEdit} style={{ ...GHOST_BUTTON, height: 40 }} hoverStyle={GHOST_HOVER}>
+                {editingShapes.some((shape) => shape.origin === 'osm')
+                  ? 'Put it back how OpenStreetMap has it'
+                  : 'Put it back how we drew it'}
+              </HoverButton>
             </div>
+          </div>
+        )}
 
-            {/* The three drawing steps, which a hole that arrived with a line has
-              * already been through — asking for a tee click over a tee that is
-              * drawn on screen is an instruction to do work twice. */}
-            {!lineFromOsm && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 16 }}>
-                {[
-                  {
-                    num: '1',
-                    label: 'The furthest back tee',
-                    done: locatePoints.length >= 1,
-                    state: locatePoints.length >= 1 ? 'marked' : 'click the map',
-                  },
-                  {
-                    num: '2',
-                    label: 'Follow the fairway',
-                    done: turnPoints > 0,
-                    state:
-                      turnPoints > 0
-                        ? `${turnPoints} point${turnPoints === 1 ? '' : 's'}`
-                        : locatePoints.length >= 1
-                          ? 'optional'
-                          : 'next',
-                  },
-                  {
-                    num: '3',
-                    label: 'The green you putt on',
-                    done: locateDone,
-                    state: locateDone ? 'marked' : locatePoints.length >= 1 ? 'click it, then finish' : 'next',
-                  },
-                ].map((p) => {
-                  const ring = p.done ? 'var(--mint-400)' : locatePoints.length >= 1 ? '#fff' : 'var(--green-200)';
+        {/* ---------- 3. A shape just dropped or picked ---------- */}
+        {!isLocate && newShape && (
+          <div style={{ ...RAIL_CARD, border: '1px solid var(--mint-400)', animation: 'ogRise 190ms var(--ease-out)' }}>
+            <div style={{ ...EYEBROW, color: 'var(--mint-400)', marginBottom: 10 }}>
+              {newShape.origin === 'drawn' ? `Your new ${SHAPE_NOUN[newShape.kind]}` : `That ${SHAPE_NOUN[newShape.kind]}`}
+            </div>
+            <h3 style={{ ...H3, fontSize: 20 }}>Pull the dots until it fits.</h3>
+            <p style={NOTE}>
+              {newShape.origin === 'drawn'
+                ? `We dropped a rough ${SHAPE_NOUN[newShape.kind]} where you clicked. Drag its corners to match what is on the ground.`
+                : `Drag its corners to match what is on the ground, then save it.`}
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
+              <Button size="lg" variant="accent" fullWidth onClick={actions.confirmNew}>
+                Save this {SHAPE_NOUN[newShape.kind]}
+              </Button>
+              <HoverButton onClick={actions.discardNew} style={{ ...GHOST_BUTTON, height: 40 }} hoverStyle={GHOST_HOVER}>
+                Remove it
+              </HoverButton>
+            </div>
+          </div>
+        )}
+
+        {/* ---------- 4. The question ---------- */}
+        {!isLocate && question && (interaction.kind === 'none' || interaction.kind === 'place' || interaction.kind === 'pick') && (
+          <div style={{ ...RAIL_CARD, opacity: interaction.kind === 'none' ? 1 : 0.6 }}>
+            <div style={{ ...EYEBROW, color: 'var(--mint-400)', marginBottom: 10 }}>{question.kicker}</div>
+            <h3 style={H3}>{question.title}</h3>
+            <p style={NOTE}>{question.note}</p>
+
+            {step?.id === 'tees' && teeSets.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+                {teeSets.map((tee, i) => {
+                  const current = i === state.teeIndex;
+                  const box = state.teeBoxes[tee.key];
+                  const stateText = current
+                    ? box
+                      ? 'highlighted'
+                      : 'no box yet'
+                    : i < state.teeIndex
+                      ? box
+                        ? 'matched'
+                        : 'no tee'
+                      : box
+                        ? 'our guess'
+                        : 'no box';
                   return (
-                    <div key={p.num} style={STEP_ROW}>
+                    <div
+                      key={tee.key}
+                      style={{
+                        ...STEP_ROW,
+                        padding: '10px 12px',
+                        background: current ? 'rgba(62,207,180,.16)' : 'var(--green-900)',
+                        border: `1px solid ${current ? 'var(--mint-400)' : 'rgba(255,255,255,.12)'}`,
+                      }}
+                    >
+                      <span style={{ width: 12, height: 12, borderRadius: 3, background: tee.swatch, display: 'block' }} />
+                      <span style={{ flex: 1, fontSize: 14, fontWeight: 600, color: current ? '#fff' : 'var(--green-100)' }}>
+                        {tee.name}
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--green-200)', fontVariantNumeric: 'tabular-nums' }}>
+                        {tee.yards} yd
+                      </span>
                       <span
                         style={{
-                          width: 24,
-                          height: 24,
-                          borderRadius: 999,
-                          border: `1.5px solid ${ring}`,
-                          color: ring,
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'center',
                           fontFamily: 'var(--font-mono)',
-                          fontSize: 12,
+                          fontSize: 11,
+                          width: 82,
+                          textAlign: 'right',
+                          color: current ? 'var(--mint-400)' : box === undefined && i >= state.teeIndex ? PROPOSED_COLOR : 'var(--green-200)',
                         }}
                       >
-                        {p.num}
+                        {stateText}
                       </span>
-                      <span style={{ flex: 1, fontSize: 14, color: '#fff' }}>{p.label}</span>
-                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: ring }}>{p.state}</span>
                     </div>
                   );
                 })}
               </div>
             )}
 
-            {/* Point-by-point editing belongs to a line being drawn. A line that
-              * came out of OpenStreetMap is kept or redrawn whole — taking its
-              * green off one vertex at a time is not a review of it. */}
-            {!lineFromOsm && (
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9, marginBottom: 14 }}>
-                <HoverButton
-                  onClick={actions.undoLastPoint}
-                  disabled={locatePoints.length === 0}
-                  style={{ ...GHOST_BUTTON, opacity: locatePoints.length === 0 ? 0.45 : 1 }}
-                  hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
-                >
-                  Undo last point
-                </HoverButton>
-                <HoverButton
-                  onClick={actions.finishLine}
-                  disabled={!canFinish}
-                  style={{
-                    ...GHOST_BUTTON,
-                    background: canFinish ? 'var(--mint-400)' : 'var(--green-900)',
-                    color: canFinish ? 'var(--green-950)' : '#fff',
-                    borderColor: canFinish ? 'var(--mint-400)' : 'rgba(255,255,255,.2)',
-                    opacity: canFinish ? 1 : 0.45,
-                  }}
-                  hoverStyle={canFinish ? {} : { background: 'var(--green-900)' }}
-                >
-                  Finish the line
-                </HoverButton>
-              </div>
-            )}
-
-            {locateDone && (
-              <div style={{ animation: 'ogRise 190ms var(--ease-out)' }}>
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'baseline',
-                    gap: 10,
-                    background: 'var(--green-900)',
-                    border: '1px solid rgba(255,255,255,.12)',
-                    borderRadius: 'var(--radius-md)',
-                    padding: '13px 14px',
-                    marginBottom: 14,
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: 13,
-                    color: 'var(--green-100)',
-                    fontVariantNumeric: 'tabular-nums',
-                  }}
-                >
-                  <span style={{ color: '#fff', fontSize: 20 }}>{locateYds}</span>
-                  <span>yd along {lineFromOsm ? "OpenStreetMap's line" : 'your line'}</span>
-                  <span
+            {step?.id === 'hazards' && hazards.length > 0 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16 }}>
+                {hazards.map((hazard, i) => (
+                  <div
+                    key={hazard.id}
                     style={{
-                      marginLeft: 'auto',
-                      color:
-                        locateVerdict === LOCATE_CLOSE_ENOUGH ? 'var(--mint-400)' : 'var(--amber-500)',
+                      background: 'var(--green-900)',
+                      border: `1px solid ${hazard.hazardType ? 'rgba(255,255,255,.12)' : PROPOSED_COLOR}`,
+                      borderRadius: 'var(--radius-md)',
+                      padding: '10px 12px',
                     }}
                   >
-                    the {teeSetName} tees say {cardText} — {locateVerdict ?? 'no card to check'}
-                  </span>
-                </div>
-
-                {/*
-                 * Detection is an offer on a finished line, never a gate in front
-                 * of one (R1). Whatever it answers — proposals, silence, or
-                 * nothing at all — the button below is still there, so a hole is
-                 * always hand-mappable (R12).
-                 */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 9, marginBottom: 14 }}>
-                  {detecting ? (
-                    <div
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 12,
-                        background: 'var(--green-900)',
-                        border: '1px solid rgba(255,255,255,.12)',
-                        borderRadius: 'var(--radius-md)',
-                        padding: '11px 13px',
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: 12,
-                        color: 'var(--green-100)',
-                      }}
-                    >
-                      <span>Reading the imagery for hole {holeNum} …</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                      <span style={{ flex: 1, fontSize: 14, color: '#fff', fontWeight: 600 }}>
+                        Hazard {i + 1}
+                        {hazard.fromSaved && (
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: SAVED_COLOR, fontWeight: 400 }}>
+                            {' '}
+                            · you saved it earlier
+                          </span>
+                        )}
+                        {!hazard.fromSaved && hazard.origin === 'proposed' && (
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: PROPOSED_COLOR, fontWeight: 400 }}>
+                            {' '}
+                            · we spotted it
+                          </span>
+                        )}
+                        {!hazard.fromSaved && hazard.origin === 'osm' && (
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: EXISTING_COLOR, fontWeight: 400 }}>
+                            {' '}
+                            · already in OpenStreetMap
+                          </span>
+                        )}
+                      </span>
                       <button
-                        onClick={actions.cancelProposals}
-                        style={{
-                          marginLeft: 'auto',
-                          background: 'rgba(255,255,255,.1)',
-                          border: 'none',
-                          borderRadius: 'var(--radius-sm)',
-                          height: 26,
-                          padding: '0 10px',
-                          color: '#fff',
-                          fontFamily: 'var(--font-mono)',
-                          fontSize: 11,
-                          cursor: 'pointer',
-                        }}
+                        onClick={() => actions.startEdit([hazard.id])}
+                        style={{ ...GHOST_BUTTON, height: 26, fontSize: 11, fontFamily: 'var(--font-mono)', fontWeight: 400, padding: '0 9px' }}
                       >
-                        cancel and map it myself
+                        edges
+                      </button>
+                      <button
+                        onClick={() => actions.removeShape(hazard.id)}
+                        style={{ ...GHOST_BUTTON, height: 26, fontSize: 11, fontFamily: 'var(--font-mono)', fontWeight: 400, padding: '0 9px' }}
+                      >
+                        remove
                       </button>
                     </div>
-                  ) : (
-                    <HoverButton
-                      onClick={actions.requestProposals}
-                      disabled={!canRequestProposals}
-                      style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
-                      hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
-                    >
-                      Look for features in the imagery
-                    </HoverButton>
-                  )}
-
-                  {/* Silence and failure are two different answers, said two different ways. */}
-                  {state.detect.status === 'no_coverage' && (
-                    <RailNotice>
-                      No proposals for this hole — {state.detect.message} Nothing went wrong; there is
-                      just nothing for you to confirm. Carry on and map it by hand.
-                    </RailNotice>
-                  )}
-
-                  {state.detect.status === 'failed' && (
-                    <RailNotice tone="danger">
-                      Detection did not finish — {state.detect.message} The hole is still yours to map
-                      by hand.
-                    </RailNotice>
-                  )}
-                </div>
-
-                <Button size="lg" variant="accent" fullWidth onClick={actions.confirmLocate}>
-                  Save this line and carry on
-                </Button>
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }} role="radiogroup" aria-label={`What hazard ${i + 1} is`}>
+                      {HAZARD_TYPES.map(({ type, label }) => {
+                        const chosen = hazard.hazardType === type;
+                        return (
+                          <button
+                            key={type}
+                            role="radio"
+                            aria-checked={chosen}
+                            onClick={() => actions.setHazardType(hazard.id, type)}
+                            style={{
+                              background: chosen ? 'rgba(62,207,180,.18)' : 'var(--green-800)',
+                              border: `1px solid ${chosen ? 'var(--mint-400)' : 'rgba(255,255,255,.14)'}`,
+                              borderRadius: 'var(--radius-sm)',
+                              height: 30,
+                              padding: '0 11px',
+                              color: chosen ? '#fff' : 'var(--green-100)',
+                              fontSize: 13,
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 14 }}>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
-                {locatePoints.length} point{locatePoints.length === 1 ? '' : 's'}{' '}
-                {lineFromOsm ? 'on the map' : 'marked'}
-              </span>
-              <button
-                onClick={actions.resetLocate}
-                style={{
-                  marginLeft: 'auto',
-                  background: 'transparent',
-                  border: 'none',
-                  color: 'var(--green-200)',
-                  fontSize: 12,
-                  cursor: 'pointer',
-                  textDecoration: 'underline',
-                  padding: 0,
-                }}
-              >
-                {lineFromOsm ? 'Draw my own line instead' : 'Start over'}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {!allDone && !isLocate && (
-          <div style={RAIL_CARD}>
-            <div
-              style={{
-                ...EYEBROW,
-                color: 'var(--mint-400)',
-                marginBottom: 10,
-                display: 'flex',
-                gap: 10,
-              }}
-            >
-              <span>{q.kicker}</span>
-              {/* Which one of how many — the count comes off the real list, not the copy. */}
-              {stepProposalCount > 0 && (
-                <span style={{ marginLeft: 'auto', color: PROPOSED_COLOR }}>
-                  {activePosition} / {stepProposalCount} suggested
-                </span>
-              )}
-            </div>
-            <h3
-              style={{
-                fontFamily: 'var(--font-display)',
-                fontSize: 22,
-                fontWeight: 700,
-                letterSpacing: '-.015em',
-                color: '#fff',
-                margin: '0 0 8px',
-                textWrap: 'pretty',
-              }}
-            >
-              {stepTitle}
-            </h3>
-            <p style={{ margin: '0 0 16px', fontSize: 14, color: 'var(--green-200)', textWrap: 'pretty' }}>
-              {stepNote}
-            </p>
-
-            {/* R5, R9: where this one came from, before it is answered. */}
+            {/* R5, R9: where a suggestion came from, before it is answered. */}
             <ProvenancePanel
               proposal={activeProposal}
               imagery={detectionImagery}
@@ -1451,167 +1505,40 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
               now={now}
             />
 
-            {/*
-              * The rest of this step's queue, each with its own confidence, so
-              * "2 of 3" is a position in a list the contributor can see rather
-              * than a number they have to take on trust.
-              */}
-            {stepProposalCount > 1 && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 14 }}>
-                {stepProposals.map((proposal, i) => {
-                  const isActive = proposal.id === activeProposal?.id;
-                  return (
-                    <div
-                      key={proposal.id}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 10,
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: 12,
-                        color: isActive ? '#fff' : 'var(--green-200)',
-                        fontVariantNumeric: 'tabular-nums',
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: 14,
-                          height: 0,
-                          borderTop: `2px ${isActive ? 'solid' : 'dashed'} ${
-                            isActive ? ACTIVE_COLOR : PROPOSED_COLOR
-                          }`,
-                          display: 'block',
-                        }}
-                      />
-                      <span style={{ flex: 1 }}>
-                        {proposal.kind} {i + 1}
-                        {isActive ? ' — asking now' : ''}
-                      </span>
-                      <span>{percent(proposal.confidence)}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {q.isTees && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginBottom: 16 }}>
-                {TEE_IDS.map((id, i) => (
-                  <div key={id} style={{ ...STEP_ROW, gap: 10, padding: '9px 12px' }}>
-                    <span
-                      style={{
-                        fontFamily: 'var(--font-mono)',
-                        fontSize: 11,
-                        color: 'var(--green-200)',
-                        width: 74,
-                      }}
-                    >
-                      {TEE_POSITIONS[i]}
-                    </span>
-                    <select
-                      value={state.teeAssign[id]}
-                      onChange={(e) => actions.setTee(id, e.target.value)}
-                      style={{
-                        flex: 1,
-                        height: 32,
-                        background: 'var(--green-800)',
-                        color: '#fff',
-                        border: '1px solid rgba(255,255,255,.18)',
-                        borderRadius: 'var(--radius-sm)',
-                        padding: '0 8px',
-                        fontSize: 13,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      {scorecard.map((t) => (
-                        <option key={t.name} value={t.name}>
-                          {t.name} · {t.yd} yd
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/*
-              * One proposal, one answer (R7). The confirming button is about the
-              * feature on screen and nothing behind it, and on the water step it
-              * is the in-play question itself — the only thing that makes a pond
-              * a hazard (R14). With nothing proposed the step still stands: the
-              * contributor confirms the absence, or says we missed one.
-              */}
             <div style={{ display: 'flex', flexDirection: 'column', gap: 9 }}>
-              <Button size="lg" variant="accent" fullWidth onClick={actions.accept}>
-                {stepAccept}
+              <Button
+                size="lg"
+                variant="accent"
+                fullWidth
+                onClick={() => actions.accept()}
+                disabled={question.acceptDisabled || interaction.kind !== 'none'}
+              >
+                {question.accept}
               </Button>
-              {stepNeedsInPlay && q.outOfPlay && (
-                <HoverButton
-                  onClick={() => actions.answerInPlay(false)}
-                  style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
-                  hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
-                >
-                  {q.outOfPlay}
-                </HoverButton>
-              )}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
-                {(activeProposal !== null || q.kind === null) && (
+              <div style={{ display: 'flex', gap: 9, flexWrap: 'wrap' }}>
+                {question.actions.map((action) => (
                   <HoverButton
-                    onClick={actions.reject}
-                    style={{ ...GHOST_BUTTON, height: 44, fontSize: 14 }}
-                    hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
+                    key={action.id}
+                    onClick={() => actions.runAction(action.id)}
+                    disabled={interaction.kind !== 'none'}
+                    style={{ ...GHOST_BUTTON, flex: '1 1 44%', minWidth: 150, height: 44, fontSize: 14 }}
+                    hoverStyle={GHOST_HOVER}
                   >
-                    {q.reject}
+                    {action.label}
                   </HoverButton>
-                )}
-                <HoverButton
-                  onClick={actions.missing}
-                  style={{
-                    ...GHOST_BUTTON,
-                    height: 44,
-                    fontSize: 14,
-                    gridColumn: activeProposal === null && q.kind !== null ? '1 / -1' : undefined,
-                  }}
-                  hoverStyle={{ background: 'var(--green-950)', borderColor: 'rgba(255,255,255,.34)' }}
-                >
-                  {q.miss}
-                </HoverButton>
+                ))}
               </div>
             </div>
 
             {/* R10: a rejection is a record. Say so where it was made. */}
             {rejectedHere.length > 0 && (
-              <div
-                style={{
-                  marginTop: 12,
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 11,
-                  color: 'var(--green-200)',
-                }}
-              >
+              <div style={{ marginTop: 12, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
                 {rejectedHere.length} turned down on this hole — kept, not discarded.
               </div>
             )}
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 14 }}>
-              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
-                A accept · N not there · M missed one
-              </span>
-              <button
-                onClick={actions.nudge}
-                style={{
-                  marginLeft: 'auto',
-                  background: 'transparent',
-                  border: 'none',
-                  color: 'var(--green-200)',
-                  fontSize: 12,
-                  cursor: 'pointer',
-                  textDecoration: 'underline',
-                  padding: 0,
-                }}
-              >
-                Edges look off — let me drag them
-              </button>
+            <div style={{ marginTop: 14, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
+              {step?.id === 'hazards' ? 'A to accept · M to draw one' : 'A to accept · N for the first “no” · M missed one · Esc to back out'}
             </div>
           </div>
         )}
@@ -1638,7 +1565,8 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
           </div>
         )}
 
-        {allDone && (
+        {/* ---------- 5. Save the hole ---------- */}
+        {!isLocate && allDone && (
           <div
             style={{
               background: 'var(--green-800)',
@@ -1648,30 +1576,12 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
               animation: 'ogRise 190ms var(--ease-out)',
             }}
           >
-            <h3
-              style={{
-                fontFamily: 'var(--font-display)',
-                fontSize: 20,
-                fontWeight: 700,
-                color: '#fff',
-                margin: '0 0 10px',
-                letterSpacing: '-.015em',
-              }}
-            >
-              Hole {holeNum}, confirmed.
-            </h3>
+            <h3 style={{ ...H3, fontSize: 20, margin: '0 0 10px' }}>Hole {holeNum}, confirmed.</h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginBottom: 16 }}>
               {summary.map((text) => (
                 <div
                   key={text}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 9,
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: 13,
-                    color: 'var(--green-100)',
-                  }}
+                  style={{ display: 'flex', alignItems: 'center', gap: 9, fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--green-100)' }}
                 >
                   <span style={{ color: 'var(--mint-400)', display: 'flex' }}>
                     <Icon name="check" size={14} />
@@ -1680,8 +1590,19 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
                 </div>
               ))}
             </div>
-            <Button size="lg" variant="accent" fullWidth onClick={actions.upload}>
-              Put hole {holeNum} on the map
+            {state.save.status === 'failed' && (
+              <div style={{ marginBottom: 12 }}>
+                <RailNotice tone="danger">
+                  Not saved — {state.save.message} Everything is still here; try again when the service is back.
+                </RailNotice>
+              </div>
+            )}
+            <Button size="lg" variant="accent" fullWidth onClick={actions.saveHole} disabled={!canSave}>
+              {state.save.status === 'saving'
+                ? 'Saving …'
+                : state.save.status === 'failed'
+                  ? `Try saving hole ${holeNum} again`
+                  : `Save hole ${holeNum}`}
             </Button>
           </div>
         )}
@@ -1699,13 +1620,14 @@ export function ReviewScreen({ mapper, now }: { mapper: Mapper; now?: Date }) {
               fontSize: 13,
               fontWeight: 600,
               cursor: 'pointer',
+              whiteSpace: 'nowrap',
             }}
             hoverStyle={{ background: 'rgba(255,255,255,.07)' }}
           >
             Back to the holes
           </HoverButton>
           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--green-200)' }}>
-            nothing is sent until you finish the hole
+            nothing is saved until you finish the hole
           </span>
         </div>
       </div>

@@ -51,18 +51,19 @@ from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Annotated, Any, Literal, Protocol
 
 from fastapi import FastAPI, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from sqlalchemy.orm import Session
 
-from service import segment, vectorize
+from service import holes, segment, vectorize
 from service.classify import METERS_PER_YARD, FeatureKind, TeeSet, classify_corridor
-from service.models import DecisionOutcome
+from service.holes import FeatureOrigin, HoleFeatureKind, OsmAction
+from service.models import DecisionOutcome, LineSource
 from service.naip import (
     CORRIDOR_HALF_WIDTH_METERS,
     MAX_LINE_VERTICES,
@@ -123,6 +124,15 @@ MAX_DECISIONS_PER_BATCH = 200
 #: much more than it emitted — but not an unbounded blob, since the geometry is
 #: stored as JSON and read back by the training exporter.
 MAX_GEOMETRY_COORDINATES = 10_000
+
+#: A saved hole is one review's worth of confirmed and drawn shapes. Thirty is a
+#: busy hole; two hundred matches the decision batch cap for the same reason.
+MAX_FEATURES_PER_HOLE = 200
+
+#: OSM tags a saved feature may carry. OSM itself caps keys and values at 255
+#: characters; twenty tags is past any golf feature's real tag set.
+MAX_OSM_TAGS = 20
+MAX_OSM_TAG_LENGTH = 255
 
 #: How many job records one container keeps. A container under scale-to-zero
 #: serves many requests before it is reclaimed, so an unbounded map of finished
@@ -666,6 +676,164 @@ def _oversized_geometry(body: DecisionsBody) -> Invalid | None:
     return None
 
 
+# --- Saved holes and boundaries --------------------------------------------- #
+#
+# The mapping record, as opposed to the training record above. Shapes are
+# bounded here (enums, lengths, the tag map) and *geometrically* validated in
+# `holes.py` — finite coordinates on the globe, rings that can enclose an area,
+# the proposal/origin pairing — so the rule for "can this become OSM nodes" lives
+# in one place and is testable without HTTP. Every model forbids extras, for the
+# same reason `DetectBody` does, and none has a contributor or session field.
+
+OsmTagText = Annotated[str, StringConstraints(min_length=1, max_length=MAX_OSM_TAG_LENGTH)]
+
+
+class LineGeometryBody(BaseModel):
+    """A GeoJSON LineString. `coordinates` is checked by `holes.line_problem`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["LineString"]
+    coordinates: list[Any]
+
+
+class AreaGeometryBody(BaseModel):
+    """A GeoJSON Polygon or MultiPolygon. Checked by `holes.area_problem`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["Polygon", "MultiPolygon"]
+    coordinates: list[Any]
+
+
+class SavedTeeSetBody(BaseModel):
+    """A tee set a saved tee box serves.
+
+    Unlike `TeeSetBody`, `yards` may be null: a contributor can place the blue
+    tee from the card's name alone when the card gives no yardage, and an
+    invented number would be worse than an absent one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=64)
+    yards: float | None = Field(default=None, ge=MIN_TEE_YARDS, le=MAX_TEE_YARDS)
+
+
+class ProposalBody(BaseModel):
+    """What a proposed feature carries that a drawn one cannot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confidence: float = Field(ge=0.0, le=1.0)
+    provenance: ProvenanceBody
+
+
+class SavedFeatureBody(BaseModel):
+    """One confirmed or drawn polygon on a saved hole.
+
+    `edited` records that a contributor moved vertices of a proposed shape —
+    the difference between "the model was right" and "the model was close",
+    which the training record and the OSM changeset comment both want.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: HoleFeatureKind
+    geometry: AreaGeometryBody
+    origin: FeatureOrigin
+    edited: bool = False
+    tee_sets: list[SavedTeeSetBody] = Field(default_factory=list, max_length=MAX_TEE_SETS)
+    label: str | None = Field(default=None, max_length=200)
+    osm_tags: dict[OsmTagText, OsmTagText] = Field(default_factory=dict, max_length=MAX_OSM_TAGS)
+    proposal: ProposalBody | None = None
+    #: The OpenStreetMap element, e.g. "way/500123", when `origin` is `osm`.
+    osm_id: str | None = Field(default=None, max_length=64)
+    #: What the upload has to do with it; see `holes.OsmAction`. Filled in when
+    #: omitted — `create` for a new shape, `keep` or `modify` for an OSM one by
+    #: whether it was edited — so every stored feature says it explicitly.
+    osm_action: OsmAction | None = None
+
+    @model_validator(mode="after")
+    def _default_osm_action(self) -> "SavedFeatureBody":
+        if self.osm_action is None:
+            if self.origin == FeatureOrigin.OSM:
+                self.osm_action = OsmAction.MODIFY if self.edited else OsmAction.KEEP
+            else:
+                self.osm_action = OsmAction.CREATE
+        return self
+
+
+class HoleBody(BaseModel):
+    """One whole hole, saved. Append-only: a re-save is a new row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    course_id: str = Field(min_length=1, max_length=128)
+    hole_number: int = Field(ge=1, le=99)
+    par: int | None = Field(default=None, ge=MIN_PAR, le=MAX_PAR)
+    playing_line: LineGeometryBody
+    line_source: LineSource
+    osm_hole_id: str | None = Field(default=None, max_length=64)
+    features: list[SavedFeatureBody] = Field(default_factory=list, max_length=MAX_FEATURES_PER_HOLE)
+
+    def to_input(self) -> holes.HoleInput:
+        # `mode="json"` so what is stored is exactly the JSON the read path
+        # answers: enums as their values, defaults filled in.
+        return holes.HoleInput(
+            course_id=self.course_id,
+            hole_number=self.hole_number,
+            par=self.par,
+            playing_line=self.playing_line.model_dump(mode="json"),
+            line_source=self.line_source,
+            osm_hole_id=self.osm_hole_id,
+            features=tuple(feature.model_dump(mode="json") for feature in self.features),
+        )
+
+
+class BoundaryBody(BaseModel):
+    """A corrected (or confirmed) course boundary. The course is in the path.
+
+    `edited` defaults to true because the ordinary reason to save a boundary is
+    that the contributor changed it; a confirmation of OSM's shape says `false`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    osm_id: str | None = Field(default=None, max_length=64)
+    geometry: AreaGeometryBody
+    edited: bool = True
+
+
+def _oversized(coordinates: Any, field_name: str, **detail: Any) -> Invalid | None:
+    """The `MAX_GEOMETRY_COORDINATES` cap applied to one geometry of a save."""
+    count = _coordinate_count(coordinates, MAX_GEOMETRY_COORDINATES + 1)
+    if count > MAX_GEOMETRY_COORDINATES:
+        return Invalid(
+            "That geometry has more coordinates than this service will store.",
+            field_name=field_name,
+            detail={**detail, "cap_coordinates": MAX_GEOMETRY_COORDINATES},
+        )
+    return None
+
+
+def _oversized_hole(body: HoleBody) -> Invalid | None:
+    """The coordinate cap, per feature and for the line, before any walk of them.
+
+    Checked ahead of `holes.py`'s per-position validation so a pathological
+    payload is refused by a bounded count rather than a full walk.
+    """
+    line = _oversized(body.playing_line.coordinates, "playing_line")
+    if line is not None:
+        return line
+    for index, feature in enumerate(body.features):
+        found = _oversized(feature.geometry.coordinates, "features", index=index)
+        if found is not None:
+            return found
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Rendering typed outcomes as HTTP
 # --------------------------------------------------------------------------- #
@@ -900,8 +1068,8 @@ def create_app(
     def _store_unavailable() -> JSONResponse:
         return failure_response(
             Upstream(
-                "This service is running without a decision store, so nothing can be "
-                "recorded or read back.",
+                "This service is running without a store, so nothing can be recorded, "
+                "saved or read back.",
                 source="configuration",
             )
         )
@@ -971,6 +1139,89 @@ def create_app(
             content={"status": "ok", "decisions": [_recorded(d) for d in found.value]},
         )
 
+    @app.post("/v1/holes")
+    def save_hole(body: HoleBody) -> JSONResponse:
+        """Save one whole hole: the playing line and every polygon kept on it.
+
+        Append-only. A contributor who comes back to a hole saves it again and
+        the read below answers the newest save; the earlier one stays, so an
+        undo on the client is never an erasure on the server.
+        """
+        if session_factory is None:
+            return _store_unavailable()
+
+        oversized = _oversized_hole(body)
+        if oversized is not None:
+            return failure_response(oversized)
+
+        with session_factory() as session:
+            saved = holes.save_hole(session, body.to_input())
+        if not is_ok(saved):
+            return failure_response(saved)
+        return JSONResponse(
+            status_code=200, content={"status": "ok", "hole": _saved_hole(saved.value)}
+        )
+
+    @app.get("/v1/holes/{course_id}")
+    def read_holes(
+        course_id: str,
+        hole: int | None = Query(default=None, ge=1, le=99),
+    ) -> JSONResponse:
+        """The latest save of each hole on a course, by hole number.
+
+        Only the newest save per hole — unlike the decision read, where every
+        answer is a label worth having. A saved hole is a *state*, and the state
+        of a hole is its latest save.
+        """
+        if session_factory is None:
+            return _store_unavailable()
+
+        with session_factory() as session:
+            found = holes.latest_holes(session, course_id, hole)
+        if not is_ok(found):
+            return failure_response(found)
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok", "holes": [_saved_hole(h) for h in found.value]},
+        )
+
+    @app.post("/v1/courses/{course_id}/boundary")
+    def save_boundary(course_id: str, body: BoundaryBody) -> JSONResponse:
+        """Save a course boundary the contributor corrected. Append-only."""
+        if session_factory is None:
+            return _store_unavailable()
+
+        oversized = _oversized(body.geometry.coordinates, "geometry")
+        if oversized is not None:
+            return failure_response(oversized)
+
+        boundary = holes.BoundaryInput(
+            course_id=course_id,
+            osm_id=body.osm_id,
+            geometry=body.geometry.model_dump(mode="json"),
+            edited=body.edited,
+        )
+        with session_factory() as session:
+            saved = holes.save_boundary(session, boundary)
+        if not is_ok(saved):
+            return failure_response(saved)
+        return JSONResponse(
+            status_code=200, content={"status": "ok", "boundary": _saved_boundary(saved.value)}
+        )
+
+    @app.get("/v1/courses/{course_id}/boundary")
+    def read_boundary(course_id: str) -> JSONResponse:
+        """The latest saved boundary, or `null` — nothing saved is not an error."""
+        if session_factory is None:
+            return _store_unavailable()
+
+        with session_factory() as session:
+            found = holes.latest_boundary(session, course_id)
+        if not is_ok(found):
+            return failure_response(found)
+        boundary = None if found.value is None else _saved_boundary(found.value)
+        return JSONResponse(status_code=200, content={"status": "ok", "boundary": boundary})
+
     return app
 
 
@@ -996,6 +1247,36 @@ def _recorded(decision: Any) -> dict[str, Any]:
         "provenance": decision.provenance.as_properties(),
         "in_play": decision.in_play,
         "recorded_at": decision.recorded_at.isoformat(),
+    }
+
+
+def _saved_hole(hole: holes.SavedHoleRecord) -> dict[str, Any]:
+    """One saved hole as JSON: the request's shape, plus `id` and `saved_at`."""
+    return {
+        "id": hole.id,
+        "course_id": hole.course_id,
+        "hole_number": hole.hole_number,
+        "par": hole.par,
+        "playing_line": hole.playing_line,
+        "line_source": str(hole.line_source),
+        "osm_hole_id": hole.osm_hole_id,
+        "features": list(hole.features),
+        # Not in OpenStreetMap until the upload says so; see `models.OsmSyncStatus`.
+        "osm_sync_status": str(hole.osm_sync_status),
+        "osm_synced_at": hole.osm_synced_at.isoformat() if hole.osm_synced_at else None,
+        "saved_at": hole.saved_at.isoformat(),
+    }
+
+
+def _saved_boundary(boundary: holes.SavedBoundaryRecord) -> dict[str, Any]:
+    """One saved boundary as JSON."""
+    return {
+        "id": boundary.id,
+        "course_id": boundary.course_id,
+        "osm_id": boundary.osm_id,
+        "geometry": boundary.geometry,
+        "edited": boundary.edited,
+        "saved_at": boundary.saved_at.isoformat(),
     }
 
 
