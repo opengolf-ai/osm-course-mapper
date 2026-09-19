@@ -1,5 +1,3 @@
-import type { ProposalKind } from '../api/detect';
-
 /**
  * Where one hole stands.
  *
@@ -7,230 +5,151 @@ import type { ProposalKind } from '../api/detect';
  * `unmapped` is "OpenStreetMap holds nothing for this hole", `unknown` is "the
  * OpenStreetMap lookup failed, so we cannot say". Collapsing the second into the
  * first would tell a contributor that a fully-mapped course is empty.
+ *
+ * `saved` is a hole a contributor finished here. It is in our own store, not in
+ * OpenStreetMap — the upload path is not built — so it is never labelled as
+ * though it were on the map.
  */
-export type HoleStatus = 'ready' | 'attention' | 'complete' | 'unmapped' | 'unknown';
+export type HoleStatus = 'ready' | 'attention' | 'complete' | 'saved' | 'unmapped' | 'unknown';
 
 export const STATUS_META: Record<HoleStatus, { label: string; tone: string }> = {
   ready: { label: 'Ready to review', tone: 'accent' },
   attention: { label: 'Needs attention', tone: 'warning' },
   complete: { label: 'On the map', tone: 'success' },
+  saved: { label: 'Saved — not uploaded', tone: 'brand' },
   unmapped: { label: 'Nothing yet', tone: 'neutral' },
   unknown: { label: 'Unknown', tone: 'info' },
 };
 
-export const TEE_IDS = ['tee1', 'tee2', 'tee3', 'tee4'] as const;
-export type TeeId = (typeof TEE_IDS)[number];
+/**
+ * What a shape on a hole is, in the terms the review steps ask about.
+ *
+ * `hazard` is everything the last step collects — water, trees, a waste area —
+ * and its `HazardType` says which. Water detection proposes lands there too:
+ * whether a pond is part of the hole is a golf question, and the hazard step is
+ * where the contributor answers golf questions about things off the short grass.
+ */
+export type ShapeKind = 'tee' | 'green' | 'fairway' | 'bunker' | 'hazard';
 
-export const TEE_POSITIONS = ['furthest back', 'second back', 'third back', 'furthest up'];
+export type HazardType = 'water' | 'trees' | 'waste_area' | 'native_area' | 'other';
 
-/** What a step says when detection proposed nothing of its kind. */
-export interface EmptyStepCopy {
-  title: string;
-  note: string;
-  accept: string;
+/** The hazard types, in the order the chips offer them. */
+export const HAZARD_TYPES: { type: HazardType; label: string }[] = [
+  { type: 'water', label: 'Water' },
+  { type: 'trees', label: 'Trees' },
+  { type: 'waste_area', label: 'Waste area' },
+  { type: 'native_area', label: 'Native grass' },
+  { type: 'other', label: 'Other' },
+];
+
+export function hazardLabel(type: HazardType | null): string {
+  return HAZARD_TYPES.find((entry) => entry.type === type)?.label ?? 'Hazard';
 }
+
+/** The word a step and a caption use for a shape. */
+export const SHAPE_NOUN: Record<ShapeKind, string> = {
+  tee: 'tee box',
+  green: 'green',
+  fairway: 'fairway',
+  bunker: 'bunker',
+  hazard: 'hazard',
+};
+
+/**
+ * The OpenStreetMap tags a saved shape would carry, where the golf schema has a
+ * settled answer.
+ *
+ * Only settled answers: `golf=tee`, `golf=green`, `golf=fairway`, `golf=bunker`
+ * and `golf=water_hazard` are the documented `golf=*` values, and trees are
+ * `natural=wood` on any map. A waste area, native grass or "other" has no tag
+ * everyone agrees on, so it gets none here — the kind and the contributor's
+ * words are stored, and the tag is decided when the upload path is built rather
+ * than invented now and baked into every saved hole.
+ */
+export function osmTagsFor(kind: ShapeKind, hazardType: HazardType | null): Record<string, string> {
+  switch (kind) {
+    case 'tee':
+      return { golf: 'tee' };
+    case 'green':
+      return { golf: 'green' };
+    case 'fairway':
+      return { golf: 'fairway' };
+    case 'bunker':
+      return { golf: 'bunker', natural: 'sand' };
+    case 'hazard':
+      if (hazardType === 'water') return { golf: 'water_hazard', natural: 'water' };
+      if (hazardType === 'trees') return { natural: 'wood' };
+      return {};
+  }
+}
+
+export type StepId = 'tees' | 'green' | 'fairway' | 'bunkers' | 'hazards';
 
 /**
  * One question in the review sequence.
  *
- * A step names the **kind** of proposal it walks, never a fixed list of feature
- * ids. Detection returns a variable number of bunkers, tees and water bodies, and
- * a fixed `targets: ['bunkerA', 'bunkerB']` could only ever confirm a whole step
- * in one keystroke — which is precisely the batch confirmation R7 forbids. The
- * reviewable list is derived from the returned proposals at runtime and walked one
- * feature at a time.
- *
- * `kind: null` is a step with no detection class behind it: it exists so a
- * contributor can add something we never look for. It is not an unmet detection
- * requirement, and it is not a placeholder for one.
+ * The order is the order a golfer walks a hole: off the tee, onto the green,
+ * then back down the fairway to the sand and whatever else is in play. Every
+ * step is shown whether or not detection proposed anything for it — an empty
+ * step is where "you missed one" lives, and skipping it would make detection's
+ * silence look the same as genuine absence.
  */
 export interface Step {
-  id: string;
+  id: StepId;
   kicker: string;
-  /** The proposal kind this step reviews, or null for a contributor-add-only step. */
-  kind: ProposalKind | null;
-  /** The tee-naming controls ride on this step. */
-  isTees?: boolean;
-  /**
-   * R14: this step's proposals are not hazards until the contributor says a ball
-   * can find them. Spectral classification proposes water; it never decides
-   * whether the water counts, so the step offers an in-play answer either way.
-   */
-  needsInPlay?: boolean;
-  /** The noun the "we missed one" branch is about on this step. */
-  missNoun: string;
-  /** The question about a single proposal — the shape the step is asked in most often. */
-  title: string;
-  /** The same question when there is more than one. `{i}` is 1-based, `{n}` the count. */
-  titleMany: string;
+  /** The shape kind this step reviews. */
+  kind: ShapeKind;
+  /** Why this step exists, in one line under the question. */
   note: string;
-  accept: string;
-  /**
-   * The second confirming answer on an in-play step: yes it is water, no a ball
-   * cannot find it. Present only where `needsInPlay` is.
-   */
-  outOfPlay?: string;
-  reject: string;
-  miss: string;
-  /**
-   * What the step says when nothing of its kind came back.
-   *
-   * The step is still shown. Skipping it would make detection silence and genuine
-   * absence look identical, and would remove the only route a contributor has to
-   * say "you missed one" — one of the three outcomes the review flow is built
-   * around. The zero-proposal `hazards` step below is the same pattern by design
-   * rather than by accident.
-   */
-  empty: EmptyStepCopy;
+  /** What the rail says once the step is answered. */
   done: string;
 }
 
-/**
- * The review sequence. Each step asks a golf question, never a geometry question.
- *
- * Detection proposes; the contributor disposes, one feature at a time (KTD1, R7).
- * Nothing in this sequence confirms a batch, and no step is skipped for being
- * empty — see `Step.empty` for why.
- */
 export const STEPS: Step[] = [
-  {
-    id: 'green',
-    kicker: 'The green',
-    kind: 'green',
-    missNoun: 'green',
-    title: 'Is that the green?',
-    titleMany: 'Green {i} of {n} — is that the one you putt on?',
-    note: 'One shape, highlighted on the imagery. You have putted on it a hundred times.',
-    accept: 'Yes, that is the green',
-    reject: 'That is not the green',
-    miss: 'The green is elsewhere',
-    empty: {
-      title: 'We did not find a green here.',
-      note: 'Nothing was proposed for this hole. If you can see the green on the imagery, put it on the map yourself.',
-      accept: 'Nothing to confirm — carry on',
-    },
-    done: 'Green confirmed.',
-  },
-  {
-    id: 'bunkers',
-    kicker: 'Bunkers',
-    kind: 'bunker',
-    missNoun: 'bunker',
-    title: 'Is that a bunker?',
-    titleMany: 'Bunker {i} of {n} — is that sand?',
-    note: 'Sand only — waste areas come later.',
-    accept: 'Yes, that is sand',
-    reject: 'That is not sand',
-    miss: 'There is another bunker',
-    empty: {
-      title: 'No bunkers proposed on this hole.',
-      note: 'Either there are none, or we could not see them. You know which.',
-      accept: 'There are no bunkers here',
-    },
-    done: 'Bunkers confirmed.',
-  },
   {
     id: 'tees',
     kicker: 'Tee boxes',
     kind: 'tee',
-    isTees: true,
-    missNoun: 'tee box',
-    title: 'Is that a tee box?',
-    titleMany: 'Tee box {i} of {n} — is that one you play from?',
-    note: 'We guessed the names by distance from the green. Change any that are wrong.',
-    accept: 'Yes, that is a tee',
-    reject: 'That is not a tee',
-    miss: 'A tee is missing',
-    empty: {
-      title: 'No tee boxes proposed on this hole.',
-      note: 'Tee boxes are small and often shaded. Add the ones you play from.',
-      accept: 'Leave the tees for now',
-    },
-    done: 'Tees named.',
+    note: 'One tee off the card at a time. Click a different box on the map if we picked the wrong one.',
+    done: 'Tees matched to the card.',
+  },
+  {
+    id: 'green',
+    kicker: 'The green',
+    kind: 'green',
+    note: 'One shape, highlighted on the imagery. You have putted on it a hundred times.',
+    done: 'Green confirmed.',
   },
   {
     id: 'fairway',
     kicker: 'Fairway',
     kind: 'fairway',
-    missNoun: 'fairway edge',
-    title: 'Does the fairway run where you would hit it?',
-    titleMany: 'Fairway {i} of {n} — does it run where you would hit it?',
-    note: 'Mown fairway only — the first cut and rough stay out of it.',
-    accept: 'Yes, that is the fairway',
-    reject: 'That is not the fairway',
-    miss: 'It runs further than that',
-    empty: {
-      title: 'No fairway proposed on this hole.',
-      note: 'On a par 3 that is expected. Anywhere else, trace it yourself.',
-      accept: 'No fairway to confirm',
-    },
+    note: 'Mown fairway only — the first cut and rough stay out of it. Split fairways get a piece each.',
     done: 'Fairway confirmed.',
   },
   {
-    id: 'water',
-    kicker: 'Water',
-    kind: 'water',
-    needsInPlay: true,
-    missNoun: 'water',
-    title: 'Can a ball find that water?',
-    titleMany: 'Water {i} of {n} — can a ball find it?',
-    note: 'We can see water from the imagery. Whether it is in play is a golf question, and that one is yours.',
-    accept: 'Yes — it is in play',
-    outOfPlay: 'It is water, but out of play',
-    reject: 'That is not water',
-    miss: 'There is other water',
-    empty: {
-      title: 'No water proposed on this hole.',
-      note: 'If there is a pond or a creek we did not see, put it on the map.',
-      accept: 'No water on this hole',
-    },
-    done: 'Water settled.',
+    id: 'bunkers',
+    kicker: 'Sand',
+    kind: 'bunker',
+    note: 'Sand only — waste areas and grass hollows come next.',
+    done: 'Sand confirmed.',
   },
   {
     id: 'hazards',
-    kicker: 'Other hazards',
-    /* Nothing proposes these — we do not classify them. The step exists so the
-     * contributor can add what we never look for, not because detection owes one. */
-    kind: null,
-    missNoun: 'hazard',
-    title: 'Anything else in play out there?',
-    titleMany: 'Anything else in play out there?',
-    note: 'A waste area, a ditch, a stand of trees — only if a ball can find it.',
-    accept: 'Nothing else on this hole',
-    reject: 'Skip this one',
-    miss: 'Yes, add one',
-    empty: {
-      title: 'Anything else in play out there?',
-      note: 'A waste area, a ditch, a stand of trees. We do not look for these, so this one is entirely on you.',
-      accept: 'Nothing else on this hole',
-    },
+    kicker: 'Anything else',
+    kind: 'hazard',
+    note: 'Water, trees in play, a waste area. Click “Draw a hazard”, click the map where it is, then say what it is.',
     done: 'Hole checked.',
   },
 ];
 
-/** Fill `{i}` (1-based position) and `{n}` (count) in a step's multi-proposal copy. */
-function fillCount(text: string, position: number, count: number): string {
-  /* split/join rather than `replaceAll`: the lib target here is ES2020. */
-  return text.split('{i}').join(String(position)).split('{n}').join(String(count));
+/** "bunker" → "bunkers", "tee box" → "tee boxes". Enough English for the nouns this app says. */
+export function plural(noun: string): string {
+  return /[sx]$/.test(noun) ? `${noun}es` : `${noun}s`;
 }
 
-/**
- * The question on screen: about the one proposal being reviewed, or about the
- * absence of any. Three cases rather than a count-stuffed sentence, because
- * "Bunker 1 of 1" reads like a machine and "We found 2 bunkers" was a lie the
- * moment detection returned three.
- */
-export function stepTitle(step: Step, position: number, count: number): string {
-  if (count === 0) return step.empty.title;
-  if (count === 1) return step.title;
-  return fillCount(step.titleMany, position, count);
-}
-
-export function stepNote(step: Step, count: number): string {
-  return count === 0 ? step.empty.note : step.note;
-}
-
-/** The confirming answer. With nothing proposed there is nothing to confirm — say so. */
-export function stepAccept(step: Step, count: number): string {
-  return count === 0 ? step.empty.accept : step.accept;
+/** "1 bunker", "3 bunkers", "no bunkers". */
+export function countOf(count: number, noun: string, none = `no ${plural(noun)}`): string {
+  if (count === 0) return none;
+  return `${count} ${count === 1 ? noun : plural(noun)}`;
 }

@@ -1,11 +1,19 @@
 import { describe, expect, it } from 'vitest';
+import type { MultiPolygon, Polygon } from 'geojson';
 import {
+  bearingBetween,
   courseFeature,
+  editableOutline,
+  ellipseAround,
   labelPoint,
   lineYards,
+  openRing,
+  outlinePolygon,
   playingLine,
+  pointInRing,
   polygon,
   polygonAcres,
+  yardsAlongToEnd,
   yardsBetween,
   yardsToLine,
   type LngLat,
@@ -193,5 +201,211 @@ describe('yardsToLine', () => {
 
   it('is infinite against a line with no points at all', () => {
     expect(yardsToLine([-121.95, 36.5665], [])).toBe(Infinity);
+  });
+});
+
+describe('yardsAlongToEnd', () => {
+  const [tee, turn, green] = PEBBLE_HOLE_1;
+
+  it('reads the whole hole, along the dogleg, from the tee', () => {
+    /* A local flat projection against turf's sphere: within a yard over 380. */
+    expect(yardsAlongToEnd(tee, PEBBLE_HOLE_1)).toBeCloseTo(lineYards(PEBBLE_HOLE_1), 0);
+    /* And not the chord: a straight line to the green reads the back tee ~19 yards short. */
+    expect(yardsAlongToEnd(tee, PEBBLE_HOLE_1) - yardsBetween(tee, green)).toBeGreaterThan(10);
+  });
+
+  it('reads only the second leg from the corner, and nothing from the green', () => {
+    expect(yardsAlongToEnd(turn, PEBBLE_HOLE_1)).toBeCloseTo(lineYards([turn, green]), 0);
+    expect(yardsAlongToEnd(green, PEBBLE_HOLE_1)).toBeCloseTo(0, 6);
+  });
+
+  it('drops a point beside the line onto it before measuring', () => {
+    /* Halfway down the first leg, then pushed ~20 yards off it to the south-east:
+     * a tee box beside the line is as far out as the spot on the line beside it. */
+    const mid: LngLat = [(tee[0] + turn[0]) / 2, (tee[1] + turn[1]) / 2];
+    const beside: LngLat = [mid[0] + 0.00012, mid[1] - 0.00012];
+
+    expect(yardsToLine(beside, PEBBLE_HOLE_1)).toBeGreaterThan(10);
+    expect(yardsAlongToEnd(beside, PEBBLE_HOLE_1)).toBeCloseTo(yardsAlongToEnd(mid, PEBBLE_HOLE_1), -1);
+    expect(Math.abs(yardsAlongToEnd(mid, PEBBLE_HOLE_1) - (lineYards([mid, turn]) + lineYards([turn, green])))).toBeLessThan(1);
+  });
+
+  it('measures a point behind the tee from the tee, not beyond it', () => {
+    /* Further back than the first point: the projection clamps to the line's start. */
+    const behind: LngLat = [tee[0] - (turn[0] - tee[0]) * 0.1, tee[1] - (turn[1] - tee[1]) * 0.1];
+
+    expect(yardsAlongToEnd(behind, PEBBLE_HOLE_1)).toBeCloseTo(yardsAlongToEnd(tee, PEBBLE_HOLE_1), 6);
+  });
+
+  it('takes a LineString as readily as a list of points', () => {
+    expect(yardsAlongToEnd(tee, playingLine(PEBBLE_HOLE_1))).toBeCloseTo(yardsAlongToEnd(tee, PEBBLE_HOLE_1), 6);
+  });
+
+  it('is infinite against no line, and the straight distance against a single point', () => {
+    expect(yardsAlongToEnd(tee, [])).toBe(Infinity);
+    expect(yardsAlongToEnd(tee, [green])).toBeCloseTo(yardsBetween(tee, green), 6);
+  });
+});
+
+describe('pointInRing', () => {
+  const square: LngLat[] = [
+    [0, 0],
+    [0.01, 0],
+    [0.01, 0.01],
+    [0, 0.01],
+  ];
+  /* An L: the square with its north-east quarter cut out. */
+  const ell: LngLat[] = [
+    [0, 0],
+    [0.01, 0],
+    [0.01, 0.005],
+    [0.005, 0.005],
+    [0.005, 0.01],
+    [0, 0.01],
+  ];
+
+  it('finds a point inside and not one outside', () => {
+    expect(pointInRing([0.005, 0.005], square)).toBe(true);
+    expect(pointInRing([0.02, 0.005], square)).toBe(false);
+    expect(pointInRing([0.005, -0.001], square)).toBe(false);
+  });
+
+  it('answers the same for an open ring and a closed one', () => {
+    const closed = polygon(square).coordinates[0] as LngLat[];
+    for (const point of [[0.005, 0.005], [0.02, 0.005]] as LngLat[]) {
+      expect(pointInRing(point, closed)).toBe(pointInRing(point, square));
+    }
+  });
+
+  it('knows the notch of a concave outline is outside it', () => {
+    expect(pointInRing([0.0075, 0.0075], ell)).toBe(false);
+    expect(pointInRing([0.0025, 0.0075], ell)).toBe(true);
+    expect(pointInRing([0.0075, 0.0025], ell)).toBe(true);
+  });
+
+  it('holds nothing inside a degenerate ring', () => {
+    expect(pointInRing([0, 0], [])).toBe(false);
+  });
+});
+
+describe('openRing', () => {
+  it('drops the closing duplicate GeoJSON adds, so a corner gets one handle', () => {
+    const closed = [
+      [0, 0],
+      [1, 0],
+      [1, 1],
+      [0, 0],
+    ];
+    expect(openRing(closed)).toEqual([
+      [0, 0],
+      [1, 0],
+      [1, 1],
+    ]);
+  });
+
+  it('leaves an open ring as it is, and keeps only longitude and latitude', () => {
+    expect(
+      openRing([
+        [0, 0, 12],
+        [1, 0, 12],
+        [1, 1, 12],
+      ]),
+    ).toEqual([
+      [0, 0],
+      [1, 0],
+      [1, 1],
+    ]);
+  });
+
+  it('does not mutate what it was given', () => {
+    const closed = [
+      [0, 0],
+      [1, 0],
+      [1, 1],
+      [0, 0],
+    ];
+    openRing(closed);
+    expect(closed).toHaveLength(4);
+  });
+});
+
+describe('editableOutline', () => {
+  const square = (lng: number, lat: number, size: number): number[][] => [
+    [lng, lat],
+    [lng + size, lat],
+    [lng + size, lat + size],
+    [lng, lat + size],
+    [lng, lat],
+  ];
+
+  it('opens the outer ring of a polygon and carries its holes alongside, opened too', () => {
+    const geometry: Polygon = { type: 'Polygon', coordinates: [square(0, 0, 0.01), square(0.004, 0.004, 0.002)] };
+
+    const { ring, inner } = editableOutline(geometry);
+
+    expect(ring).toEqual(openRing(geometry.coordinates[0]));
+    expect(ring).toHaveLength(4);
+    expect(inner).toEqual([openRing(geometry.coordinates[1])]);
+    /* And closed again, it is the polygon it came from. */
+    expect(outlinePolygon(ring, inner)).toEqual(geometry);
+  });
+
+  it('picks the largest part of a MultiPolygon, wherever it sits in the list', () => {
+    const sliver = square(0.02, 0.02, 0.0005);
+    const main = square(0, 0, 0.01);
+    const geometry: MultiPolygon = { type: 'MultiPolygon', coordinates: [[sliver], [main], [square(0.03, 0.03, 0.001)]] };
+
+    expect(editableOutline(geometry)).toEqual({ ring: openRing(main), inner: [] });
+  });
+
+  it('skips a part too short to be a polygon rather than crashing on it', () => {
+    const main = square(0, 0, 0.01);
+    const geometry: MultiPolygon = { type: 'MultiPolygon', coordinates: [[[[0, 0], [1, 1]]], [main]] };
+
+    expect(editableOutline(geometry).ring).toEqual(openRing(main));
+  });
+});
+
+describe('ellipseAround', () => {
+  const centre: LngLat = [-121.947, 36.5705];
+
+  it('gives as many handles as asked for, twelve by default, and an open ring', () => {
+    expect(ellipseAround(centre, 10, 6)).toHaveLength(12);
+    expect(ellipseAround(centre, 10, 6, 8)).toHaveLength(8);
+    const ring = ellipseAround(centre, 10, 6);
+    expect(ring[0]).not.toEqual(ring[ring.length - 1]);
+  });
+
+  it('is roughly the size it was asked for, long axis north before any turn', () => {
+    const ring = ellipseAround(centre, 20, 8, 12);
+    /* Vertex 0 and 6 lie across the ellipse; 3 and 9 along it. */
+    expect(yardsBetween(ring[0], ring[6])).toBeCloseTo(16, 0);
+    expect(yardsBetween(ring[3], ring[9])).toBeCloseTo(40, 0);
+    expect(ring[3][0]).toBeCloseTo(centre[0], 9);
+    expect(ring[3][1]).toBeGreaterThan(centre[1]);
+    /* Centred on the click, and holding it. */
+    const [lng, lat] = labelPoint(outlinePolygon(ring));
+    expect(lng).toBeCloseTo(centre[0], 6);
+    expect(lat).toBeCloseTo(centre[1], 6);
+    expect(pointInRing(centre, ring)).toBe(true);
+  });
+
+  it('lays the long axis along a bearing, so a dropped shape lies along the hole', () => {
+    const ring = ellipseAround(centre, 20, 8, 12, 90);
+
+    /* Turned to face east: the long axis now runs east–west. */
+    expect(yardsBetween(ring[3], ring[9])).toBeCloseTo(40, 0);
+    expect(ring[3][1]).toBeCloseTo(centre[1], 9);
+    expect(ring[3][0]).toBeGreaterThan(centre[0]);
+  });
+});
+
+describe('bearingBetween', () => {
+  it('reads compass bearings clockwise from north', () => {
+    const from: LngLat = [-121.95, 36.57];
+    expect(bearingBetween(from, [-121.95, 36.58])).toBeCloseTo(0, 6);
+    expect(bearingBetween(from, [-121.94, 36.57])).toBeCloseTo(90, 6);
+    expect(bearingBetween(from, [-121.95, 36.56])).toBeCloseTo(180, 6);
+    expect(bearingBetween(from, [-121.96, 36.57])).toBeCloseTo(270, 6);
   });
 });

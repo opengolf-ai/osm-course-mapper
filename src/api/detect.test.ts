@@ -3,6 +3,8 @@ import type { Polygon } from 'geojson';
 import type { LngLat } from '../geo/coords';
 import {
   DETECT_API_BASE,
+  REQUEST_TIMEOUT_MS,
+  readEnvelope,
   MAX_DECISIONS_PER_CALL,
   POLL_INTERVAL_MS,
   decisionFor,
@@ -610,5 +612,51 @@ describe('recordDecisions', () => {
   it('does not call the store when there is nothing to record', async () => {
     expect(await recordDecisions('c', 1, [])).toEqual({ status: 'ok', recorded: 0 });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('a service that accepts the connection and never answers', () => {
+  /*
+   * What a missing or mis-pointed devcontainer port forward looks like from the
+   * browser: the TCP connection opens, and nothing ever comes back. Before the
+   * timeout, a hole save sat on "Saving …" forever.
+   */
+  const hangingFetch = () =>
+    vi.fn(
+      (_url: string, init: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        }),
+    );
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('gives up after the request timeout with a failure that names the service', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', hangingFetch());
+
+    const pending = readEnvelope(`${DETECT_API_BASE}/v1/holes`, { method: 'POST' });
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS);
+    const result = await pending;
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.result).toMatchObject({ status: 'failed', reason: 'network' });
+    expect((result.result as { message: string }).message).toMatch(/did not answer within 20 s/);
+  });
+
+  it('still reports a cancellation the caller asked for as aborted, not as a timeout', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', hangingFetch());
+    const controller = new AbortController();
+
+    const pending = readEnvelope(`${DETECT_API_BASE}/v1/holes`, { method: 'POST' }, controller.signal);
+    controller.abort();
+    const result = await pending;
+
+    expect(result).toEqual({ ok: false, result: { status: 'aborted' } });
   });
 });

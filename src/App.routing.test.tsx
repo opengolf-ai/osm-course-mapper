@@ -59,11 +59,27 @@ function detailFixture() {
   };
 }
 
-function stubNetwork() {
+/**
+ * Our own store, read on every course open (saved holes and a saved boundary).
+ * Answered at once, holding nothing unless a test says otherwise: a stub that
+ * let these fall through to the course record, or held them open, would make
+ * every open either read nonsense or wait out the store timeout.
+ */
+function storeAnswer(url: string, holes: unknown[] = []): Response | null {
+  if (url.includes('/v1/holes/')) return jsonResponse({ status: 'ok', holes });
+  if (url.includes('/v1/courses/') && url.includes('/boundary')) {
+    return jsonResponse({ status: 'ok', boundary: null });
+  }
+  return null;
+}
+
+function stubNetwork(savedHoles: unknown[] = []) {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: unknown) => {
       const url = String(input);
+      const stored = storeAnswer(url, savedHoles);
+      if (stored) return stored;
       if (url.includes('/courses/search')) {
         return jsonResponse({
           courses: [{ id: COURSE_ID, name: COURSE_NAME, latitude: 36.5685, longitude: -121.949 }],
@@ -201,7 +217,7 @@ describe('a pasted link', () => {
     await settle();
     await settle();
 
-    expect(document.body.textContent).toContain('Show us where this hole plays.');
+    expect(document.body.textContent).toContain('Walk us down the hole.');
     /* And the address says so, so backing out of drawing goes somewhere real. */
     expect(path()).toBe(`/c/${COURSE_ID}/hole/1/locate`);
   });
@@ -232,6 +248,10 @@ describe('a pasted link', () => {
       vi.fn(async (input: unknown) => {
         const url = String(input);
         if (url.includes('overpass')) return jsonResponse({ elements: [] });
+        /* Only the course record is held — the store reads alongside the OSM
+           lookup would otherwise hold opening for the whole store timeout. */
+        const stored = storeAnswer(url);
+        if (stored) return stored;
         /* Hold the course record open so the loading window is observable. */
         await new Promise<void>((resolve) => { releaseDetail = resolve; });
         return jsonResponse(detailFixture());
@@ -249,7 +269,7 @@ describe('a pasted link', () => {
     await settle();
 
     expect(path()).toBe(`/c/${COURSE_ID}/hole/2/locate`);
-    expect(document.body.textContent).toContain('Show us where this hole plays.');
+    expect(document.body.textContent).toContain('Walk us down the hole.');
   });
 
   it('releases the address when the course it names cannot be opened', async () => {
@@ -277,5 +297,40 @@ describe('a pasted link', () => {
     await settle();
 
     expect(screen.getByPlaceholderText(/course name/i)).toBeDefined();
+  });
+});
+
+/**
+ * A hole the contributor saved to our store is theirs, not OpenStreetMap's. The
+ * board says so in words of its own, and never as "On the map" — the upload path
+ * is not built, so claiming the map holds it would be claiming something false.
+ */
+describe('what the contributor already saved', () => {
+  it('shows a saved hole from the store as saved and not uploaded', async () => {
+    stubNetwork([
+      {
+        course_id: COURSE_ID,
+        hole_number: 2,
+        par: 4,
+        playing_line: {
+          type: 'LineString',
+          coordinates: [
+            [-121.949, 36.5685],
+            [-121.9475, 36.5695],
+          ],
+        },
+        line_source: 'drawn',
+        osm_hole_id: null,
+        features: [],
+        saved_at: '2026-09-01T10:00:00Z',
+      },
+    ]);
+
+    await openTheCourse();
+
+    expect(screen.getAllByText('Saved — not uploaded')).toHaveLength(1);
+    expect(screen.queryByText('On the map')).toBeNull();
+    /* The other two holes are still nothing yet. */
+    expect(screen.getAllByText('Nothing yet')).toHaveLength(2);
   });
 });

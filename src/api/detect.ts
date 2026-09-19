@@ -35,8 +35,20 @@ import type { LngLat } from '../geo/coords';
  * behind an authenticating identity proxy, which owns access control, so the
  * service carries no auth logic and knowing its address grants nothing.
  */
-export const DETECT_API_BASE =
-  import.meta.env.VITE_DETECT_API_BASE ?? 'http://localhost:8000';
+export const DETECT_API_BASE: string =
+  import.meta.env.VITE_DETECT_API_BASE ??
+  /*
+   * In `npm run dev` the service is reached through the dev server itself —
+   * `vite.config.ts` proxies `/v1` to it — so the browser only ever talks to
+   * the page's own origin. Calling port 8000 directly depended on a second
+   * port forward out of the devcontainer, and when that forward was missing or
+   * the port was taken on the host, the connection was accepted and never
+   * answered: a save that said "Saving …" forever.
+   */
+  (import.meta.env.DEV && typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000');
+
+/** The longest any one request to the service may take before it counts as unanswered. */
+export const REQUEST_TIMEOUT_MS = 20_000;
 
 /** How long to leave between polls. Long enough not to hammer a cold container. */
 export const POLL_INTERVAL_MS = 2_000;
@@ -217,17 +229,48 @@ function failure(
  * failure as a 502, each with a body that says which it is. So the body is read
  * first and the HTTP status is only the fallback for a body that says nothing.
  */
-async function readEnvelope(
+export async function readEnvelope(
   url: string,
   init: RequestInit,
   signal?: AbortSignal,
 ): Promise<
   { ok: true; httpStatus: number; body: Record<string, unknown> } | { ok: false; result: DetectResult }
 > {
+  /*
+   * No single request to the service may hang. Every endpoint answers in well
+   * under a second — detection is spawn-and-poll precisely so none has to wait
+   * on the model — so a request still open after `REQUEST_TIMEOUT_MS` is a
+   * connection nobody is answering, and the caller hears that as a failure it
+   * can state and retry rather than a spinner that never stops.
+   */
+  const timeout = new AbortController();
+  const stop = () => timeout.abort();
+  signal?.addEventListener('abort', stop, { once: true });
+  if (signal?.aborted) stop();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    timeout.abort();
+  }, REQUEST_TIMEOUT_MS);
+  const settle = () => {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', stop);
+  };
+
   let response: Response;
   try {
-    response = await fetch(url, { ...init, signal });
+    response = await fetch(url, { ...init, signal: timeout.signal });
   } catch (error) {
+    settle();
+    if (timedOut) {
+      return {
+        ok: false,
+        result: failure(
+          'network',
+          `the service at ${DETECT_API_BASE} did not answer within ${REQUEST_TIMEOUT_MS / 1000} s`,
+        ),
+      };
+    }
     if (isAbort(error, signal)) return { ok: false, result: { status: 'aborted' } };
     /*
      * A browser reports every unreachable host as a bare "Failed to fetch",
@@ -245,7 +288,15 @@ async function readEnvelope(
   let body: unknown;
   try {
     body = await response.json();
+    settle();
   } catch (error) {
+    settle();
+    if (timedOut) {
+      return {
+        ok: false,
+        result: failure('network', `the service at ${DETECT_API_BASE} stopped answering part-way through`),
+      };
+    }
     if (isAbort(error, signal)) return { ok: false, result: { status: 'aborted' } };
     return {
       ok: false,
@@ -264,7 +315,7 @@ async function readEnvelope(
  * `no_coverage` arrives as a 200 and stays a success with an empty answer;
  * everything else here is either a stated failure or an unreadable one.
  */
-function interpretFailure(body: Record<string, unknown>, httpStatus: number): DetectResult {
+export function interpretFailure(body: Record<string, unknown>, httpStatus: number): DetectResult {
   const message = optionalString(body.message);
   switch (body.status) {
     case 'no_coverage':

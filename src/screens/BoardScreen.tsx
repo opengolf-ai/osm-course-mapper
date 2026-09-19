@@ -16,6 +16,8 @@ interface BoardScreenProps {
 
 const PROGRESS_FILL: Record<HoleStatus, string> = {
   complete: 'var(--mint-400)',
+  /* Ours, not OpenStreetMap's yet: the mint, at half strength. */
+  saved: 'rgba(62,207,180,.6)',
   ready: 'rgba(62,207,180,.28)',
   attention: 'var(--amber-500)',
   unmapped: 'rgba(255,255,255,.12)',
@@ -263,8 +265,8 @@ export function BoardScreen({
             textWrap: 'pretty',
           }}
         >
-          Stop whenever you like. Every hole you finish is already live in OpenStreetMap — the rest
-          will wait for you.
+          Stop whenever you like. Every hole you finish is saved as you go — the rest will wait for
+          you. Nothing is uploaded to OpenStreetMap yet.
         </p>
         <HoverButton
           onClick={onBack}

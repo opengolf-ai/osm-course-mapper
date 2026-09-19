@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { getCourse } from './api/opengolf';
+import { getSavedBoundary, listSavedHoles, type SavedBoundary, type SavedHole } from './api/holes';
 import { lookupOsmCourse } from './api/overpass';
 import { TopNav, type NavItem } from './components/TopNav';
 import { BoardScreen } from './screens/BoardScreen';
@@ -9,7 +10,7 @@ import { ReviewScreen } from './screens/ReviewScreen';
 import { SearchScreen } from './screens/SearchScreen';
 import { buildCourseSession } from './state/courseSession';
 import { parsePath, routeFor, routeToPath, type Route } from './state/url';
-import { useMapper } from './state/useMapper';
+import { summariseSavedHole, useMapper } from './state/useMapper';
 
 /**
  * What opening a course is doing right now. Loading, checking, and failed are
@@ -66,6 +67,12 @@ export default function App() {
          * to `unknown`, so this can stall but never hang.
          */
         setLoad({ kind: 'checking' });
+        /*
+         * What the contributor already saved here is read alongside OpenStreetMap,
+         * and is best-effort: a store that is down or not configured leaves the
+         * course opening exactly as it would have with nothing saved.
+         */
+        const saved = loadSaved(session.id, controller.signal);
         const osm = await lookupOsmCourse(
           {
             id: session.id,
@@ -79,10 +86,11 @@ export default function App() {
           },
           controller.signal,
         );
+        const { holes, boundary } = await saved;
         if (controller.signal.aborted) return;
 
         setLoad({ kind: 'idle' });
-        actions.openCourse(session, osm);
+        actions.openCourse(session, osm, { holes, boundary });
       })();
     },
     [actions],
@@ -321,8 +329,18 @@ export default function App() {
       {course && adopted && state.screen === 'boundary' && (
         <BoundaryScreen
           course={adopted}
+          geometry={state.boundary.edited ?? adopted.boundary}
+          edited={state.boundary.edited !== null}
+          save={state.boundary.save}
           courseName={course.name}
-          onContinue={() => actions.go('board')}
+          onChange={actions.moveBoundary}
+          onReset={actions.resetBoundary}
+          onSave={actions.saveBoundary}
+          onContinue={() => {
+            /* An edge dragged but never saved is saved on the way past, not dropped. */
+            if (state.boundary.edited && state.boundary.save.status === 'idle') actions.saveBoundary();
+            actions.go('board');
+          }}
           onBack={() => actions.go('search')}
         />
       )}
@@ -343,8 +361,9 @@ export default function App() {
       {course && state.screen === 'complete' && (
         <CompleteModal
           courseName={course.name}
-          holeNum={course.holes[derived.hi]?.number ?? derived.hi + 1}
-          doneCount={derived.doneCount}
+          holeNum={derived.holeNumber}
+          saved={summariseSavedHole(state.savedHoles[derived.holeNumber])}
+          doneCount={derived.doneCount + derived.savedCount}
           holeCount={course.holes.length}
           onNextHole={actions.nextHole}
           onBack={() => actions.go('board')}
@@ -356,36 +375,147 @@ export default function App() {
   );
 }
 
-/** The course-open transition, stated over whatever screen the contributor is on. */
+/** How long opening a course waits on our own store before carrying on without it. */
+const SAVED_READ_TIMEOUT_MS = 4_000;
+
+/**
+ * The holes and boundary saved for a course, or nothing. Never fails: the store
+ * is where a contributor's own earlier work lives, and its absence must not
+ * stop a course opening.
+ */
+async function loadSaved(
+  courseId: string,
+  outer: AbortSignal,
+): Promise<{ holes: SavedHole[]; boundary: SavedBoundary | null }> {
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  outer.addEventListener('abort', stop, { once: true });
+  const timer = setTimeout(stop, SAVED_READ_TIMEOUT_MS);
+  try {
+    const [holes, boundary] = await Promise.all([
+      listSavedHoles(courseId, controller.signal),
+      getSavedBoundary(courseId, controller.signal),
+    ]);
+    return {
+      holes: holes.status === 'ok' ? holes.data : [],
+      boundary: boundary.status === 'ok' ? boundary.data : null,
+    };
+  } catch {
+    return { holes: [], boundary: null };
+  } finally {
+    clearTimeout(timer);
+    outer.removeEventListener('abort', stop);
+  }
+}
+
+/**
+ * The course-open transition, stated over whatever screen the contributor is on.
+ *
+ * Loading and checking cover the screen: nothing underneath is the course they
+ * picked yet, and a click on the search results behind it would start a second
+ * load. A failure is a toast instead — search stays usable, because picking
+ * another course is the way forward.
+ */
 function CourseLoadNotice({ load }: { load: Exclude<CourseLoad, { kind: 'idle' }> }) {
-  const failed = load.kind === 'failed';
+  if (load.kind === 'failed') {
+    return (
+      <div
+        role="alert"
+        style={{
+          position: 'fixed',
+          left: '50%',
+          bottom: 28,
+          transform: 'translateX(-50%)',
+          zIndex: 70,
+          maxWidth: 560,
+          background: 'var(--status-danger-bg, #f6e4e1)',
+          color: 'var(--clay-500, #8a3324)',
+          border: '1px solid var(--status-danger-fg, #b4462f)',
+          borderRadius: 'var(--radius-md)',
+          boxShadow: 'var(--shadow-md)',
+          padding: '12px 18px',
+          fontFamily: 'var(--font-mono)',
+          fontSize: 12,
+          lineHeight: 1.6,
+          textWrap: 'pretty',
+        }}
+      >
+        Could not open that course — {load.message}. Pick a course to try again.
+      </div>
+    );
+  }
+
+  const checking = load.kind === 'checking';
   return (
     <div
       role="status"
+      aria-live="polite"
+      aria-busy="true"
       style={{
         position: 'fixed',
-        left: '50%',
-        bottom: 28,
-        transform: 'translateX(-50%)',
+        inset: 0,
         zIndex: 70,
-        maxWidth: 560,
-        background: failed ? 'var(--status-danger-bg, #f6e4e1)' : 'var(--green-800)',
-        color: failed ? 'var(--clay-500, #8a3324)' : 'var(--green-100)',
-        border: `1px solid ${failed ? 'var(--status-danger-fg, #b4462f)' : 'rgba(255,255,255,.18)'}`,
-        borderRadius: 'var(--radius-md)',
-        boxShadow: 'var(--shadow-md)',
-        padding: '12px 18px',
-        fontFamily: 'var(--font-mono)',
-        fontSize: 12,
-        lineHeight: 1.6,
-        textWrap: 'pretty',
+        background: 'rgba(6,43,38,.62)',
+        backdropFilter: 'blur(2px)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 32,
+        animation: 'ogRise 190ms var(--ease-out)',
       }}
     >
-      {failed
-        ? `Could not open that course — ${load.message}. Pick a course to try again.`
-        : load.kind === 'checking'
-          ? 'Checking what OpenStreetMap already holds for this course …'
-          : 'Opening that course — loading its scorecard …'}
+      <div
+        style={{
+          width: 380,
+          maxWidth: '100%',
+          background: 'var(--green-900)',
+          border: '1px solid rgba(255,255,255,.14)',
+          borderRadius: 'var(--radius-lg)',
+          boxShadow: 'var(--shadow-lg)',
+          padding: '28px 26px',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          gap: 16,
+          textAlign: 'center',
+        }}
+      >
+        <span
+          aria-hidden="true"
+          style={{
+            width: 40,
+            height: 40,
+            borderRadius: 999,
+            border: '3px solid rgba(255,255,255,.14)',
+            borderTopColor: 'var(--mint-400)',
+            animation: 'ogSpin 0.9s linear infinite',
+          }}
+        />
+        <div>
+          <div style={{ fontSize: 17, fontWeight: 600, color: '#fff', marginBottom: 6 }}>
+            {checking ? 'Checking OpenStreetMap' : 'Opening the course'}
+          </div>
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, lineHeight: 1.6, color: 'var(--green-200)', textWrap: 'pretty' }}>
+            {checking
+              ? 'Looking up the boundary, holes and outlines OpenStreetMap already holds, and anything you saved here before …'
+              : 'Loading its scorecard …'}
+          </div>
+        </div>
+        {/* Two stages, so a slow OpenStreetMap answer reads as progress rather than a hang. */}
+        <div style={{ display: 'flex', gap: 6 }} aria-hidden="true">
+          {[true, checking].map((done, i) => (
+            <span
+              key={i}
+              style={{
+                width: 28,
+                height: 4,
+                borderRadius: 2,
+                background: done ? 'var(--mint-400)' : 'rgba(255,255,255,.14)',
+              }}
+            />
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

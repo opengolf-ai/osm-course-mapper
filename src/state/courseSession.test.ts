@@ -7,10 +7,10 @@ import { SEARCH_DEBOUNCE_MS } from '../screens/SearchScreen';
 import type { CourseDetail } from '../api/types';
 import {
   buildCourseSession,
-  defaultTeeAssign,
   holeStatusesFrom,
   holeYardage,
   scorecardFor,
+  teeSetsFor,
 } from './courseSession';
 import { clearOsmCache } from '../api/overpass';
 import { INITIAL, computeDerived } from './useMapper';
@@ -172,27 +172,74 @@ describe('scorecardFor', () => {
   });
 });
 
-describe('defaultTeeAssign', () => {
-  it('names the four review tee slots from the course’s own tee sets', () => {
+/**
+ * The tee step walks these one at a time, so their order and membership are the
+ * questions the contributor is asked: a set missing here is a tee nobody is asked
+ * about, and a set listed here without a number is a question about nothing.
+ */
+describe('teeSetsFor', () => {
+  it('lists the sets that play a hole longest first, with the key, name and swatch the rail draws', () => {
     const session = buildCourseSession(detailFixture());
 
-    expect(defaultTeeAssign(session)).toEqual({
-      tee1: 'Blue',
-      tee2: 'Gold',
-      tee3: 'White',
-      tee4: 'Red',
-    });
+    expect(teeSetsFor(session, 0)).toEqual([
+      { key: 'blue', name: 'Blue', swatch: '#2b7fa8', yards: 378 },
+      { key: 'gold', name: 'Gold', swatch: '#c98a15', yards: 349 },
+      { key: 'white', name: 'White', swatch: '#e8ebdf', yards: 337 },
+      { key: 'red', name: 'Red', swatch: '#b4462f', yards: 310 },
+    ]);
   });
 
-  it('repeats the last set when a course carries fewer than four tees', () => {
-    const session = buildCourseSession(otherDetail());
+  it('orders by what the set plays on this hole, not by the course total', () => {
+    /*
+     * The course lists Blue as its longest set, but on this hole the gold markers
+     * sit behind the blue ones. The step asks about the back tee first, and the
+     * back tee here is gold — ordering off the course total would ask about the
+     * wrong box first.
+     */
+    const session = buildCourseSession(
+      detailFixture({
+        holes_data: [holeRow(1, 3, 17, { blue: 150, gold: 162, white: 140, red: 120 }), ...PEBBLE_HOLES.slice(1)],
+      }),
+    );
 
-    expect(defaultTeeAssign(session)).toEqual({
-      tee1: 'Black',
-      tee2: 'Black',
-      tee3: 'Black',
-      tee4: 'Black',
+    expect(session.tees[0].color).toBe('blue');
+    expect(teeSetsFor(session, 0).map((tee) => [tee.key, tee.yards])).toEqual([
+      ['gold', 162],
+      ['blue', 150],
+      ['white', 140],
+      ['red', 120],
+    ]);
+  });
+
+  it('leaves out a set the card gives no yardage for on that hole', () => {
+    /* Red plays holes 2 and 3 but has no number on hole 1: nobody tees off there. */
+    const session = buildCourseSession(
+      detailFixture({
+        holes_data: [holeRow(1, 4, 6, { blue: 378, gold: 349, white: 337 }), ...PEBBLE_HOLES.slice(1)],
+      }),
+    );
+
+    expect(session.tees.map((tee) => tee.color)).toContain('red');
+    expect(teeSetsFor(session, 0).map((tee) => tee.key)).toEqual(['blue', 'gold', 'white']);
+    expect(teeSetsFor(session, 1).map((tee) => tee.key)).toEqual(['blue', 'gold', 'white', 'red']);
+    /* And the stray `web` column, which no tee row claims, is never a set. */
+    expect(teeSetsFor(session, 1).some((tee) => tee.key === 'web')).toBe(false);
+  });
+
+  it('reads a slate swatch for a colour it has no swatch for', () => {
+    const session = buildCourseSession({
+      ...otherDetail(),
+      tees: [{ tee_key: 'combo-male', tee_name: 'Combo', tee_color: 'combo', yardage: 6500 }],
+      holes_data: [holeRow(1, 4, 5, { combo: 401 })],
     });
+
+    expect(teeSetsFor(session, 0)).toEqual([{ key: 'combo', name: 'Combo', swatch: '#8d9698', yards: 401 }]);
+  });
+
+  it('has no sets for a hole the card does not carry', () => {
+    const session = buildCourseSession(detailFixture());
+
+    expect(teeSetsFor(session, 17)).toEqual([]);
   });
 });
 
@@ -355,6 +402,26 @@ afterEach(() => {
 });
 
 describe('opening a course from search', () => {
+  it('covers the screen with a loading overlay while the course loads', async () => {
+    /* The course record never answers, so the load stays in flight. */
+    fetchMock = routeFetch(() => new Promise<Response>(() => {}));
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(createElement(App));
+    fireEvent.change(screen.getByPlaceholderText(/course name/i), {
+      target: { value: 'pebble' },
+    });
+    await settle();
+
+    fireEvent.click(screen.getByText('Pebble Beach Golf Links'));
+    await settle(0);
+
+    const overlay = screen.getByRole('status');
+    expect(overlay.getAttribute('aria-busy')).toBe('true');
+    expect(overlay.textContent).toMatch(/Opening the course/);
+    expect(overlay.style.position).toBe('fixed');
+  });
+
   it('leaves the contributor on search with a stated failure when detail fetch fails', async () => {
     fetchMock = routeFetch(async () => {
       throw new Error('Failed to fetch');
@@ -370,7 +437,7 @@ describe('opening a course from search', () => {
     fireEvent.click(screen.getByText('Pebble Beach Golf Links'));
     await settle(0);
 
-    expect(screen.getByRole('status').textContent).toMatch(/Failed to fetch/);
+    expect(screen.getByRole('alert').textContent).toMatch(/Failed to fetch/);
     /* Still on search: the input is there and no board header replaced it. */
     expect(screen.getByPlaceholderText(/course name/i)).toBeDefined();
     expect(screen.queryByText(/holes on the map/)).toBeNull();

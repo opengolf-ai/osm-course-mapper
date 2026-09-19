@@ -13,4 +13,5 @@ a:hover{color:var(--mint-300)}
 @keyframes ogPulse{0%{opacity:.35}50%{opacity:1}100%{opacity:.35}}
 @keyframes ogRise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @keyframes ogDash{to{stroke-dashoffset:-28}}
+@keyframes ogSpin{to{transform:rotate(360deg)}}
 input,select{font-family:var(--font-sans)}
