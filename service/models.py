@@ -10,6 +10,9 @@ them whenever it lands.
 
 This module is the schema and nothing else. The functions U5 calls live in
 `store.py`, so nobody has to import a `Session` to look at what a decision is.
+The two later tables at the bottom — `saved_holes` and `saved_boundaries`, the
+mapped course awaiting an OSM upload — are written and read by `holes.py`, and
+the privacy rule below applies to them unchanged.
 
 --------------------------------------------------------------------------- #
 WHAT A DECISION RECORD MAY CARRY — the deliberate part
@@ -174,12 +177,28 @@ def _string_enum(enum_class: type[StrEnum], name: str) -> Enum:
     )
 
 
-class Base(DeclarativeBase):
-    """Declarative base for the decision store.
+class LineSource(StrEnum):
+    """Where a saved hole's playing line came from.
 
-    Its own base rather than one shared with anything else: this is the only
-    persistent table the detection service owns, and `Base.metadata` is what the
-    Alembic migration compares against.
+    Three values because the OpenStreetMap write path needs all three answers:
+    a line the contributor `drawn` from nothing is a new `golf=hole` way; one
+    taken from `osm` unchanged is an existing way the upload must leave alone;
+    one taken from OSM and then moved (`osm_edited`) is a modification of that
+    way. Collapsing the last two would make the upload either skip a correction
+    or re-submit a way nobody changed.
+    """
+
+    DRAWN = "drawn"
+    OSM = "osm"
+    OSM_EDITED = "osm_edited"
+
+
+class Base(DeclarativeBase):
+    """Declarative base for everything the detection service persists.
+
+    Its own base rather than one shared with anything else: these are the only
+    persistent tables the detection service owns, and `Base.metadata` is what
+    the Alembic migrations compare against.
     """
 
 
@@ -270,3 +289,119 @@ class FeatureDecision(Base):
         # The training export: "every decision on imagery flown since 2022".
         Index("ix_feature_decisions_imagery_acquired", "imagery_acquired"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Saved holes and course boundaries — the mapped course, awaiting upload
+# --------------------------------------------------------------------------- #
+#
+# `feature_decisions` is the *training* record: one row per answered proposal.
+# The two tables below are the *mapping* record: what a contributor says a hole
+# looks like once they are done with it, with enough fidelity (tags, tee sets,
+# the OSM ids a shape came from) to become an OpenStreetMap changeset later.
+#
+# The privacy rule above applies unchanged, and it is asserted in
+# `test_store.py` against these tables too: **no contributor, session or device
+# identifier.** The OSM upload will authenticate its own user when it lands; a
+# saved hole is a fact about a golf course, not about who mapped it.
+#
+# Both tables are append-only for the same reason `feature_decisions` is: a
+# re-save is a new row and the read path picks the latest, so a contributor who
+# undoes a correction has not destroyed the version before it. There is no
+# update path in `holes.py`.
+
+
+class OsmSyncStatus(StrEnum):
+    """Whether a saved hole has reached OpenStreetMap.
+
+    Every save starts `pending`: the upload path is not built, and a hole saved
+    here is in our store only. The upload flips a row to `synced` (and stamps
+    `osm_synced_at`) once its changeset is accepted — each feature's
+    `osm_action` and `osm_id` say what that changeset has to do.
+    """
+
+    PENDING = "pending"
+    SYNCED = "synced"
+
+
+class SavedHole(Base):
+    """One save of one whole hole: the playing line and every confirmed polygon.
+
+    The grain is the *hole*, unlike `FeatureDecision`, because this is what the
+    contributor submits as a unit ("this hole is done") and what an OSM upload
+    consumes as a unit. `features` is therefore one JSON list rather than a
+    child table: it is written once, read back whole, and never queried by
+    member — a child table would buy joins nobody runs.
+    """
+
+    __tablename__ = "saved_holes"
+
+    id: Mapped[int] = mapped_column(SurrogateKey, primary_key=True, autoincrement=True)
+
+    #: The same opaque course reference `FeatureDecision` carries, and for the
+    #: same reason not a foreign key: the catalogue is another service's data.
+    course_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    hole_number: Mapped[int] = mapped_column(Integer(), nullable=False)
+    #: Nullable because a course record without a scorecard is common and an
+    #: invented par would be worse than an absent one.
+    par: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+
+    #: A GeoJSON LineString in WGS84, tee to green, exactly as sent.
+    playing_line: Mapped[dict[str, Any]] = mapped_column(GeoJSON, nullable=False)
+    line_source: Mapped[LineSource] = mapped_column(
+        _string_enum(LineSource, "line_source"), nullable=False
+    )
+    #: The OSM `golf=hole` way the line came from (`"way/123"`), when it did.
+    osm_hole_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    #: The confirmed features as the client sent them — kind, geometry, origin,
+    #: edit flag, tee sets, label, OSM tags and (for proposals) confidence and
+    #: imagery provenance. Validated by `holes.py` before it lands here.
+    features: Mapped[list[dict[str, Any]]] = mapped_column(GeoJSON, nullable=False)
+
+    #: Not in OpenStreetMap yet. Always `pending` on write; see `OsmSyncStatus`.
+    osm_sync_status: Mapped[OsmSyncStatus] = mapped_column(
+        _string_enum(OsmSyncStatus, "osm_sync_status"),
+        nullable=False,
+        default=OsmSyncStatus.PENDING,
+        server_default=OsmSyncStatus.PENDING.value,
+    )
+    osm_synced_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    saved_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: dt.datetime.now(dt.UTC),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        # The only read: the latest save of each hole on one course.
+        Index("ix_saved_holes_hole", "course_id", "hole_number"),
+    )
+
+
+class SavedBoundary(Base):
+    """One save of a course boundary a contributor corrected or confirmed."""
+
+    __tablename__ = "saved_boundaries"
+
+    id: Mapped[int] = mapped_column(SurrogateKey, primary_key=True, autoincrement=True)
+    course_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: The OSM element the boundary came from (`"way/123"`, `"relation/9"`),
+    #: or `NULL` for a boundary drawn where OSM had none.
+    osm_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: A GeoJSON Polygon or MultiPolygon in WGS84, exactly as sent.
+    geometry: Mapped[dict[str, Any]] = mapped_column(GeoJSON, nullable=False)
+    #: Whether the contributor moved it. An unedited save of an OSM boundary is
+    #: a confirmation the upload must not turn into a modification.
+    edited: Mapped[bool] = mapped_column(Boolean(), nullable=False)
+
+    saved_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: dt.datetime.now(dt.UTC),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (Index("ix_saved_boundaries_course", "course_id"),)

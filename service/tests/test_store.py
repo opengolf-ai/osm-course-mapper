@@ -433,6 +433,69 @@ def test_no_contributor_or_session_identifier_is_stored() -> None:
     )
 
 
+def test_saved_holes_and_boundaries_hold_no_contributor_or_session_identifier() -> None:
+    """The same privacy decision, frozen for the mapping record too.
+
+    A saved hole is a fact about a golf course. The OSM upload will
+    authenticate its own user when it lands and does not need these tables to
+    remember one, so the column sets are frozen here and identity-shaped names
+    are refused explicitly — including in what a caller may supply and what
+    comes back out — for the same reason given above.
+    """
+    from service import holes
+
+    hole_columns = set(models.SavedHole.__table__.columns.keys())
+    boundary_columns = set(models.SavedBoundary.__table__.columns.keys())
+    assert hole_columns == {
+        "id",
+        "course_id",
+        "hole_number",
+        "par",
+        "playing_line",
+        "line_source",
+        "osm_hole_id",
+        "features",
+        "osm_sync_status",
+        "osm_synced_at",
+        "saved_at",
+    }, "the saved-hole field set is a deliberate privacy decision; see models.py"
+    assert boundary_columns == {
+        "id",
+        "course_id",
+        "osm_id",
+        "geometry",
+        "edited",
+        "saved_at",
+    }, "the saved-boundary field set is a deliberate privacy decision; see models.py"
+
+    named = (
+        hole_columns
+        | boundary_columns
+        | {
+            field.name
+            for shape in (
+                holes.HoleInput,
+                holes.SavedHoleRecord,
+                holes.BoundaryInput,
+                holes.SavedBoundaryRecord,
+            )
+            for field in dataclasses.fields(shape)
+        }
+    )
+    identity_shaped = sorted(
+        name
+        for name in named
+        if any(
+            word in name.lower()
+            for word in ("user", "contributor", "session", "ip", "email", "account", "device")
+        )
+    )
+    assert identity_shaped == [], (
+        f"{identity_shaped} names an identity the store deliberately does not hold; "
+        "see the privacy note in models.py before adding it"
+    )
+
+
 def test_each_write_call_mints_its_own_batch(session) -> None:
     """One batch is one review pass, not one contributor and not one session."""
     first = store.record_decisions(
@@ -547,3 +610,63 @@ def test_the_alembic_migration_builds_the_schema_the_orm_expects(tmp_path) -> No
 
     assert isinstance(read, Ok), read
     assert read.value[0].geometry == _square()
+
+
+def test_the_alembic_migrations_build_the_saved_hole_and_boundary_tables(tmp_path) -> None:
+    """Revision 0003 creates what the ORM describes, and the store can write to it.
+
+    Same scope and same gap as the migration test above: SQLite proves the
+    revision applies and the tables accept a save; it does not prove the
+    PostgreSQL rendering.
+    """
+    from service import holes
+
+    url = f"sqlite:///{tmp_path / 'migrated.sqlite'}"
+    config = Config()
+    config.set_main_option("script_location", str(MIGRATIONS_DIR))
+    config.set_main_option("sqlalchemy.url", url)
+    command.upgrade(config, "head")
+
+    engine = create_engine(url)
+    inspector = inspect(engine)
+    for model in (models.SavedHole, models.SavedBoundary):
+        migrated = {column["name"] for column in inspector.get_columns(model.__tablename__)}
+        assert migrated == set(model.__table__.columns.keys()), model.__tablename__
+    assert {index["name"] for index in inspector.get_indexes("saved_holes")} == {
+        "ix_saved_holes_hole"
+    }
+
+    line = {"type": "LineString", "coordinates": [[-122.0, 37.0], [-121.99, 37.01]]}
+    with Session(engine) as open_session:
+        saved = holes.save_hole(
+            open_session,
+            holes.HoleInput(
+                course_id="c",
+                hole_number=1,
+                par=4,
+                playing_line=line,
+                line_source=models.LineSource.DRAWN,
+                osm_hole_id=None,
+                features=({"kind": "green", "geometry": _square(), "origin": "drawn"},),
+            ),
+        )
+        boundary = holes.save_boundary(
+            open_session,
+            holes.BoundaryInput(course_id="c", osm_id=None, geometry=_square(), edited=True),
+        )
+        assert isinstance(saved, Ok), saved
+        assert isinstance(boundary, Ok), boundary
+        read = holes.latest_holes(open_session, "c")
+    engine.dispose()
+
+    assert isinstance(read, Ok), read
+    assert read.value[0].playing_line == line
+    assert read.value[0].line_source is models.LineSource.DRAWN
+
+    # And the downgrade removes exactly what 0003 added.
+    command.downgrade(config, "0002")
+    engine = create_engine(url)
+    remaining = set(inspect(engine).get_table_names())
+    engine.dispose()
+    assert "saved_holes" not in remaining and "saved_boundaries" not in remaining
+    assert "feature_decisions" in remaining
